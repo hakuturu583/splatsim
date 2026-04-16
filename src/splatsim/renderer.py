@@ -10,8 +10,7 @@ from gsplat import rasterization
 from splatsim._conversions import GaussianTensors
 
 if TYPE_CHECKING:
-    from splatsim.background import Background
-    from splatsim.rigid_body import RigidBody
+    from splatsim.scene import Scene
 
 
 class Renderer:
@@ -40,17 +39,16 @@ class Renderer:
         self,
         viewmat: Tensor,
         K: Tensor,
-        background: Background | None = None,
-        rigid_bodies: list[RigidBody] | None = None,
+        *,
+        scene: Scene | None = None,
     ) -> Tensor:
         """Render the scene and return an [H, W, 3] float32 RGB image (0-1)."""
         tensor_list: list[GaussianTensors] = []
 
-        if background is not None:
-            tensor_list.append(background.tensors)
-
-        if rigid_bodies:
-            for rb in rigid_bodies:
+        if scene is not None:
+            if scene.background is not None:
+                tensor_list.append(scene.background.tensors)
+            for rb in scene.rigid_body_list:
                 tensor_list.append(rb.tensors)
 
         if not tensor_list:

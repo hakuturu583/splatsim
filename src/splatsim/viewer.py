@@ -9,8 +9,7 @@ import torch
 from splatsim.renderer import Renderer
 
 if TYPE_CHECKING:
-    from splatsim.background import Background
-    from splatsim.rigid_body import RigidBody
+    from splatsim.scene import Scene
 
 
 class Viewer:
@@ -19,16 +18,14 @@ class Viewer:
     def __init__(
         self,
         renderer: Renderer,
-        background: Background | None = None,
-        rigid_bodies: list[RigidBody] | None = None,
+        scene: Scene | None = None,
         *,
         fov_y_deg: float = 60.0,
         move_speed: float = 5.0,
         rotate_speed: float = 1.5,
     ) -> None:
         self.renderer = renderer
-        self.background = background
-        self.rigid_bodies = rigid_bodies or []
+        self.scene = scene
         self.fov_y_deg = fov_y_deg
         self.move_speed = move_speed
         self.rotate_speed = rotate_speed
@@ -48,10 +45,11 @@ class Viewer:
         (spherical average on the 1-sphere) to derive the yaw.
         """
         all_means: list[torch.Tensor] = []
-        if self.background is not None:
-            all_means.append(self.background.tensors.means)
-        for rb in self.rigid_bodies:
-            all_means.append(rb.tensors.means)
+        if self.scene is not None:
+            if self.scene.background is not None:
+                all_means.append(self.scene.background.tensors.means)
+            for rb in self.scene.rigid_body_list:
+                all_means.append(rb.tensors.means)
         if not all_means:
             return 0.0
 
@@ -174,9 +172,7 @@ class Viewer:
             viewmat = self._build_viewmat()
 
             with torch.no_grad():
-                image = self.renderer.render(
-                    viewmat, self._K, self.background, self.rigid_bodies
-                )
+                image = self.renderer.render(viewmat, self._K, scene=self.scene)
 
             # Convert GPU tensor to pygame surface
             image_np = (image.clamp(0.0, 1.0) * 255).byte().cpu().numpy()  # [H, W, 3]

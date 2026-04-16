@@ -7,7 +7,7 @@ from splatsim.dataclass import (
 )
 from splatsim.renderer import Renderer
 from splatsim.rigid_body import RigidBody
-from splatsim.scene import load_scene
+from splatsim.scene import Scene, load_scene
 from splatsim.viewer import Viewer
 
 __all__ = [
@@ -16,6 +16,7 @@ __all__ = [
     "RendererConfig",
     "RigidBody",
     "RigidBodyConfig",
+    "Scene",
     "SceneConfig",
     "Viewer",
     "ViewerConfig",

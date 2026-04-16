@@ -43,9 +43,11 @@ class SceneConfig:
             source = str(base_dir / rb["source"])
             position = tuple(rb.get("position", [0.0, 0.0, 0.0]))
             rotation = tuple(rb.get("rotation", [1.0, 0.0, 0.0, 0.0]))
+            name = rb.get("name", Path(source).stem)
             rigid_bodies.append(
                 RigidBodyConfig(
                     source=source,
+                    name=name,
                     position=position,
                     rotation=rotation,
                     use_sh=rb.get("use_sh", False),
