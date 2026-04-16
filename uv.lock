@@ -861,6 +861,7 @@ dependencies = [
     { name = "3dgs-io", marker = "sys_platform == 'linux'" },
     { name = "gsplat", marker = "sys_platform == 'linux'" },
     { name = "pygame", marker = "sys_platform == 'linux'" },
+    { name = "pyyaml", marker = "sys_platform == 'linux'" },
     { name = "torch", marker = "sys_platform == 'linux'" },
     { name = "torchvision", marker = "sys_platform == 'linux'" },
 ]
@@ -880,6 +881,7 @@ requires-dist = [
     { name = "3dgs-io", git = "https://github.com/tier4/3dgs_io.git?branch=main" },
     { name = "gsplat", specifier = "==1.5.3" },
     { name = "pygame", specifier = ">=2.5.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "torch", specifier = "==2.4.0+cu124", index = "https://download.pytorch.org/whl/cu124" },
     { name = "torchvision", specifier = "==0.19.0+cu124", index = "https://download.pytorch.org/whl/cu124" },
 ]
