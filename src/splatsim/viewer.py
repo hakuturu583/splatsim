@@ -73,10 +73,10 @@ class Viewer(QMainWindow):
         self._frame_count: int = 0
 
     def _estimate_initial_yaw(self) -> float:
-        """Estimate initial yaw via PCA on the XZ (horizontal) plane.
+        """Estimate initial yaw via PCA on the XY (horizontal) plane.
 
-        Finds the principal (longest) horizontal axis of the point cloud
-        and orients the camera to look along it. Y is up.
+        Z is up in this tile-local data. Finds the longest horizontal
+        axis and orients the camera to look along it.
         """
         all_means: list[torch.Tensor] = []
         if self.scene is not None:
@@ -88,15 +88,16 @@ class Viewer(QMainWindow):
             return 0.0
 
         means = torch.cat(all_means, dim=0)  # [N, 3]
-        xz = means[:, [0, 2]]  # [N, 2]
-        xz = xz - xz.mean(dim=0)
+        xy = means[:, [0, 1]]  # [N, 2] horizontal plane (Z=up)
+        xy = xy - xy.mean(dim=0)
 
-        cov = (xz.T @ xz) / xz.shape[0]
+        cov = (xy.T @ xy) / xy.shape[0]
         eigenvalues, eigenvectors = torch.linalg.eigh(cov)
         principal = eigenvectors[:, -1]  # [2]
 
-        px, pz = principal[0].item(), principal[1].item()
-        return math.atan2(-px, -pz)
+        # forward = (sin(yaw), -cos(yaw), 0); align with principal (px, py)
+        px, py = principal[0].item(), principal[1].item()
+        return math.atan2(px, -py)
 
     def _build_intrinsics(self) -> torch.Tensor:
         fov_y = math.radians(self.fov_y_deg)
@@ -113,21 +114,21 @@ class Viewer(QMainWindow):
     def _build_viewmat(self) -> torch.Tensor:
         """Build world-to-camera 4x4 matrix.
 
-        gsplat camera: +X=right, +Y=down, +Z=forward.
-        World (glTF/tile-local): +Y=up, yaw rotates around Y.
+        gsplat camera: +X=right, +Y=down, +Z=forward (RDF).
+        World (tile-local): +Z=up, yaw rotates around Z.
         """
         cos_y = math.cos(self._yaw)
         sin_y = math.sin(self._yaw)
 
-        # World-to-camera rotation (yaw around world Y):
-        #   cam_X (right)   = yaw-rotated horizontal
-        #   cam_Y (down)    = world -Y
-        #   cam_Z (forward) = yaw-rotated horizontal
+        # Yaw around world Z. At yaw=0 camera looks along world -Y.
+        #   cam_X (right)   = (-cos, -sin, 0)
+        #   cam_Y (down)    = (0, 0, -1)   = world -Z (down)
+        #   cam_Z (forward) = (sin, -cos, 0)
         r_w2c = torch.tensor(
             [
-                [cos_y, 0.0, -sin_y],
-                [0.0, -1.0, 0.0],
-                [-sin_y, 0.0, -cos_y],
+                [-cos_y, -sin_y, 0.0],
+                [0.0, 0.0, -1.0],
+                [sin_y, -cos_y, 0.0],
             ],
             device=self.renderer.device,
             dtype=torch.float32,
@@ -143,14 +144,15 @@ class Viewer(QMainWindow):
         cos_y = math.cos(self._yaw)
         sin_y = math.sin(self._yaw)
 
+        # World directions: Z=up, yaw around Z
         forward = torch.tensor(
-            [-sin_y, 0.0, -cos_y], device=self.renderer.device, dtype=torch.float32
+            [sin_y, -cos_y, 0.0], device=self.renderer.device, dtype=torch.float32
         )
         right = torch.tensor(
-            [cos_y, 0.0, -sin_y], device=self.renderer.device, dtype=torch.float32
+            [-cos_y, -sin_y, 0.0], device=self.renderer.device, dtype=torch.float32
         )
         up = torch.tensor(
-            [0.0, 1.0, 0.0], device=self.renderer.device, dtype=torch.float32
+            [0.0, 0.0, 1.0], device=self.renderer.device, dtype=torch.float32
         )
 
         speed = self.move_speed * dt
