@@ -27,36 +27,69 @@ class Background:
     ) -> None:
         tiles = _load_tileset(str(tileset_path), max_tiles=max_tiles)
 
-        # Extract root tile rotation (tile-local -> ECEF).
-        # 3D Tiles transform is column-major flat [16], so reshape and transpose.
-        root_transform = np.array(tiles[0].transform, dtype=np.float64).reshape(4, 4).T
-        ecef_rotation = root_transform[:3, :3]  # tile-local -> ECEF
+        # Extract the root tile's ECEF transform for GeoReference.
+        # 3D Tiles stores column-major; reshape then transpose to row-major.
+        root_tf = np.array(tiles[0].transform, dtype=np.float64).reshape(4, 4).T
+        self._ecef_rotation = root_tf[:3, :3].copy()
+        self._ecef_translation = root_tf[:3, 3].copy()
 
-        cloud = _merge_tileset(tiles)
+        if len(tiles) == 1:
+            # Single tile: use raw tile-local cloud directly (already RUB, Y=up).
+            # Avoids the ECEF rotation that merge_tileset would apply.
+            cloud = tiles[0].cloud
+        else:
+            # Multi-tile: merge into ECEF, then undo the root rotation
+            # so that the result stays in the tile-local orientation.
+            cloud = _merge_tileset(tiles)
+            self._undo_ecef_rotation(cloud, device)
+
         tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
 
-        # Re-center: subtract ECEF centroid for numerical stability.
+        # Re-center to local origin for numerical stability.
         self._origin = tensors.means.mean(dim=0).clone()
         tensors.means = tensors.means - self._origin
 
-        # Undo ECEF rotation so that the tile-local frame is restored
-        # (Y=up, Z=back in RUB). Use SVD to get a clean rotation matrix.
-        u, _, vt = np.linalg.svd(ecef_rotation)
+        self._tensors = tensors
+
+    def _undo_ecef_rotation(self, cloud: object, device: torch.device) -> None:
+        """Undo the ECEF rotation in-place on a merged cloud.
+
+        Converts from ECEF orientation back to tile-local RUB frame.
+        """
+        n = cloud.num_points  # ty: ignore[unresolved-attribute]
+        positions = np.array(
+            cloud.positions,  # ty: ignore[unresolved-attribute]
+            dtype=np.float32,
+        ).reshape(n, 3)
+
+        # Clean rotation via SVD
+        u, _, vt = np.linalg.svd(self._ecef_rotation)
         r_clean = u @ vt
         if np.linalg.det(r_clean) < 0:
             u[:, -1] *= -1
             r_clean = u @ vt
-        # R maps tile-local -> ECEF, so R^T maps ECEF -> tile-local.
-        r_inv = torch.tensor(r_clean.T, device=device, dtype=torch.float32)
+        r_inv = r_clean.T  # ECEF -> tile-local
 
-        # Rotate positions back to tile-local frame
-        tensors.means = tensors.means @ r_inv.T
+        # Subtract ECEF centroid, rotate back, write positions
+        centroid = positions.mean(axis=0)
+        positions = (positions - centroid) @ r_inv.T
+        cloud.positions = positions.reshape(-1)  # ty: ignore[unresolved-attribute]
 
-        # Rotate quaternions: convert R^T to quaternion, compose with existing
-        r_inv_quat = _rotation_matrix_to_quat(r_inv)
-        tensors.quats = quat_multiply(r_inv_quat, tensors.quats)
+        # Rotate quaternions: spz stores (x,y,z,w)
+        quats_xyzw = np.array(
+            cloud.rotations,  # ty: ignore[unresolved-attribute]
+            dtype=np.float32,
+        ).reshape(n, 4)
+        quats_wxyz = quats_xyzw[:, [3, 0, 1, 2]]
+        quats_t = torch.from_numpy(quats_wxyz).to(device)
 
-        self._tensors = tensors
+        r_inv_t = torch.tensor(r_inv, device=device, dtype=torch.float32)
+        r_inv_quat = _rotation_matrix_to_quat(r_inv_t)
+        rotated = quat_multiply(r_inv_quat, quats_t)
+
+        # Back to spz (x,y,z,w) order
+        rotated_np = rotated.cpu().numpy()[:, [1, 2, 3, 0]]
+        cloud.rotations = rotated_np.reshape(-1)  # ty: ignore[unresolved-attribute]
 
     @property
     def origin(self) -> Tensor:
@@ -74,7 +107,6 @@ class Background:
 
 def _rotation_matrix_to_quat(r: Tensor) -> Tensor:
     """Convert a 3x3 rotation matrix to a (w,x,y,z) quaternion."""
-    # Shepperd's method
     trace = r[0, 0] + r[1, 1] + r[2, 2]
 
     if trace > 0:

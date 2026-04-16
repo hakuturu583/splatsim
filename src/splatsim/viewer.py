@@ -71,8 +71,12 @@ class Viewer(QMainWindow):
         self._timer.timeout.connect(self._tick)
         self._dt: float = 1.0 / 30.0
 
-    def _estimate_initial_yaw(self, k: int = 512) -> float:
-        """Estimate initial yaw by looking towards nearby Gaussians."""
+    def _estimate_initial_yaw(self) -> float:
+        """Estimate initial yaw via PCA on the XZ plane.
+
+        Finds the principal (longest) horizontal axis of the point cloud
+        and orients the camera to look along it.
+        """
         all_means: list[torch.Tensor] = []
         if self.scene is not None:
             if self.scene.background is not None:
@@ -82,23 +86,18 @@ class Viewer(QMainWindow):
         if not all_means:
             return 0.0
 
-        means = torch.cat(all_means, dim=0)
-        diffs = means - self._position.unsqueeze(0)
-        dists = diffs.norm(dim=1)
+        means = torch.cat(all_means, dim=0)  # [N, 3]
+        xz = means[:, [0, 2]]  # [N, 2]
+        xz = xz - xz.mean(dim=0)
 
-        k = min(k, len(dists))
-        _, indices = dists.topk(k, largest=False)
-        nearby = diffs[indices]
+        # 2x2 covariance → eigenvector of largest eigenvalue = principal axis
+        cov = (xz.T @ xz) / xz.shape[0]
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+        principal = eigenvectors[:, -1]  # [2]
 
-        xz = nearby[:, [0, 2]]
-        norms = xz.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        unit_dirs = xz / norms
-        mean_dir = unit_dirs.mean(dim=0)
-        if mean_dir.norm() < 1e-8:
-            return 0.0
-
-        mx, mz = mean_dir[0].item(), mean_dir[1].item()
-        return math.atan2(-mx, -mz)
+        # yaw so camera forward (-sin(yaw), -cos(yaw)) aligns with principal
+        px, pz = principal[0].item(), principal[1].item()
+        return math.atan2(-px, -pz)
 
     def _build_intrinsics(self) -> torch.Tensor:
         fov_y = math.radians(self.fov_y_deg)
