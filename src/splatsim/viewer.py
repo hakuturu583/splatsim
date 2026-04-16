@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pygame
@@ -185,3 +187,19 @@ class Viewer:
             pygame.display.flip()
 
         pygame.quit()
+
+
+def main() -> None:
+    """Entry point: ``python -m splatsim.viewer scene.yaml``."""
+    parser = argparse.ArgumentParser(description="splatsim interactive viewer")
+    parser.add_argument("scene_yaml", type=Path, help="Path to scene YAML file")
+    args = parser.parse_args()
+
+    from splatsim.scene import load_scene
+
+    viewer = load_scene(args.scene_yaml)
+    viewer.run()
+
+
+if __name__ == "__main__":
+    main()
