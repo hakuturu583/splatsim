@@ -55,7 +55,8 @@ class Viewer(QMainWindow):
         # Qt setup
         self._label = QLabel(self)
         self.setCentralWidget(self._label)
-        self.setFixedSize(renderer.width, renderer.height)
+        # After rot90 the display dimensions are swapped
+        self.setFixedSize(renderer.height, renderer.width)
         self.setWindowTitle("splatsim viewer")
 
         # FPS tracking
@@ -191,10 +192,13 @@ class Viewer(QMainWindow):
             image = self.renderer.render(viewmat, self._K, scene=self.scene)
 
         # GPU tensor -> QPixmap
+        # gsplat output is [H, W, 3]. QImage from raw bytes displays rotated
+        # 90° CW on some systems; rotate 90° CCW to compensate, then swap
+        # render dimensions so the final display size stays landscape.
         image_np = (image.clamp(0.0, 1.0) * 255).byte().cpu().numpy()  # [H, W, 3]
-        image_np = np.ascontiguousarray(image_np)
+        image_np = np.ascontiguousarray(np.rot90(image_np))  # 90° CCW → [W, H, 3]
         h, w, _ = image_np.shape
-        qimg = QImage(bytes(image_np.data), w, h, w * 3, QImage.Format.Format_RGB888)
+        qimg = QImage(image_np.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
 
         # Draw HUD overlay
