@@ -18,11 +18,8 @@ jobs:
       - name: Set up Python
         run: uv python install
 
-      - name: Configure git for private dependencies
-        run: git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
-
-      - name: Install dependencies
-        run: uv sync --dev
+      - name: Install dev dependencies only
+        run: uv sync --dev --no-install-project
 
       - name: Run pre-commit
         uses: pre-commit/action@v3.0.1
