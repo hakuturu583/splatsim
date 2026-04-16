@@ -12,6 +12,9 @@ dependencies = [
     "torch==2.4.0+cu124",
     "torchvision==0.19.0+cu124",
     "3dgs-io",
+    "PyQt5>=5.15.0",
+    "pyyaml>=6.0",
+    "setuptools",
 ]
 
 [tool.uv]
@@ -42,6 +45,9 @@ dev = [
     "pytest-cov>=6.0.0",
     "pre-commit>=4.0.0",
 ]
+
+[project.scripts]
+viewer = "splatsim.viewer:main"
 
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]
