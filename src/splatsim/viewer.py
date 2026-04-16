@@ -8,8 +8,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+import time
+
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QImage, QKeyEvent, QPixmap
+from PyQt5.QtGui import QFont, QImage, QKeyEvent, QPainter, QPixmap
 from PyQt5.QtWidgets import QApplication, QLabel, QMainWindow
 
 from splatsim.renderer import Renderer
@@ -55,6 +57,14 @@ class Viewer(QMainWindow):
         self.setCentralWidget(self._label)
         self.setFixedSize(renderer.width, renderer.height)
         self.setWindowTitle("splatsim viewer")
+
+        # FPS tracking
+        self._last_tick_time: float = time.monotonic()
+        self._fps: float = 0.0
+        self._fps_alpha: float = 0.1  # EMA smoothing
+
+        # HUD font
+        self._hud_font = QFont("monospace", 12)
 
         # Render timer (~30 FPS)
         self._timer = QTimer(self)
@@ -157,18 +167,46 @@ class Viewer(QMainWindow):
             self._yaw += rot_speed
 
     def _tick(self) -> None:
+        now = time.monotonic()
+        dt = now - self._last_tick_time
+        self._last_tick_time = now
+        if dt > 0:
+            instant_fps = 1.0 / dt
+            self._fps += self._fps_alpha * (instant_fps - self._fps)
+
         self._handle_input(self._dt)
         viewmat = self._build_viewmat()
 
         with torch.no_grad():
             image = self.renderer.render(viewmat, self._K, scene=self.scene)
 
-        # GPU tensor -> QImage (RGB888)
+        # GPU tensor -> QPixmap
         image_np = (image.clamp(0.0, 1.0) * 255).byte().cpu().numpy()  # [H, W, 3]
         image_np = np.ascontiguousarray(image_np)
         h, w, _ = image_np.shape
         qimg = QImage(bytes(image_np.data), w, h, w * 3, QImage.Format.Format_RGB888)
-        self._label.setPixmap(QPixmap.fromImage(qimg))
+        pixmap = QPixmap.fromImage(qimg)
+
+        # Draw HUD overlay
+        painter = QPainter(pixmap)
+        painter.setFont(self._hud_font)
+        painter.setPen(Qt.GlobalColor.white)
+        x, y, z = (
+            self._position[0].item(),
+            self._position[1].item(),
+            self._position[2].item(),
+        )
+        yaw_deg = math.degrees(self._yaw)
+        lines = [
+            f"XYZ: {x:+8.2f} {y:+8.2f} {z:+8.2f}",
+            f"Yaw: {yaw_deg:+7.1f} deg",
+            f"FPS: {self._fps:5.1f}",
+        ]
+        for i, line in enumerate(lines):
+            painter.drawText(10, 20 + i * 18, line)
+        painter.end()
+
+        self._label.setPixmap(pixmap)
 
     # --- Qt event overrides ---
 
