@@ -112,16 +112,27 @@ class Viewer(QMainWindow):
         )
 
     def _build_viewmat(self) -> torch.Tensor:
+        """Build world-to-camera 4x4 matrix.
+
+        gsplat uses OpenCV/RDF convention: +X=right, +Y=down, +Z=forward.
+        World uses RUB: +X=right, +Y=up, -Z=forward.
+        """
         cos_y = math.cos(self._yaw)
         sin_y = math.sin(self._yaw)
 
-        r_yaw = torch.tensor(
-            [[cos_y, 0.0, sin_y], [0.0, 1.0, 0.0], [-sin_y, 0.0, cos_y]],
+        # World-to-camera rotation:
+        #   cam_X (right)   = world yaw-rotated X
+        #   cam_Y (down)    = world -Y
+        #   cam_Z (forward) = world yaw-rotated -Z
+        r_w2c = torch.tensor(
+            [
+                [cos_y, 0.0, -sin_y],
+                [0.0, -1.0, 0.0],
+                [-sin_y, 0.0, -cos_y],
+            ],
             device=self.renderer.device,
             dtype=torch.float32,
         )
-
-        r_w2c = r_yaw.T
         t_w2c = -r_w2c @ self._position
 
         viewmat = torch.eye(4, device=self.renderer.device, dtype=torch.float32)
