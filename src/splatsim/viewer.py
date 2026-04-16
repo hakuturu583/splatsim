@@ -55,8 +55,7 @@ class Viewer(QMainWindow):
         # Qt setup
         self._label = QLabel(self)
         self.setCentralWidget(self._label)
-        # After rot90 the display dimensions are swapped
-        self.setFixedSize(renderer.height, renderer.width)
+        self.setFixedSize(renderer.width, renderer.height)
         self.setWindowTitle("splatsim viewer")
 
         # FPS tracking
@@ -71,12 +70,13 @@ class Viewer(QMainWindow):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._dt: float = 1.0 / 30.0
+        self._frame_count: int = 0
 
     def _estimate_initial_yaw(self) -> float:
-        """Estimate initial yaw via PCA on the XZ plane.
+        """Estimate initial yaw via PCA on the XZ (horizontal) plane.
 
         Finds the principal (longest) horizontal axis of the point cloud
-        and orients the camera to look along it.
+        and orients the camera to look along it. Y is up.
         """
         all_means: list[torch.Tensor] = []
         if self.scene is not None:
@@ -91,12 +91,10 @@ class Viewer(QMainWindow):
         xz = means[:, [0, 2]]  # [N, 2]
         xz = xz - xz.mean(dim=0)
 
-        # 2x2 covariance → eigenvector of largest eigenvalue = principal axis
         cov = (xz.T @ xz) / xz.shape[0]
         eigenvalues, eigenvectors = torch.linalg.eigh(cov)
         principal = eigenvectors[:, -1]  # [2]
 
-        # yaw so camera forward (-sin(yaw), -cos(yaw)) aligns with principal
         px, pz = principal[0].item(), principal[1].item()
         return math.atan2(-px, -pz)
 
@@ -115,16 +113,16 @@ class Viewer(QMainWindow):
     def _build_viewmat(self) -> torch.Tensor:
         """Build world-to-camera 4x4 matrix.
 
-        gsplat uses OpenCV/RDF convention: +X=right, +Y=down, +Z=forward.
-        World uses RUB: +X=right, +Y=up, -Z=forward.
+        gsplat camera: +X=right, +Y=down, +Z=forward.
+        World (glTF/tile-local): +Y=up, yaw rotates around Y.
         """
         cos_y = math.cos(self._yaw)
         sin_y = math.sin(self._yaw)
 
-        # World-to-camera rotation:
-        #   cam_X (right)   = world yaw-rotated X
+        # World-to-camera rotation (yaw around world Y):
+        #   cam_X (right)   = yaw-rotated horizontal
         #   cam_Y (down)    = world -Y
-        #   cam_Z (forward) = world yaw-rotated -Z
+        #   cam_Z (forward) = yaw-rotated horizontal
         r_w2c = torch.tensor(
             [
                 [cos_y, 0.0, -sin_y],
@@ -192,14 +190,25 @@ class Viewer(QMainWindow):
             image = self.renderer.render(viewmat, self._K, scene=self.scene)
 
         # GPU tensor -> QPixmap
-        # gsplat output is [H, W, 3]. QImage from raw bytes displays rotated
-        # 90° CW on some systems; rotate 90° CCW to compensate, then swap
-        # render dimensions so the final display size stays landscape.
         image_np = (image.clamp(0.0, 1.0) * 255).byte().cpu().numpy()  # [H, W, 3]
-        image_np = np.ascontiguousarray(np.rot90(image_np))  # 90° CCW → [W, H, 3]
+        image_np = np.ascontiguousarray(image_np)
+
+        # Save first frame for debugging orientation
+        if self._frame_count == 0:
+            from PIL import Image as PILImage
+
+            PILImage.fromarray(image_np).save("/tmp/splatsim_frame0_pil.png")
+            print(f"[debug] Saved /tmp/splatsim_frame0_pil.png  shape={image_np.shape}")
+
         h, w, _ = image_np.shape
         qimg = QImage(image_np.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
+
+        if self._frame_count == 0:
+            qimg.save("/tmp/splatsim_frame0_qimage.png")
+            print("[debug] Saved /tmp/splatsim_frame0_qimage.png")
+
         pixmap = QPixmap.fromImage(qimg)
+        self._frame_count += 1
 
         # Draw HUD overlay
         painter = QPainter(pixmap)
