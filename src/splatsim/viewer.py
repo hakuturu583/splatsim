@@ -70,7 +70,6 @@ class Viewer(QMainWindow):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._dt: float = 1.0 / 30.0
-        self._frame_count: int = 0
 
     def _estimate_initial_yaw(self) -> float:
         """Estimate initial yaw via PCA on the XY (horizontal) plane.
@@ -194,23 +193,9 @@ class Viewer(QMainWindow):
         # GPU tensor -> QPixmap
         image_np = (image.clamp(0.0, 1.0) * 255).byte().cpu().numpy()  # [H, W, 3]
         image_np = np.ascontiguousarray(image_np)
-
-        # Save first frame for debugging orientation
-        if self._frame_count == 0:
-            from PIL import Image as PILImage
-
-            PILImage.fromarray(image_np).save("/tmp/splatsim_frame0_pil.png")
-            print(f"[debug] Saved /tmp/splatsim_frame0_pil.png  shape={image_np.shape}")
-
         h, w, _ = image_np.shape
         qimg = QImage(image_np.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
-
-        if self._frame_count == 0:
-            qimg.save("/tmp/splatsim_frame0_qimage.png")
-            print("[debug] Saved /tmp/splatsim_frame0_qimage.png")
-
         pixmap = QPixmap.fromImage(qimg)
-        self._frame_count += 1
 
         # Draw HUD overlay
         painter = QPainter(pixmap)
