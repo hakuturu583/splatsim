@@ -8,7 +8,7 @@ on:
 
 jobs:
   pre-commit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -30,10 +30,8 @@ jobs:
             libboost-system-dev \
             libeigen3-dev \
             libpugixml-dev \
-            libgeographiclib-dev \
+            libgeographic-dev \
             python3-dev
-          # GeographicLib v2 renamed libGeographic to libGeographicLib; create compat symlink
-          sudo ln -sf /usr/lib/x86_64-linux-gnu/libGeographicLib.so /usr/lib/x86_64-linux-gnu/libGeographic.so
 
       - name: Configure git for private dependencies
         run: git config --global url."https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/".insteadOf "https://github.com/"
