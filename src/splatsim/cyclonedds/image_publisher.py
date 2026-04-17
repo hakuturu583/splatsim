@@ -24,7 +24,8 @@ class ImagePublisher:
     participant:
         CycloneDDS domain participant (caller manages its lifetime).
     topic_name:
-        DDS topic name (e.g. ``"/splatsim/image_raw"``).
+        ROS 2 topic name (e.g. ``"/splatsim/image_raw"``).
+        The ``rt/`` DDS prefix is added automatically.
     frame_id:
         ``frame_id`` written into each message header.
     """
@@ -36,7 +37,7 @@ class ImagePublisher:
         frame_id: str = "camera",
     ) -> None:
         self._frame_id = frame_id
-        topic = Topic(participant, topic_name, Image)
+        topic = Topic(participant, _to_dds_topic(topic_name), Image)
         self._writer = DataWriter(participant, topic)
 
     def publish(
@@ -71,6 +72,11 @@ class ImagePublisher:
             data=np.ascontiguousarray(image).tobytes(),
         )
         self._writer.write(msg)
+
+
+def _to_dds_topic(ros_topic: str) -> str:
+    """Convert a ROS 2 topic name to the DDS wire name (``rt/`` prefix)."""
+    return "rt/" + ros_topic.lstrip("/")
 
 
 def _now() -> Time:

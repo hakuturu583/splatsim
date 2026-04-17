@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Protocol
 
 from cyclonedds.pub import DataWriter
 from cyclonedds.topic import Topic
@@ -13,14 +13,29 @@ from splatsim.cyclonedds.msg_types import CameraInfo, Header, RegionOfInterest, 
 if TYPE_CHECKING:
     from cyclonedds.domain import DomainParticipant
 
-    from splatsim.carla_integration.splatsim_camera import SplatSimCameraSensorConfig
+
+class CameraConfig(Protocol):
+    """Anything that exposes pinhole-camera intrinsics."""
+
+    @property
+    def fx(self) -> float: ...
+    @property
+    def fy(self) -> float: ...
+    @property
+    def cx(self) -> float: ...
+    @property
+    def cy(self) -> float: ...
+    @property
+    def image_width(self) -> int: ...
+    @property
+    def image_height(self) -> int: ...
 
 
 class CameraInfoPublisher:
     """Publishes ``sensor_msgs/CameraInfo`` via CycloneDDS.
 
     Intrinsic parameters are precomputed once from a
-    :class:`SplatSimCameraSensorConfig` and reused on every
+    :class:`CameraConfig`-compatible object and reused on every
     :meth:`publish` call—only the header timestamp changes.
 
     Parameters
@@ -38,13 +53,13 @@ class CameraInfoPublisher:
     def __init__(
         self,
         participant: DomainParticipant,
-        config: SplatSimCameraSensorConfig,
+        config: CameraConfig,
         topic_name: str = "/splatsim/camera_info",
         frame_id: str = "camera",
     ) -> None:
         self._frame_id = frame_id
 
-        topic = Topic(participant, topic_name, CameraInfo)
+        topic = Topic(participant, _to_dds_topic(topic_name), CameraInfo)
         self._writer = DataWriter(participant, topic)
 
         # Precompute static intrinsic fields from config.
@@ -130,6 +145,11 @@ class CameraInfoPublisher:
             roi=self._roi,
         )
         self._writer.write(msg)
+
+
+def _to_dds_topic(ros_topic: str) -> str:
+    """Convert a ROS 2 topic name to the DDS wire name (``rt/`` prefix)."""
+    return "rt/" + ros_topic.lstrip("/")
 
 
 def _now() -> Time:

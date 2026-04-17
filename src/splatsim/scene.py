@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
@@ -9,7 +10,11 @@ from splatsim.background import Background
 from splatsim.dataclass import SceneConfig
 from splatsim.renderer import Renderer
 from splatsim.rigid_body import RigidBody
-from splatsim.viewer import Viewer
+
+if TYPE_CHECKING:
+    from splatsim.cyclonedds.camera_info_publisher import CameraInfoPublisher
+    from splatsim.cyclonedds.image_publisher import ImagePublisher
+    from splatsim.viewer import Viewer
 
 
 class Scene:
@@ -94,8 +99,15 @@ class Scene:
         return Scene(background=background, rigid_bodies=rigid_bodies)
 
 
-def load_scene(config: SceneConfig | str | Path) -> Viewer:
+def load_scene(
+    config: SceneConfig | str | Path,
+    *,
+    image_publisher: ImagePublisher | None = None,
+    camera_info_publisher: CameraInfoPublisher | None = None,
+) -> Viewer:
     """Build a Viewer from a SceneConfig or a YAML file path."""
+    from splatsim.viewer import Viewer
+
     if not isinstance(config, SceneConfig):
         config = SceneConfig.from_yaml(config)
 
@@ -119,4 +131,6 @@ def load_scene(config: SceneConfig | str | Path) -> Viewer:
         fov_y_deg=vc.fov_y_deg,
         move_speed=vc.move_speed,
         rotate_speed=vc.rotate_speed,
+        image_publisher=image_publisher,
+        camera_info_publisher=camera_info_publisher,
     )
