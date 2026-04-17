@@ -15,6 +15,7 @@ dependencies = [
     "PyQt5>=5.15.0",
     "pyyaml>=6.0",
     "setuptools",
+    "autoware-carla-scenario[carla-0-9-16]",
 ]
 
 [tool.uv]
@@ -35,6 +36,8 @@ torchvision = [
 ]
 
 3dgs-io = { git = "https://github.com/tier4/3dgs_io.git", branch = "main" }
+
+autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", subdirectory = "autoware_carla_scenario" }
 
 [dependency-groups]
 dev = [
