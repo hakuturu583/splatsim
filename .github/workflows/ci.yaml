@@ -31,6 +31,7 @@ jobs:
             libeigen3-dev \
             libpugixml-dev \
             libgeographic-dev \
+            librange-v3-dev \
             python3-dev
 
       - name: Configure git for private dependencies
