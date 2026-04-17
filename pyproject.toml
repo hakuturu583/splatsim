@@ -38,6 +38,7 @@ torchvision = [
 3dgs-io = { git = "https://github.com/tier4/3dgs_io.git", branch = "main" }
 
 autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", subdirectory = "autoware_carla_scenario" }
+lanelet2-python-api-for-autoware = { git = "https://github.com/tier4/lanelet2_python_api_for_autoware", rev = "7745347645fd04aa8e4230cfa8793e253aad6753" }
 
 [dependency-groups]
 dev = [
