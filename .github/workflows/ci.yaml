@@ -28,6 +28,8 @@ jobs:
             libeigen3-dev \
             libpugixml-dev \
             libgeographiclib-dev
+          # GeographicLib v2 renamed libGeographic to libGeographicLib; create compat symlink
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libGeographicLib.so /usr/lib/x86_64-linux-gnu/libGeographic.so
 
       - name: Configure git for private dependencies
         run: git config --global url."https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/".insteadOf "https://github.com/"
