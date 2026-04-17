@@ -27,7 +27,7 @@ jobs:
             libboost-program-options-dev \
             libeigen3-dev \
             libpugixml-dev \
-            libgeographic-dev
+            libgeographiclib-dev
 
       - name: Configure git for private dependencies
         run: git config --global url."https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/".insteadOf "https://github.com/"
