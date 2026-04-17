@@ -25,6 +25,7 @@ jobs:
             libboost-serialization-dev \
             libboost-filesystem-dev \
             libboost-program-options-dev \
+            libboost-python-dev \
             libeigen3-dev \
             libpugixml-dev \
             libgeographiclib-dev
