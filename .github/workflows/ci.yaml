@@ -18,6 +18,17 @@ jobs:
       - name: Set up Python
         run: uv python install
 
+      - name: Install system dependencies for lanelet2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libboost-serialization-dev \
+            libboost-filesystem-dev \
+            libboost-program-options-dev \
+            libeigen3-dev \
+            libpugixml-dev \
+            libgeographic-dev
+
       - name: Configure git for private dependencies
         run: git config --global url."https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
