@@ -59,7 +59,7 @@ wheels = [
 [[package]]
 name = "autoware-carla-scenario"
 version = "0.1.0"
-source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario#547673c8096c2e04e0d6af4aeb460ef9f09348cf" }
+source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&tag=v2.53.0#034ef94cf45f98fdb88130dd5af30cd2b3b0cfe6" }
 dependencies = [
     { name = "fastapi", marker = "sys_platform == 'linux'" },
     { name = "ffmpeg-python", marker = "sys_platform == 'linux'" },
@@ -1750,7 +1750,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "3dgs-io", git = "https://github.com/tier4/3dgs_io.git?branch=main" },
-    { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario" },
+    { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&tag=v2.53.0" },
     { name = "gsplat", specifier = "==1.5.3" },
     { name = "pyqt5", specifier = ">=5.15.0" },
     { name = "pyyaml", specifier = ">=6.0" },
