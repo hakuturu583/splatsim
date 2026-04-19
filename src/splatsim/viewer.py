@@ -3,12 +3,12 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-import time
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QImage, QKeyEvent, QPainter, QPixmap
@@ -17,6 +17,8 @@ from PyQt5.QtWidgets import QApplication, QLabel, QMainWindow
 from splatsim.renderer import Renderer
 
 if TYPE_CHECKING:
+    from splatsim.cyclonedds.camera_info_publisher import CameraInfoPublisher
+    from splatsim.cyclonedds.image_publisher import ImagePublisher
     from splatsim.scene import Scene
 
 
@@ -31,6 +33,8 @@ class Viewer(QMainWindow):
         fov_y_deg: float = 60.0,
         move_speed: float = 5.0,
         rotate_speed: float = 1.5,
+        image_publisher: ImagePublisher | None = None,
+        camera_info_publisher: CameraInfoPublisher | None = None,
     ) -> None:
         # QApplication must exist before QMainWindow.__init__
         self._app = QApplication.instance() or QApplication(sys.argv)
@@ -65,6 +69,10 @@ class Viewer(QMainWindow):
 
         # HUD font
         self._hud_font = QFont("monospace", 12)
+
+        # DDS publishers (optional)
+        self._image_pub = image_publisher
+        self._camera_info_pub = camera_info_publisher
 
         # Render timer (~30 FPS)
         self._timer = QTimer(self)
@@ -190,9 +198,18 @@ class Viewer(QMainWindow):
         with torch.no_grad():
             image = self.renderer.render(viewmat, self._K, scene=self.scene)
 
-        # GPU tensor -> QPixmap
-        image_np = (image.clamp(0.0, 1.0) * 255).byte().cpu().numpy()  # [H, W, 3]
+        # float32 RGB [H, W, 3] -> uint8 RGB [H, W, 3]
+        image_np = (image.clamp(0.0, 1.0) * 255).byte().cpu().numpy()
         image_np = np.ascontiguousarray(image_np)
+
+        # Publish to DDS
+        if self._image_pub is not None:
+            bgr_np = np.ascontiguousarray(image_np[:, :, ::-1])
+            self._image_pub.publish(bgr_np)
+            if self._camera_info_pub is not None:
+                self._camera_info_pub.publish()
+
+        # Qt display
         h, w, _ = image_np.shape
         qimg = QImage(image_np.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
@@ -212,6 +229,8 @@ class Viewer(QMainWindow):
             f"Yaw: {yaw_deg:+7.1f} deg",
             f"FPS: {self._fps:5.1f}",
         ]
+        if self._image_pub is not None:
+            lines.append("DDS: publishing")
         for i, line in enumerate(lines):
             painter.drawText(10, 20 + i * 18, line)
         painter.end()
@@ -248,11 +267,56 @@ def main() -> None:
     """Entry point: ``uv run viewer scene.yaml``."""
     parser = argparse.ArgumentParser(description="splatsim interactive viewer")
     parser.add_argument("scene_yaml", type=Path, help="Path to scene YAML file")
+    parser.add_argument(
+        "--dds",
+        action="store_true",
+        help="Publish images and camera info via CycloneDDS",
+    )
+    parser.add_argument("--topic-image", default="/splatsim/image_raw")
+    parser.add_argument("--topic-camera-info", default="/splatsim/camera_info")
+    parser.add_argument("--frame-id", default="camera")
     args = parser.parse_args()
 
+    from splatsim.dataclass import SceneConfig
     from splatsim.scene import load_scene
 
-    viewer = load_scene(args.scene_yaml)
+    config = SceneConfig.from_yaml(args.scene_yaml)
+
+    image_pub = None
+    camera_info_pub = None
+    if args.dds:
+        import types
+
+        from cyclonedds.domain import DomainParticipant
+
+        from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
+
+        dp = DomainParticipant()
+        image_pub = ImagePublisher(
+            dp, topic_name=args.topic_image, frame_id=args.frame_id
+        )
+
+        # Build a config-like object with the same intrinsics the Viewer uses.
+        rc, vc = config.renderer, config.viewer
+        fov_y = math.radians(vc.fov_y_deg)
+        fy = rc.height / (2.0 * math.tan(fov_y / 2.0))
+        cam_cfg = types.SimpleNamespace(
+            fx=fy,
+            fy=fy,
+            cx=rc.width / 2.0,
+            cy=rc.height / 2.0,
+            image_width=rc.width,
+            image_height=rc.height,
+        )
+        camera_info_pub = CameraInfoPublisher(
+            dp, cam_cfg, topic_name=args.topic_camera_info, frame_id=args.frame_id
+        )
+
+    viewer = load_scene(
+        config,
+        image_publisher=image_pub,
+        camera_info_publisher=camera_info_pub,
+    )
     viewer.run()
 
 

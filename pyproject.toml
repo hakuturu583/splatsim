@@ -16,6 +16,7 @@ dependencies = [
     "pyyaml>=6.0",
     "setuptools",
     "autoware-carla-scenario[carla-0-9-16]",
+    "cyclonedds>=11.0.1",
 ]
 
 [tool.uv]
