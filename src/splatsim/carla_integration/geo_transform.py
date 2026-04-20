@@ -51,6 +51,11 @@ class GeoTransform:
         ecef_translation: NDArray[np.float64],
         tile_origin: NDArray[np.float64],
     ) -> None:
+        # pyproj's +proj=utm ignores custom lat_0/lon_0 (they are fixed
+        # by the zone).  The autoware xodr GeoReference uses +proj=utm
+        # with a custom origin, which is really a Transverse Mercator.
+        proj_string = _fix_proj_string(proj_string)
+
         # pyproj transformers (thread-safe, reusable)
         self._proj_to_lla = Transformer.from_proj(
             proj_string, "EPSG:4326", always_xy=True
@@ -137,6 +142,47 @@ class GeoTransform:
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+
+def _fix_proj_string(proj_string: str) -> str:
+    """Convert ``+proj=utm`` with custom origin to ``+proj=tmerc``.
+
+    pyproj's UTM implementation fixes ``lat_0`` to 0 and ``lon_0`` to
+    the zone central meridian, silently ignoring any overrides.  The
+    autoware xodr GeoReference encodes a custom origin as
+    ``+proj=utm +zone=N +lat_0=... +lon_0=...`` which is semantically
+    a Transverse Mercator with UTM scale factor (k=0.9996).  We rewrite
+    the string so that pyproj honours the custom origin.
+    """
+    if "+proj=utm" not in proj_string:
+        return proj_string
+
+    # Extract lat_0 / lon_0 — if both are present and non-default,
+    # the string is almost certainly a "custom-origin UTM".
+    lat_match = re.search(r"\+lat_0=([0-9eE.+-]+)", proj_string)
+    lon_match = re.search(r"\+lon_0=([0-9eE.+-]+)", proj_string)
+    if lat_match is None or lon_match is None:
+        return proj_string
+
+    lat_0 = float(lat_match.group(1))
+    if lat_0 == 0.0:
+        # Standard UTM — no fix needed.
+        return proj_string
+
+    lon_0 = float(lon_match.group(1))
+
+    # Strip +proj=utm and +zone=N, replace with +proj=tmerc +k=0.9996
+    fixed = re.sub(r"\+proj=utm\b", "+proj=tmerc", proj_string)
+    fixed = re.sub(r"\+zone=\d+\s*", "", fixed)
+    if "+k=" not in fixed and "+k_0=" not in fixed:
+        fixed = fixed.replace("+proj=tmerc", "+proj=tmerc +k=0.9996")
+
+    logger.info(
+        "Rewrote proj string: +proj=utm → +proj=tmerc (lat_0=%.6f, lon_0=%.6f)",
+        lat_0,
+        lon_0,
+    )
+    return fixed
 
 
 def _enu_to_ecef_rotation(lat_deg: float, lon_deg: float) -> NDArray[np.float64]:
