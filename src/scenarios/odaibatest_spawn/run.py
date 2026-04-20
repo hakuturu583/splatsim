@@ -44,7 +44,7 @@ from .spawn_only import SpawnOnlyScenario
 logger = logging.getLogger(__name__)
 
 # Load .env from the project root (two levels above this file).
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 load_dotenv(_PROJECT_ROOT / ".env")
 
 
