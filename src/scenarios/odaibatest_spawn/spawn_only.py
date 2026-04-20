@@ -1,18 +1,15 @@
 """Spawn-only scenario: spawn ego vehicle at a lanelet coordinate and wait.
 
-This is the simplest possible scenario — it spawns the ego vehicle at
-the configured Lanelet2 pose, attaches the spectator camera, and waits
-until the timeout expires.
-
 Usage::
 
     source .env
-    uv run spawn-scenario ego.spawn_lanelet_id=100 ego.spawn_s=5.0
+    uv run spawn-scenario ego.spawn_lanelet_id=2223437 ego.spawn_s=5.0
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from autoware_carla_scenario import (
     EGO_ROLE_NAME,
@@ -26,23 +23,23 @@ from autoware_carla_scenario import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class SpawnOnlyConfig:
+    """Parameters for the spawn-only scenario."""
+
+    name: str = "spawn_only"
+    timeout_seconds: float = 30.0
+
+
 class SpawnOnlyScenario(BaseScenario):
-    """Spawn the ego at a Lanelet2 pose and hold until timeout.
-
-    The scenario:
-
-    1. Converts the Lanelet2 pose to a CARLA world pose via OpenDRIVE.
-    2. Spawns the ego vehicle at the snapped position.
-    3. Attaches the spectator camera to follow the ego.
-    4. Waits for ``timeout_seconds`` then passes.
-    """
+    """Spawn the ego at a Lanelet2 pose and hold until timeout."""
 
     def __init__(
         self,
         ego_config: EgoConfig,
-        spawn_pose: Lanelet2Pose,
         *,
-        timeout_seconds: float = 30.0,
+        config: SpawnOnlyConfig,
+        spawn_pose: Lanelet2Pose,
         ground_projection: GroundProjectionConfig | None = None,
     ) -> None:
         super().__init__(
@@ -50,7 +47,7 @@ class SpawnOnlyScenario(BaseScenario):
             spawn_pose=spawn_pose,
             ground_projection=ground_projection,
         )
-        self._timeout_seconds = timeout_seconds
+        self._config = config
 
     def setup(self) -> None:
         """Snap ego spawn to CARLA road and attach spectator."""
@@ -68,11 +65,11 @@ class SpawnOnlyScenario(BaseScenario):
             "Ego spawned on lanelet %d (s=%.1f). Waiting %.1f s ...",
             self._spawn_pose.lanelet_id,
             self._spawn_pose.s,
-            self._timeout_seconds,
+            self._config.timeout_seconds,
         )
 
         self.register_pass_condition(
-            TimeoutCondition(self._timeout_seconds, label="spawn_hold_timeout")
+            TimeoutCondition(self._config.timeout_seconds, label="spawn_hold_timeout")
         )
 
     def is_done(self) -> bool:
