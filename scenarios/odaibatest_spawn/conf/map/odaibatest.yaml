@@ -1,0 +1,9 @@
+# @package _global_
+# Odaibatest map configuration for CARLA scenarios.
+#
+# Override paths via CLI:
+#   uv run spawn-scenario map.xodr_path=/other/path.xodr
+map:
+  name: odaibatest
+  xodr_path: ${oc.env:ODAIBATEST_XODR_PATH}
+  lanelet2_path: ${oc.env:ODAIBATEST_LANELET2_PATH}

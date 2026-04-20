@@ -1,0 +1,6 @@
+# @package _global_
+ego:
+  vehicle_type: vehicle.mini.cooper
+  initial_speed_kmh: 0.0
+  spawn_lanelet_id: 100
+  spawn_s: 5.0

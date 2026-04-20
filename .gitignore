@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Lanelet2 map data (large binary-like files)
+test/data/osm/
+
+# Environment variables
+.env
