@@ -1,0 +1,4 @@
+# @package _global_
+scenario:
+  name: spawn_only
+  timeout_seconds: 30.0
