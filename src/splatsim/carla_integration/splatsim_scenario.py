@@ -6,16 +6,25 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
+import carla
+
 from autoware_carla_scenario.scenario_base import BaseScenario, EgoConfig
 
 from splatsim.carla_integration.attach_splatsim_camera import (
     AttachSplatSimCameraAction,
 )
 from splatsim.carla_integration.geo_transform import GeoTransform, parse_geo_reference
-from splatsim.carla_integration.splatsim_camera import SplatSimCameraSensorConfig
+from splatsim.carla_integration.splatsim_camera import (
+    SplatSimCameraSensor,
+    SplatSimCameraSensorConfig,
+)
+from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
+from splatsim.cyclonedds.msg_types import Time
 from splatsim.scene import Scene
 
 if TYPE_CHECKING:
+    from cyclonedds.domain import DomainParticipant
+
     from autoware_carla_scenario.actions import TickTiming
     from autoware_carla_scenario.conditions.base import BaseCondition
     from autoware_carla_scenario.coordinate import (
@@ -85,6 +94,9 @@ class SplatSimScenario(BaseScenario):
         self._sensor_config = sensor_config
         self._geo_transform: GeoTransform | None = None
 
+        # Registered camera actions and their publishers.
+        self._camera_entries: list[_CameraEntry] = []
+
     # -- public properties ---------------------------------------------------
 
     @property
@@ -94,7 +106,7 @@ class SplatSimScenario(BaseScenario):
 
     @property
     def geo_transform(self) -> GeoTransform:
-        """The CARLA ↔ tile-local coordinate transform.
+        """The CARLA <-> tile-local coordinate transform.
 
         Created lazily on first access from the CARLA map's xodr
         ``<geoReference>`` and the scene's tileset ECEF transform.
@@ -114,10 +126,17 @@ class SplatSimScenario(BaseScenario):
         timing: TickTiming | None = None,
         label: str = "attach_splatsim_camera",
         once: bool = True,
+        dds_participant: DomainParticipant | None = None,
+        image_topic: str = "/splatsim/image_raw",
+        camera_info_topic: str = "/splatsim/camera_info",
+        frame_id: str = "splatsim_camera",
     ) -> AttachSplatSimCameraAction:
         """Create and register an action that attaches a SplatSim camera.
 
         The action is automatically registered via :meth:`register_post_tick`.
+        If *dds_participant* is provided, :class:`ImagePublisher` and
+        :class:`CameraInfoPublisher` are created and the camera is included
+        in :meth:`publish_ros_topics`.
 
         Parameters
         ----------
@@ -137,6 +156,15 @@ class SplatSimScenario(BaseScenario):
             Human-readable action identifier.
         once:
             If *True* (default), the action fires at most once.
+        dds_participant:
+            CycloneDDS domain participant for ROS 2 publishing.  When
+            *None*, no publishers are created (render-only mode).
+        image_topic:
+            ROS 2 topic name for ``sensor_msgs/Image``.
+        camera_info_topic:
+            ROS 2 topic name for ``sensor_msgs/CameraInfo``.
+        frame_id:
+            ``frame_id`` written into each published message header.
 
         Returns
         -------
@@ -162,7 +190,67 @@ class SplatSimScenario(BaseScenario):
             once=once,
         )
         self.register_post_tick(action)
+
+        # Create publishers if a DDS participant was provided.
+        image_pub: ImagePublisher | None = None
+        if dds_participant is not None:
+            image_pub = ImagePublisher(
+                dds_participant,
+                topic_name=image_topic,
+                frame_id=frame_id,
+            )
+
+        self._camera_entries.append(
+            _CameraEntry(
+                action=action,
+                image_pub=image_pub,
+                camera_info_pub=None,
+                dds_participant=dds_participant,
+                camera_info_topic=camera_info_topic,
+                frame_id=frame_id,
+            )
+        )
         return action
+
+    def publish_ros_topics(self, world: carla.World) -> None:
+        """Render all attached SplatSim cameras and publish to ROS 2.
+
+        This should be registered as a post-tick callback via
+        :meth:`register_post_tick`.  Image and CameraInfo messages
+        share the same timestamp derived from the CARLA world snapshot.
+
+        Parameters
+        ----------
+        world:
+            The current CARLA world (passed by the tick loop).
+        """
+        # CARLA simulation timestamp → ROS 2 Time
+        snapshot = world.get_snapshot()
+        stamp = _carla_timestamp_to_ros(snapshot.timestamp)
+
+        for entry in self._camera_entries:
+            sensor = entry.action.sensor
+            if sensor is None:
+                continue
+            assert isinstance(sensor, SplatSimCameraSensor)  # noqa: S101
+
+            image = sensor.get_image()
+
+            if entry.image_pub is not None:
+                entry.image_pub.publish(image, stamp=stamp)
+
+            # Lazily create CameraInfo publisher (needs intrinsics from
+            # the sensor config, available only after attachment).
+            if entry.camera_info_pub is None and entry.dds_participant is not None:
+                entry.camera_info_pub = CameraInfoPublisher(
+                    entry.dds_participant,
+                    sensor.config,
+                    topic_name=entry.camera_info_topic,
+                    frame_id=entry.frame_id,
+                )
+
+            if entry.camera_info_pub is not None:
+                entry.camera_info_pub.publish(stamp=stamp)
 
     # -- internals -----------------------------------------------------------
 
@@ -191,3 +279,49 @@ class SplatSimScenario(BaseScenario):
             ecef_translation=bg._ecef_translation,
             tile_origin=tile_origin,
         )
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+class _CameraEntry:
+    """Bookkeeping for one attached SplatSim camera + its publishers."""
+
+    __slots__ = (
+        "action",
+        "camera_info_pub",
+        "camera_info_topic",
+        "dds_participant",
+        "frame_id",
+        "image_pub",
+    )
+
+    def __init__(
+        self,
+        *,
+        action: AttachSplatSimCameraAction,
+        image_pub: ImagePublisher | None,
+        camera_info_pub: CameraInfoPublisher | None,
+        dds_participant: DomainParticipant | None,
+        camera_info_topic: str,
+        frame_id: str,
+    ) -> None:
+        self.action = action
+        self.image_pub = image_pub
+        self.camera_info_pub = camera_info_pub
+        self.dds_participant = dds_participant
+        self.camera_info_topic = camera_info_topic
+        self.frame_id = frame_id
+
+
+def _carla_timestamp_to_ros(ts: carla.Timestamp) -> Time:
+    """Convert a CARLA simulation timestamp to a ROS 2 ``Time``.
+
+    Uses ``elapsed_seconds`` (simulation time since episode start) so
+    that all sensors referencing the same tick produce identical stamps.
+    """
+    elapsed_ns = int(ts.elapsed_seconds * 1e9)
+    sec, nanosec = divmod(elapsed_ns, 10**9)
+    return Time(sec=sec, nanosec=nanosec)

@@ -7,14 +7,13 @@ via CycloneDDS.
 Usage::
 
     source .env
-    uv run spawn-scenario ego.spawn_lanelet_id=2223437 ego.spawn_s=5.0
+    uv run spawn-scenario ego.spawn_lanelet_id=2303321 ego.spawn_s=0.0
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from cyclonedds.domain import DomainParticipant
 
@@ -27,15 +26,10 @@ from autoware_carla_scenario import (
 )
 
 from splatsim.carla_integration import (
-    SplatSimCameraSensor,
     SplatSimCameraSensorConfig,
     SplatSimConfig,
     SplatSimScenario,
 )
-from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
-
-if TYPE_CHECKING:
-    import carla
 
 logger = logging.getLogger(__name__)
 
@@ -68,33 +62,27 @@ class SpawnOnlyScenario(SplatSimScenario):
         )
         self._config = config
         self._splatsim_cfg = splatsim_config
-        self._camera_action = None
-        self._image_pub: ImagePublisher | None = None
-        self._camera_info_pub: CameraInfoPublisher | None = None
-        self._dds_participant: DomainParticipant | None = None
 
     def setup(self) -> None:
         """Snap ego spawn, attach SplatSim camera, set up ROS 2 publishers."""
         self._setup_ego_spawn()
 
+        scfg = self._splatsim_cfg
+        dds_participant = DomainParticipant()
+
         # Attach SplatSim camera to ego vehicle (1.5m above base_link)
-        self._camera_action = self.attach_splatsim_camera(
+        self.attach_splatsim_camera(
             EGO_ROLE_NAME,
             sensor_config=SplatSimCameraSensorConfig(position_z=1.5),
             label="ego_splatsim_camera",
-        )
-
-        # Set up CycloneDDS publishers for ROS 2 output
-        scfg = self._splatsim_cfg
-        self._dds_participant = DomainParticipant()
-        self._image_pub = ImagePublisher(
-            self._dds_participant,
-            topic_name=scfg.image_topic,
+            dds_participant=dds_participant,
+            image_topic=scfg.image_topic,
+            camera_info_topic=scfg.camera_info_topic,
             frame_id=scfg.frame_id,
         )
 
-        # Register post-tick callback to render and publish
-        self.register_post_tick(self._publish_splatsim_image)
+        # Register the shared publish callback
+        self.register_post_tick(self.publish_ros_topics)
 
         assert self._spawn_pose is not None  # noqa: S101
         logger.info(
@@ -110,31 +98,6 @@ class SpawnOnlyScenario(SplatSimScenario):
         self.register_pass_condition(
             TimeoutCondition(self._config.timeout_seconds, label="spawn_hold_timeout")
         )
-
-    def _publish_splatsim_image(self, world: carla.World) -> None:
-        """Render via SplatSim and publish image + camera_info to ROS 2."""
-        if self._camera_action is None or self._camera_action.sensor is None:
-            return
-
-        sensor = self._camera_action.sensor
-        assert isinstance(sensor, SplatSimCameraSensor)  # noqa: S101
-        image = sensor.get_image()
-
-        if self._image_pub is not None:
-            self._image_pub.publish(image)
-
-        # Lazily create camera_info publisher after sensor is attached
-        # (need sensor config for intrinsics)
-        if self._camera_info_pub is None and self._dds_participant is not None:
-            self._camera_info_pub = CameraInfoPublisher(
-                self._dds_participant,
-                sensor.config,
-                topic_name=self._splatsim_cfg.camera_info_topic,
-                frame_id=self._splatsim_cfg.frame_id,
-            )
-
-        if self._camera_info_pub is not None:
-            self._camera_info_pub.publish()
 
     def is_done(self) -> bool:
         """Always ``False`` -- termination is driven by the timeout condition."""
