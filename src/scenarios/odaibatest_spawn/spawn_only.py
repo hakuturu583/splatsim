@@ -26,7 +26,11 @@ from autoware_carla_scenario import (
     TimeoutCondition,
 )
 
-from splatsim.carla_integration import SplatSimCameraSensor, SplatSimScenario
+from splatsim.carla_integration import (
+    SplatSimCameraSensor,
+    SplatSimCameraSensorConfig,
+    SplatSimScenario,
+)
 from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
 
 if TYPE_CHECKING:
@@ -82,9 +86,10 @@ class SpawnOnlyScenario(SplatSimScenario):
         """Snap ego spawn, attach SplatSim camera, set up ROS 2 publishers."""
         self._setup_ego_spawn()
 
-        # Attach SplatSim camera to ego vehicle
+        # Attach SplatSim camera to ego vehicle (1.5m above base_link)
         self._camera_action = self.attach_splatsim_camera(
             EGO_ROLE_NAME,
+            sensor_config=SplatSimCameraSensorConfig(position_z=1.5),
             label="ego_splatsim_camera",
         )
 
