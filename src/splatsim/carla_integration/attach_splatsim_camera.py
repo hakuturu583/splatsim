@@ -11,11 +11,9 @@ from splatsim.carla_integration.splatsim_camera import (
 )
 
 if TYPE_CHECKING:
-    import numpy as np
-    from numpy.typing import NDArray
-
     from autoware_carla_scenario.conditions.base import BaseCondition
     from autoware_carla_scenario.entity_role import EntityRole
+    from splatsim.carla_integration.geo_transform import GeoTransform
     from splatsim.scene import Scene
 
 
@@ -36,23 +34,22 @@ class AttachSplatSimCameraAction(AttachCameraSensorAction):
     scene:
         The :class:`~splatsim.scene.Scene` containing the Gaussian
         Splatting background and rigid bodies to render.
+    geo_transform:
+        :class:`GeoTransform` for CARLA ↔ tile-local conversion.
     sensor_config:
         Camera and renderer configuration.  Falls back to
         :class:`SplatSimCameraSensorConfig` defaults when *None*.
-    carla_to_splatsim:
-        Optional 4 x 4 matrix that converts CARLA-world coordinates
-        to the SplatSim scene coordinate frame.  Identity by default.
     """
 
     def __init__(
         self,
         entity_name: Union[EntityRole, str],
         scene: Scene,
+        geo_transform: GeoTransform,
         sensor_config: SplatSimCameraSensorConfig | None = None,
         condition: BaseCondition | None = None,
         timing: TickTiming = TickTiming.POST_TICK,
         *,
-        carla_to_splatsim: NDArray[np.float64] | None = None,
         label: str = "attach_splatsim_camera",
         once: bool = True,
     ) -> None:
@@ -60,7 +57,7 @@ class AttachSplatSimCameraAction(AttachCameraSensorAction):
             sensor_config = SplatSimCameraSensorConfig()
         self._splatsim_config = sensor_config
         self._scene = scene
-        self._carla_to_splatsim = carla_to_splatsim
+        self._geo_transform = geo_transform
         super().__init__(
             entity_name,
             sensor_config,
@@ -74,5 +71,5 @@ class AttachSplatSimCameraAction(AttachCameraSensorAction):
         return SplatSimCameraSensor(
             self._splatsim_config,
             self._scene,
-            carla_to_splatsim=self._carla_to_splatsim,
+            geo_transform=self._geo_transform,
         )

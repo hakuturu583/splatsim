@@ -13,6 +13,7 @@ from autoware_carla_scenario.sensor import CameraSensorBase, CameraSensorConfig
 from splatsim.renderer import Renderer
 
 if TYPE_CHECKING:
+    from splatsim.carla_integration.geo_transform import GeoTransform
     from splatsim.scene import Scene
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,10 @@ class SplatSimCameraSensor(CameraSensorBase):
     Instead of capturing images from CARLA's built-in camera sensor,
     this sensor renders the Gaussian Splatting scene from the
     perspective of a CARLA actor using gsplat rasterization.
+
+    All coordinate conversion is done in float64 via :class:`GeoTransform`
+    to avoid floating-point precision issues.  The final view matrix is
+    cast to float32 only when passed to the gsplat rasteriser.
     """
 
     def __init__(
@@ -41,22 +46,13 @@ class SplatSimCameraSensor(CameraSensorBase):
         config: SplatSimCameraSensorConfig,
         scene: Scene,
         *,
-        carla_to_splatsim: NDArray[np.float64] | None = None,
+        geo_transform: GeoTransform,
     ) -> None:
         super().__init__(config)
         self._splatsim_config = config
         self._scene = scene
         self._device = torch.device(config.device)
-
-        # Track whether the user explicitly provided the transform.
-        self._transform_provided = carla_to_splatsim is not None
-
-        # Coordinate transform: CARLA world -> SplatSim world (4x4).
-        self._carla_to_splatsim: NDArray[np.float64] = (
-            np.asarray(carla_to_splatsim, dtype=np.float64)
-            if carla_to_splatsim is not None
-            else np.eye(4, dtype=np.float64)
-        )
+        self._geo_transform = geo_transform
 
         self._renderer = Renderer(
             width=config.image_width,
@@ -75,7 +71,6 @@ class SplatSimCameraSensor(CameraSensorBase):
         )
 
         self._actor: carla.Actor | None = None
-        self._auto_aligned = False
 
     # -- public properties ---------------------------------------------------
 
@@ -113,10 +108,6 @@ class SplatSimCameraSensor(CameraSensorBase):
         if self._actor is None:
             return None
 
-        # Auto-compute carla_to_splatsim on first call if not provided.
-        if not self._transform_provided and not self._auto_aligned:
-            self._auto_align()
-
         viewmat = self._compute_viewmat()
 
         with torch.no_grad():
@@ -129,100 +120,56 @@ class SplatSimCameraSensor(CameraSensorBase):
 
     # -- internals -----------------------------------------------------------
 
-    def _scene_centroid(self) -> NDArray[np.float64] | None:
-        """Compute the centroid of all Gaussian means in the scene."""
-        all_means: list[torch.Tensor] = []
-        if self._scene.background is not None:
-            all_means.append(self._scene.background.tensors.means)
-        for rb in self._scene.rigid_body_list:
-            all_means.append(rb.tensors.means)
-        if not all_means:
-            return None
-        centroid: NDArray[np.float64] = (
-            torch.cat(all_means, dim=0).mean(dim=0).cpu().numpy().astype(np.float64)
-        )
-        return centroid
-
-    def _auto_align(self) -> None:
-        """Auto-compute a translation-only carla_to_splatsim transform.
-
-        Maps the current CARLA camera position to the scene centroid so
-        that the rendered image is not blank.  This is an approximation;
-        for accurate alignment provide an explicit ``carla_to_splatsim``.
-        """
-        self._auto_aligned = True
-
-        centroid = self._scene_centroid()
-        if centroid is None:
-            logger.warning("Cannot auto-align: scene has no Gaussians")
-            return
-
-        assert self._actor is not None  # noqa: S101
-        carla_pos = np.asarray(
-            [
-                self._actor.get_location().x,
-                self._actor.get_location().y,
-                self._actor.get_location().z,
-            ],
-            dtype=np.float64,
-        )
-
-        offset = centroid - carla_pos
-        self._carla_to_splatsim = np.eye(4, dtype=np.float64)
-        self._carla_to_splatsim[:3, 3] = offset
-
-        logger.warning(
-            "carla_to_splatsim not provided — auto-aligned with translation only. "
-            "CARLA pos=(%.1f, %.1f, %.1f) -> scene centroid=(%.1f, %.1f, %.1f), "
-            "offset=(%.1f, %.1f, %.1f). "
-            "For accurate results, provide an explicit carla_to_splatsim transform.",
-            *carla_pos,
-            *centroid,
-            *offset,
-        )
-
     def _compute_viewmat(self) -> torch.Tensor:
         """Build a gsplat-compatible 4x4 view matrix from the CARLA actor pose.
 
-        Coordinate pipeline
-        --------------------
-        1. Actor world pose in CARLA frame  (``T_world_actor``)
-        2. + sensor offset in actor-local   (``T_actor_camera``)
-        3. * ``carla_to_splatsim``           → camera in SplatSim world
-        4. Remap CARLA camera axes (X=fwd, Y=right, Z=up)
-           to gsplat RDF axes     (X=right, Y=down,  Z=fwd)
-        5. Invert to get world-to-camera    → ``viewmat``
+        All intermediate computation is in float64 (via :class:`GeoTransform`)
+        to avoid precision loss with large ECEF / UTM coordinates.
+        The final 4x4 matrix is small-valued (tile-local, re-centered) and
+        safe to cast to float32.
+
+        Pipeline
+        --------
+        1. Camera pose in CARLA world (actor * sensor offset)
+        2. Position: CARLA → xodr → LLA → ECEF → tile-local − origin  (float64)
+        3. Rotation: CARLA → ENU → ECEF → tile-local                   (float64)
+        4. Remap camera axes (X=fwd, Y=right, Z=up) to gsplat RDF
+        5. Invert camera-to-world → world-to-camera view matrix
         """
         assert self._actor is not None  # noqa: S101
         cfg = self.config
 
-        # 1. Actor world pose in CARLA coordinates
+        # 1. Camera pose in CARLA world
         T_world_actor = np.asarray(
             self._actor.get_transform().get_matrix(), dtype=np.float64
         )
-
-        # 2. Sensor offset in actor-local frame (CARLA convention)
         sensor_tf = carla.Transform(
             carla.Location(x=cfg.position_x, y=cfg.position_y, z=cfg.position_z),
             carla.Rotation(roll=cfg.roll, pitch=cfg.pitch, yaw=cfg.yaw),
         )
         T_actor_camera = np.asarray(sensor_tf.get_matrix(), dtype=np.float64)
+        T_carla_cam = T_world_actor @ T_actor_camera
 
-        # 3. Camera world pose in SplatSim coordinates
-        T_cam = self._carla_to_splatsim @ T_world_actor @ T_actor_camera
+        carla_pos = T_carla_cam[:3, 3]
+        R_carla = T_carla_cam[:3, :3]
 
-        # 4. Remap CARLA camera axes to gsplat RDF:
-        #    gsplat right (X)   = CARLA right   (Y) = R[:, 1]
-        #    gsplat down  (Y)   = CARLA -up    (-Z) = -R[:, 2]
-        #    gsplat forward (Z) = CARLA forward (X) = R[:, 0]
-        R = T_cam[:3, :3]
-        t = T_cam[:3, 3]
+        # 2. Position in re-centered tile-local (float64)
+        tile_pos = self._geo_transform.carla_position_to_tile_local(
+            carla_pos[0], carla_pos[1], carla_pos[2]
+        )
 
-        R_rdf = np.column_stack([R[:, 1], -R[:, 2], R[:, 0]])
+        # 3. Rotation in tile-local (float64)
+        R_tile = self._geo_transform.carla_rotation_to_tile_local(R_carla)
 
-        # 5. Invert camera-to-world -> world-to-camera
+        # 4. Remap camera axes (X=fwd, Y=right, Z=up) to gsplat RDF:
+        #    gsplat right (X)   = camera right   (Y) = R_tile[:, 1]
+        #    gsplat down  (Y)   = camera -up    (-Z) = -R_tile[:, 2]
+        #    gsplat forward (Z) = camera forward (X) = R_tile[:, 0]
+        R_rdf = np.column_stack([R_tile[:, 1], -R_tile[:, 2], R_tile[:, 0]])
+
+        # 5. Invert camera-to-world → world-to-camera
         viewmat = np.eye(4, dtype=np.float64)
         viewmat[:3, :3] = R_rdf.T
-        viewmat[:3, 3] = -(R_rdf.T @ t)
+        viewmat[:3, 3] = -(R_rdf.T @ tile_pos)
 
         return torch.tensor(viewmat, device=self._device, dtype=torch.float32)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
@@ -10,13 +11,11 @@ from autoware_carla_scenario.scenario_base import BaseScenario, EgoConfig
 from splatsim.carla_integration.attach_splatsim_camera import (
     AttachSplatSimCameraAction,
 )
+from splatsim.carla_integration.geo_transform import GeoTransform, parse_geo_reference
 from splatsim.carla_integration.splatsim_camera import SplatSimCameraSensorConfig
 from splatsim.scene import Scene
 
 if TYPE_CHECKING:
-    import numpy as np
-    from numpy.typing import NDArray
-
     from autoware_carla_scenario.actions import TickTiming
     from autoware_carla_scenario.conditions.base import BaseCondition
     from autoware_carla_scenario.coordinate import (
@@ -26,6 +25,8 @@ if TYPE_CHECKING:
     from autoware_carla_scenario.entity_role import EntityRole
     from splatsim.dataclass import SceneConfig
 
+logger = logging.getLogger(__name__)
+
 
 class SplatSimScenario(BaseScenario):
     """Abstract base class for CARLA scenarios with SplatSim rendering.
@@ -33,6 +34,10 @@ class SplatSimScenario(BaseScenario):
     Extends :class:`BaseScenario` so that subclasses have full access to
     the CARLA client, world, ego vehicle helpers **and** a SplatSim
     :class:`~splatsim.scene.Scene` for Gaussian Splatting rendering.
+
+    The geographic transform between CARLA world coordinates and the
+    3DGS tile-local frame is computed automatically from the xodr
+    ``<geoReference>`` and the tileset.json ECEF transform.
 
     Parameters
     ----------
@@ -49,9 +54,6 @@ class SplatSimScenario(BaseScenario):
         Ground-projection settings for snapping to the CARLA road surface.
     random_seed:
         Seed for the CARLA TrafficManager random device.
-    carla_to_splatsim:
-        Optional 4 x 4 matrix that converts CARLA-world coordinates to
-        the SplatSim scene coordinate frame.  Identity by default.
     sensor_config:
         Default camera / renderer configuration used by
         :meth:`attach_splatsim_camera`.  Falls back to
@@ -66,7 +68,6 @@ class SplatSimScenario(BaseScenario):
         spawn_pose: Lanelet2Pose | None = None,
         ground_projection: GroundProjectionConfig | None = None,
         random_seed: int = BaseScenario.DEFAULT_RANDOM_SEED,
-        carla_to_splatsim: NDArray[np.float64] | None = None,
         sensor_config: SplatSimCameraSensorConfig | None = None,
     ) -> None:
         super().__init__(
@@ -81,8 +82,8 @@ class SplatSimScenario(BaseScenario):
         else:
             self._scene = Scene.from_config(scene)
 
-        self._carla_to_splatsim = carla_to_splatsim
         self._sensor_config = sensor_config
+        self._geo_transform: GeoTransform | None = None
 
     # -- public properties ---------------------------------------------------
 
@@ -91,6 +92,17 @@ class SplatSimScenario(BaseScenario):
         """The Gaussian Splatting scene used for rendering."""
         return self._scene
 
+    @property
+    def geo_transform(self) -> GeoTransform:
+        """The CARLA ↔ tile-local coordinate transform.
+
+        Created lazily on first access from the CARLA map's xodr
+        ``<geoReference>`` and the scene's tileset ECEF transform.
+        """
+        if self._geo_transform is None:
+            self._geo_transform = self._build_geo_transform()
+        return self._geo_transform
+
     # -- convenience helpers -------------------------------------------------
 
     def attach_splatsim_camera(
@@ -98,7 +110,6 @@ class SplatSimScenario(BaseScenario):
         entity_name: Union[EntityRole, str],
         *,
         sensor_config: SplatSimCameraSensorConfig | None = None,
-        carla_to_splatsim: NDArray[np.float64] | None = None,
         condition: BaseCondition | None = None,
         timing: TickTiming | None = None,
         label: str = "attach_splatsim_camera",
@@ -106,8 +117,7 @@ class SplatSimScenario(BaseScenario):
     ) -> AttachSplatSimCameraAction:
         """Create and register an action that attaches a SplatSim camera.
 
-        The action is automatically registered via :meth:`register_pre_tick`
-        or :meth:`register_post_tick` depending on *timing*.
+        The action is automatically registered via :meth:`register_post_tick`.
 
         Parameters
         ----------
@@ -118,9 +128,6 @@ class SplatSimScenario(BaseScenario):
             Per-call override.  Falls back to the instance-level
             ``sensor_config`` passed at construction, then to
             :class:`SplatSimCameraSensorConfig` defaults.
-        carla_to_splatsim:
-            Per-call override for the coordinate transform.  Falls back
-            to the instance-level ``carla_to_splatsim``.
         condition:
             Optional trigger condition for the action.
         timing:
@@ -143,21 +150,45 @@ class SplatSimScenario(BaseScenario):
             timing = _TickTiming.POST_TICK
 
         config = sensor_config or self._sensor_config
-        transform = (
-            carla_to_splatsim
-            if carla_to_splatsim is not None
-            else self._carla_to_splatsim
-        )
 
         action = AttachSplatSimCameraAction(
             entity_name,
             self._scene,
+            self.geo_transform,
             sensor_config=config,
             condition=condition,
             timing=timing,
-            carla_to_splatsim=transform,
             label=label,
             once=once,
         )
         self.register_post_tick(action)
         return action
+
+    # -- internals -----------------------------------------------------------
+
+    def _build_geo_transform(self) -> GeoTransform:
+        """Build :class:`GeoTransform` from the CARLA map and scene data."""
+        import numpy as _np  # noqa: PLC0415
+
+        # 1. Parse PROJ string from CARLA xodr
+        xodr_xml = self.world.get_map().to_opendrive()
+        proj_string = parse_geo_reference(xodr_xml)
+        logger.info("GeoReference proj string: %s", proj_string)
+
+        # 2. Get tileset ECEF rotation/translation from Background
+        bg = self._scene.background
+        if bg is None:
+            raise RuntimeError(
+                "Cannot build GeoTransform: scene has no Background "
+                "(no tileset.json ECEF data)"
+            )
+
+        # 3. Get tile origin (torch Tensor on GPU → numpy float64)
+        tile_origin = bg.origin.cpu().numpy().astype(_np.float64)
+
+        return GeoTransform(
+            proj_string=proj_string,
+            ecef_rotation=bg._ecef_rotation,
+            ecef_translation=bg._ecef_translation,
+            tile_origin=tile_origin,
+        )

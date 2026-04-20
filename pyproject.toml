@@ -19,6 +19,7 @@ dependencies = [
     "autoware-lanelet2-to-opendrive",
     "cyclonedds>=11.0.1",
     "python-dotenv>=1.0.0",
+    "pyproj>=3.7.1",
 ]
 
 [tool.uv]
