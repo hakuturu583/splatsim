@@ -29,6 +29,7 @@ from autoware_carla_scenario import (
 from splatsim.carla_integration import (
     SplatSimCameraSensor,
     SplatSimCameraSensorConfig,
+    SplatSimConfig,
     SplatSimScenario,
 )
 from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
@@ -45,16 +46,6 @@ class SpawnOnlyConfig:
 
     name: str = "spawn_only"
     timeout_seconds: float = 30.0
-
-
-@dataclass
-class SplatSimConfig:
-    """SplatSim rendering and ROS 2 publishing parameters."""
-
-    scene_yaml: str = ""
-    image_topic: str = "/splatsim/image_raw"
-    camera_info_topic: str = "/splatsim/camera_info"
-    frame_id: str = "splatsim_camera"
 
 
 class SpawnOnlyScenario(SplatSimScenario):

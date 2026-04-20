@@ -25,7 +25,9 @@ import hydra
 from autoware_carla_scenario import BaseScenario, EgoConfig
 from autoware_carla_scenario.examples.run import build_ego_and_spawn, run_scenario
 
-from .spawn_only import SplatSimConfig, SpawnOnlyConfig, SpawnOnlyScenario
+from splatsim.carla_integration import SplatSimConfig
+
+from .spawn_only import SpawnOnlyConfig, SpawnOnlyScenario
 
 logger = logging.getLogger(__name__)
 
