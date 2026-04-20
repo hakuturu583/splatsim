@@ -2,5 +2,5 @@
 ego:
   vehicle_type: vehicle.mini.cooper_s_2021
   initial_speed_kmh: 0.0
-  spawn_lanelet_id: 2303327
-  spawn_s: 50.0
+  spawn_lanelet_id: 2303321
+  spawn_s: 0.0
