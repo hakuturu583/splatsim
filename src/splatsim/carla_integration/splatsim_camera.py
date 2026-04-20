@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -13,6 +14,8 @@ from splatsim.renderer import Renderer
 
 if TYPE_CHECKING:
     from splatsim.scene import Scene
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,9 @@ class SplatSimCameraSensor(CameraSensorBase):
         self._scene = scene
         self._device = torch.device(config.device)
 
+        # Track whether the user explicitly provided the transform.
+        self._transform_provided = carla_to_splatsim is not None
+
         # Coordinate transform: CARLA world -> SplatSim world (4x4).
         self._carla_to_splatsim: NDArray[np.float64] = (
             np.asarray(carla_to_splatsim, dtype=np.float64)
@@ -69,6 +75,7 @@ class SplatSimCameraSensor(CameraSensorBase):
         )
 
         self._actor: carla.Actor | None = None
+        self._auto_aligned = False
 
     # -- public properties ---------------------------------------------------
 
@@ -106,6 +113,10 @@ class SplatSimCameraSensor(CameraSensorBase):
         if self._actor is None:
             return None
 
+        # Auto-compute carla_to_splatsim on first call if not provided.
+        if not self._transform_provided and not self._auto_aligned:
+            self._auto_align()
+
         viewmat = self._compute_viewmat()
 
         with torch.no_grad():
@@ -117,6 +128,58 @@ class SplatSimCameraSensor(CameraSensorBase):
         return bgr_np
 
     # -- internals -----------------------------------------------------------
+
+    def _scene_centroid(self) -> NDArray[np.float64] | None:
+        """Compute the centroid of all Gaussian means in the scene."""
+        all_means: list[torch.Tensor] = []
+        if self._scene.background is not None:
+            all_means.append(self._scene.background.tensors.means)
+        for rb in self._scene.rigid_body_list:
+            all_means.append(rb.tensors.means)
+        if not all_means:
+            return None
+        centroid: NDArray[np.float64] = (
+            torch.cat(all_means, dim=0).mean(dim=0).cpu().numpy().astype(np.float64)
+        )
+        return centroid
+
+    def _auto_align(self) -> None:
+        """Auto-compute a translation-only carla_to_splatsim transform.
+
+        Maps the current CARLA camera position to the scene centroid so
+        that the rendered image is not blank.  This is an approximation;
+        for accurate alignment provide an explicit ``carla_to_splatsim``.
+        """
+        self._auto_aligned = True
+
+        centroid = self._scene_centroid()
+        if centroid is None:
+            logger.warning("Cannot auto-align: scene has no Gaussians")
+            return
+
+        assert self._actor is not None  # noqa: S101
+        carla_pos = np.asarray(
+            [
+                self._actor.get_location().x,
+                self._actor.get_location().y,
+                self._actor.get_location().z,
+            ],
+            dtype=np.float64,
+        )
+
+        offset = centroid - carla_pos
+        self._carla_to_splatsim = np.eye(4, dtype=np.float64)
+        self._carla_to_splatsim[:3, 3] = offset
+
+        logger.warning(
+            "carla_to_splatsim not provided — auto-aligned with translation only. "
+            "CARLA pos=(%.1f, %.1f, %.1f) -> scene centroid=(%.1f, %.1f, %.1f), "
+            "offset=(%.1f, %.1f, %.1f). "
+            "For accurate results, provide an explicit carla_to_splatsim transform.",
+            *carla_pos,
+            *centroid,
+            *offset,
+        )
 
     def _compute_viewmat(self) -> torch.Tensor:
         """Build a gsplat-compatible 4x4 view matrix from the CARLA actor pose.
