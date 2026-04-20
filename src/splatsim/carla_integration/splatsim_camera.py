@@ -71,6 +71,7 @@ class SplatSimCameraSensor(CameraSensorBase):
         )
 
         self._actor: carla.Actor | None = None
+        self._frame_count = 0
 
     # -- public properties ---------------------------------------------------
 
@@ -160,6 +161,26 @@ class SplatSimCameraSensor(CameraSensorBase):
 
         # 3. Rotation in tile-local (float64)
         R_tile = self._geo_transform.carla_rotation_to_tile_local(R_carla)
+
+        # Debug: log tile-local position on first frame
+        self._frame_count += 1
+        if self._frame_count <= 3:
+            import math as _m  # noqa: PLC0415
+
+            fwd = R_tile[:, 0]
+            _yaw = _m.atan2(fwd[0], -fwd[1])
+            logger.info(
+                "[frame %d] CARLA=(%.1f, %.1f, %.1f) -> "
+                "tile_local=(%.2f, %.2f, %.2f) yaw=%.1f°",
+                self._frame_count,
+                carla_pos[0],
+                carla_pos[1],
+                carla_pos[2],
+                tile_pos[0],
+                tile_pos[1],
+                tile_pos[2],
+                _m.degrees(_yaw),
+            )
 
         # 4. Remap camera axes (X=fwd, Y=right, Z=up) to gsplat RDF:
         #    gsplat right (X)   = camera right   (Y) = R_tile[:, 1]
