@@ -5,6 +5,7 @@ defaults:
   - entity: default
   - traffic_manager: default
   - scenario: spawn_only/default
+  - splatsim: default
   - map: odaibatest
 
 server:
@@ -31,3 +32,9 @@ entity:
   spawn_retry_max_count: 10
   spawn_retry_t_step: 0.1
   spawn_retry_z_step: 0.5
+
+splatsim:
+  scene_yaml: ???
+  image_topic: /splatsim/image_raw
+  camera_info_topic: /splatsim/camera_info
+  frame_id: splatsim_camera

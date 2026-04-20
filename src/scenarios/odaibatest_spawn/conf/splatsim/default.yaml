@@ -1,0 +1,6 @@
+# @package _global_
+splatsim:
+  scene_yaml: ${oc.env:SPLATSIM_SCENE_YAML}
+  image_topic: /splatsim/image_raw
+  camera_info_topic: /splatsim/camera_info
+  frame_id: splatsim_camera
