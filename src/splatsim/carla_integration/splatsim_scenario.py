@@ -170,10 +170,9 @@ class SplatSimScenario(BaseScenario):
         """Build :class:`GeoTransform` from the CARLA map and scene data."""
         import numpy as _np  # noqa: PLC0415
 
-        # 1. Parse PROJ string from CARLA xodr
+        # 1. Parse (lat_0, lon_0) from CARLA xodr GeoReference
         xodr_xml = self.world.get_map().to_opendrive()
-        proj_string = parse_geo_reference(xodr_xml)
-        logger.info("GeoReference proj string: %s", proj_string)
+        proj_origin = parse_geo_reference(xodr_xml)
 
         # 2. Get tileset ECEF rotation/translation from Background
         bg = self._scene.background
@@ -187,7 +186,7 @@ class SplatSimScenario(BaseScenario):
         tile_origin = bg.origin.cpu().numpy().astype(_np.float64)
 
         return GeoTransform(
-            proj_string=proj_string,
+            proj_origin=proj_origin,
             ecef_rotation=bg._ecef_rotation,
             ecef_translation=bg._ecef_translation,
             tile_origin=tile_origin,
