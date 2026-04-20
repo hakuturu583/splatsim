@@ -33,6 +33,8 @@ class Viewer(QMainWindow):
         fov_y_deg: float = 60.0,
         move_speed: float = 5.0,
         rotate_speed: float = 1.5,
+        initial_position: tuple[float, float, float] | None = None,
+        initial_yaw_deg: float | None = None,
         image_publisher: ImagePublisher | None = None,
         camera_info_publisher: CameraInfoPublisher | None = None,
     ) -> None:
@@ -47,8 +49,16 @@ class Viewer(QMainWindow):
         self.rotate_speed = rotate_speed
 
         # Camera state (RUB: +X=right, +Y=up, -Z=forward)
-        self._position = torch.zeros(3, device=renderer.device, dtype=torch.float32)
-        self._yaw: float = self._estimate_initial_yaw()
+        if initial_position is not None:
+            self._position = torch.tensor(
+                initial_position, device=renderer.device, dtype=torch.float32
+            )
+        else:
+            self._position = torch.zeros(3, device=renderer.device, dtype=torch.float32)
+        if initial_yaw_deg is not None:
+            self._yaw: float = math.radians(initial_yaw_deg)
+        else:
+            self._yaw = self._estimate_initial_yaw()
 
         # Pre-compute intrinsics
         self._K = self._build_intrinsics()
@@ -275,10 +285,23 @@ def main() -> None:
     parser.add_argument("--topic-image", default="/splatsim/image_raw")
     parser.add_argument("--topic-camera-info", default="/splatsim/camera_info")
     parser.add_argument("--frame-id", default="camera")
+    parser.add_argument(
+        "--pos",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help="Initial camera position in tile-local coordinates",
+    )
+    parser.add_argument(
+        "--yaw",
+        type=float,
+        default=None,
+        help="Initial camera yaw in degrees",
+    )
     args = parser.parse_args()
 
     from splatsim.dataclass import SceneConfig
-    from splatsim.scene import load_scene
 
     config = SceneConfig.from_yaml(args.scene_yaml)
 
@@ -312,8 +335,30 @@ def main() -> None:
             dp, cam_cfg, topic_name=args.topic_camera_info, frame_id=args.frame_id
         )
 
-    viewer = load_scene(
-        config,
+    from splatsim.scene import Scene
+
+    device = torch.device(config.renderer.device)
+    scene = Scene.from_config(config, device=device)
+
+    rc = config.renderer
+    renderer = Renderer(
+        width=rc.width,
+        height=rc.height,
+        device=device,
+        background_color=rc.background_color,
+        near_plane=rc.near_plane,
+        far_plane=rc.far_plane,
+    )
+
+    vc = config.viewer
+    viewer = Viewer(
+        renderer,
+        scene=scene,
+        fov_y_deg=vc.fov_y_deg,
+        move_speed=vc.move_speed,
+        rotate_speed=vc.rotate_speed,
+        initial_position=tuple(args.pos) if args.pos else None,
+        initial_yaw_deg=args.yaw,
         image_publisher=image_pub,
         camera_info_publisher=camera_info_pub,
     )
