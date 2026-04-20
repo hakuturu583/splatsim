@@ -14,3 +14,6 @@ test/data/osm/
 
 # Environment variables
 .env
+
+# Log
+outputs
