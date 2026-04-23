@@ -31,8 +31,35 @@ from .spawn_only import SpawnOnlyConfig, SpawnOnlyScenario
 
 logger = logging.getLogger(__name__)
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-load_dotenv(_PROJECT_ROOT / ".env", override=True)
+def _find_env_file() -> Path | None:
+    """Locate .env file, checking ROS2 share dir then source-tree fallback."""
+    try:
+        from ament_index_python.packages import get_package_share_directory
+
+        share = Path(get_package_share_directory("splatsim"))
+        candidate = share / ".env"
+        if candidate.is_file():
+            return candidate
+    except Exception:
+        pass
+    # Fallback for editable / uv-run usage
+    candidate = Path(__file__).resolve().parents[3] / ".env"
+    return candidate if candidate.is_file() else None
+
+
+def _resolve_relative_paths(base_dir: Path) -> None:
+    """Resolve relative file paths in env vars to absolute using base_dir."""
+    import os
+    for key in ("ODAIBATEST_LANELET2_PATH", "ODAIBATEST_XODR_PATH"):
+        val = os.environ.get(key)
+        if val and not Path(val).is_absolute() and (base_dir / val).is_file():
+            os.environ[key] = str(base_dir / val)
+
+
+_env_file = _find_env_file()
+if _env_file is not None:
+    load_dotenv(_env_file, override=True)
+    _resolve_relative_paths(_env_file.parent)
 
 
 def _build_scenario_from_cfg(

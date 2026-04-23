@@ -10,6 +10,5 @@
   <arg name="camera_info_topic" default="/splatsim/camera_info"/>
   <arg name="frame_id" default="splatsim_camera"/>
 
-  <node pkg="splatsim" exec="spawn-scenario" name="splatsim_scenario" output="screen"
-        args="server.host=$(var carla_host) server.port=$(var carla_port) splatsim.scene_yaml=$(var scene_yaml) ego.spawn_lanelet_id=$(var spawn_lanelet_id) ego.spawn_s=$(var spawn_s) ego.vehicle_type=$(var vehicle_type) scenario.timeout_seconds=$(var timeout_seconds) splatsim.image_topic=$(var image_topic) splatsim.camera_info_topic=$(var camera_info_topic) splatsim.frame_id=$(var frame_id)"/>
+  <executable cmd="$(find-pkg-prefix splatsim)/lib/splatsim/spawn-scenario server.host=$(var carla_host) server.port=$(var carla_port) splatsim.scene_yaml=$(var scene_yaml) ego.spawn_lanelet_id=$(var spawn_lanelet_id) ego.spawn_s=$(var spawn_s) ego.vehicle_type=$(var vehicle_type) scenario.timeout_seconds=$(var timeout_seconds) splatsim.image_topic=$(var image_topic) splatsim.camera_info_topic=$(var camera_info_topic) splatsim.frame_id=$(var frame_id)" output="screen"/>
 </launch>

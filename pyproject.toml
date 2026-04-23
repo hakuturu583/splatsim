@@ -66,12 +66,15 @@ spawn-scenario = "scenarios.odaibatest_spawn.run:main"
 requires = ["uv_build>=0.9.7,<0.10.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+module-name = ["splatsim", "scenarios"]
+
 [tool.colcon-uv-ros]
 name = "splatsim"
 
 [tool.colcon-uv-ros.data-files]
 "share/ament_index/resource_index/packages" = ["resource/splatsim"]
-"share/splatsim" = ["package.xml"]
+"share/splatsim" = ["package.xml", ".env"]
 "share/splatsim/launch" = [
     "launch/splatsim_scenario.launch.xml",
     "launch/splatsim_viewer.launch.xml",
