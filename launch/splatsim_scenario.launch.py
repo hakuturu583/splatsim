@@ -1,7 +1,7 @@
 """Launch splatsim spawn-scenario with shutdown-on-exit."""
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, EmitEvent, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, EmitEvent, ExecuteProcess, TimerAction
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -42,7 +42,12 @@ def generate_launch_description():
 
     shutdown_on_exit = OnProcessExit(
         target_action=spawn_scenario,
-        on_exit=[EmitEvent(event=Shutdown(reason="spawn-scenario exited"))],
+        on_exit=[
+            TimerAction(
+                period=3.0,
+                actions=[EmitEvent(event=Shutdown(reason="spawn-scenario exited"))],
+            )
+        ],
     )
 
     return LaunchDescription([*args, spawn_scenario, shutdown_on_exit])
