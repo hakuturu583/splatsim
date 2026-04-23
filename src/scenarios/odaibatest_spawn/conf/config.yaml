@@ -11,6 +11,7 @@ defaults:
 server:
   host: localhost
   port: 2000
+  timeout_seconds: 3600.0
 
 traffic_manager:
   port: 8100
