@@ -44,8 +44,8 @@ torchvision = [
 
 3dgs-io = { git = "https://github.com/tier4/3dgs_io.git", branch = "main" }
 
-autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "c6c0e1c1ae6f44939cc7ea884100bfe0e5c8309b", subdirectory = "autoware_carla_scenario" }
-autoware-lanelet2-to-opendrive = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "c6c0e1c1ae6f44939cc7ea884100bfe0e5c8309b", subdirectory = "autoware_lanelet2_to_opendrive" }
+autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "66023a31c93464d1eafe4d1522fa4cb08d08727a", subdirectory = "autoware_carla_scenario" }
+autoware-lanelet2-to-opendrive = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "66023a31c93464d1eafe4d1522fa4cb08d08727a", subdirectory = "autoware_lanelet2_to_opendrive" }
 lanelet2-python-api-for-autoware = { git = "https://github.com/tier4/lanelet2_python_api_for_autoware", rev = "7745347645fd04aa8e4230cfa8793e253aad6753" }
 
 [dependency-groups]
@@ -77,5 +77,6 @@ name = "splatsim"
 "share/splatsim" = ["package.xml", ".env"]
 "share/splatsim/launch" = [
     "launch/splatsim_scenario.launch.xml",
+    "launch/splatsim_scenario.launch.py",
     "launch/splatsim_viewer.launch.xml",
 ]
