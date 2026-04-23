@@ -72,3 +72,7 @@ name = "splatsim"
 [tool.colcon-uv-ros.data-files]
 "share/ament_index/resource_index/packages" = ["resource/splatsim"]
 "share/splatsim" = ["package.xml"]
+"share/splatsim/launch" = [
+    "launch/splatsim_scenario.launch.xml",
+    "launch/splatsim_viewer.launch.xml",
+]
