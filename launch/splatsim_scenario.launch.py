@@ -4,7 +4,8 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, EmitEvent, ExecuteProcess
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
-from launch.substitutions import FindPackagePrefix, LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
@@ -23,8 +24,7 @@ def generate_launch_description():
 
     spawn_scenario = ExecuteProcess(
         cmd=[
-            FindPackagePrefix("splatsim"),
-            "/lib/splatsim/spawn-scenario",
+            PathJoinSubstitution([FindPackageShare("splatsim"), "..", "..", "lib", "splatsim", "spawn-scenario"]),
             ["server.host=", LaunchConfiguration("carla_host")],
             ["server.port=", LaunchConfiguration("carla_port")],
             ["splatsim.scene_yaml=", LaunchConfiguration("scene_yaml")],
