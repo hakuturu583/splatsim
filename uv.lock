@@ -96,7 +96,7 @@ wheels = [
 [[package]]
 name = "autoware-carla-scenario"
 version = "0.1.0"
-source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=f3b75c42#f3b75c427edf6e836e0a2c2cbf6031462e0656de" }
+source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=099e1dad#099e1dad3aea0c9fc85924ae651a1c16151807e6" }
 dependencies = [
     { name = "cyclonedds", marker = "sys_platform == 'linux'" },
     { name = "fastapi", marker = "sys_platform == 'linux'" },
@@ -125,7 +125,7 @@ carla-0-9-16 = [
 [[package]]
 name = "autoware-lanelet2-to-opendrive"
 version = "2.55.0"
-source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=f3b75c42#f3b75c427edf6e836e0a2c2cbf6031462e0656de" }
+source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=099e1dad#099e1dad3aea0c9fc85924ae651a1c16151807e6" }
 dependencies = [
     { name = "asam-qc-opendrive", marker = "sys_platform == 'linux'" },
     { name = "hydra-core", marker = "sys_platform == 'linux'" },
@@ -1986,8 +1986,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "3dgs-io", git = "https://github.com/tier4/3dgs_io.git?branch=main" },
-    { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=f3b75c42" },
-    { name = "autoware-lanelet2-to-opendrive", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=f3b75c42" },
+    { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=099e1dad" },
+    { name = "autoware-lanelet2-to-opendrive", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=099e1dad" },
     { name = "cyclonedds", specifier = ">=11.0.1" },
     { name = "gsplat", specifier = "==1.5.3" },
     { name = "pyproj", specifier = ">=3.7.1" },

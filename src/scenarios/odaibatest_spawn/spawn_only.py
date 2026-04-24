@@ -44,7 +44,6 @@ from splatsim.carla_integration import (
     SplatSimConfig,
     SplatSimScenario,
 )
-from splatsim.cyclonedds import ImuPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -190,42 +189,35 @@ class SpawnOnlyScenario(SplatSimScenario):
         self._setup_ego_spawn()
 
         scfg = self._splatsim_cfg
-        dds_participant = DomainParticipant()
 
         # Publish initial pose to Autoware's simple_planning_simulator
         assert self._spawn_pose is not None  # noqa: S101
-        _publish_initialpose(dds_participant, self._spawn_pose)
+        _publish_initialpose(self.dds_participant, self._spawn_pose)
 
         # Attach SplatSim camera to ego vehicle (1.5m above base_link)
         self.attach_splatsim_camera(
             EGO_ROLE_NAME,
             sensor_config=SplatSimCameraSensorConfig(position_z=1.5),
             label="ego_splatsim_camera",
-            dds_participant=dds_participant,
+            dds_participant=self.dds_participant,
             image_topic=scfg.image_topic,
             camera_info_topic=scfg.camera_info_topic,
             frame_id=scfg.frame_id,
         )
 
         # Attach CARLA IMU sensor and publish to /sensing/imu/imu_data
-        imu_pub = ImuPublisher(
-            dds_participant,
-            topic_name="/sensing/imu/imu_data",
-            frame_id="base_link",
-        )
         imu_action = AttachIMUSensorAction(
             EGO_ROLE_NAME,
             sensor_config=IMUSensorConfig(sensor_tick=0.01, role_name="imu"),
+            dds_participant=self.dds_participant,
+            imu_topic="/sensing/imu/imu_data",
+            frame_id="base_link",
             label="ego_imu_sensor",
         )
         self.register_post_tick(imu_action)
-        self._imu_action = imu_action
-        self._imu_pub = imu_pub
-        self._imu_listening = False
 
         # Register the shared publish callback
         self.register_post_tick(self.publish_ros_topics)
-        self.register_post_tick(self._setup_imu_listen)
 
         logger.info(
             "Ego spawned on lanelet %d (s=%.1f). "
@@ -241,27 +233,6 @@ class SpawnOnlyScenario(SplatSimScenario):
         self.register_pass_condition(
             TimeoutCondition(self._config.timeout_seconds, label="spawn_hold_timeout")
         )
-
-    def _setup_imu_listen(self, world) -> None:
-        """Register CARLA sensor listen callback once the IMU is attached."""
-        if self._imu_listening:
-            return
-        sensor = self._imu_action.sensor_actor
-        if sensor is None:
-            return
-        imu_pub = self._imu_pub
-
-        def _on_imu_data(imu_measurement) -> None:
-            acc = imu_measurement.accelerometer
-            gyro = imu_measurement.gyroscope
-            imu_pub.publish(
-                accelerometer=(acc.x, acc.y, acc.z),
-                gyroscope=(gyro.x, gyro.y, gyro.z),
-            )
-
-        sensor.listen(_on_imu_data)
-        self._imu_listening = True
-        logger.info("IMU sensor listen callback registered")
 
     def is_done(self) -> bool:
         """Always ``False`` -- termination is driven by the timeout condition."""

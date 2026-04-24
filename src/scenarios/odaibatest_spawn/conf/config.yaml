@@ -35,6 +35,9 @@ entity:
   spawn_retry_t_step: 0.1
   spawn_retry_z_step: 0.5
 
+simulation:
+  fixed_delta_seconds: 0.05
+
 splatsim:
   scene_yaml: ???
   image_topic: /splatsim/image_raw
