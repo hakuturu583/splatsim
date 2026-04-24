@@ -1,13 +1,7 @@
 """ROS 2 message type definitions for CycloneDDS.
 
 Provides CycloneDDS ``IdlStruct`` equivalents of the standard ROS 2 message
-types used by camera publishers:
-
-* ``builtin_interfaces/msg/Time``
-* ``std_msgs/msg/Header``
-* ``sensor_msgs/msg/RegionOfInterest``
-* ``sensor_msgs/msg/Image``
-* ``sensor_msgs/msg/CameraInfo``
+types used by camera publishers.
 
 .. note::
 
@@ -19,7 +13,7 @@ types used by camera publishers:
 from dataclasses import dataclass
 
 from cyclonedds.idl import IdlStruct
-from cyclonedds.idl.types import array, float64, int32, sequence, uint8, uint32, float32
+from cyclonedds.idl.types import array, float64, int32, sequence, uint8, uint32
 
 
 @dataclass
@@ -60,38 +54,6 @@ class Image(IdlStruct, typename="sensor_msgs::msg::dds_::Image_"):
     is_bigendian: uint8 = 0
     step: uint32 = 0
     data: sequence[uint8] = b""  # type: ignore[assignment]
-
-
-@dataclass
-class Vector3(IdlStruct, typename="geometry_msgs::msg::dds_::Vector3_"):
-    """geometry_msgs/msg/Vector3."""
-
-    x: float64 = 0.0
-    y: float64 = 0.0
-    z: float64 = 0.0
-
-
-@dataclass
-class Quaternion(IdlStruct, typename="geometry_msgs::msg::dds_::Quaternion_"):
-    """geometry_msgs/msg/Quaternion."""
-
-    x: float64 = 0.0
-    y: float64 = 0.0
-    z: float64 = 0.0
-    w: float64 = 1.0
-
-
-@dataclass
-class Imu(IdlStruct, typename="sensor_msgs::msg::dds_::Imu_"):
-    """sensor_msgs/msg/Imu."""
-
-    header: Header = Header()  # noqa: RUF009
-    orientation: Quaternion = Quaternion()  # noqa: RUF009
-    orientation_covariance: array[float64, 9] = (0.0,) * 9  # type: ignore[assignment]
-    angular_velocity: Vector3 = Vector3()  # noqa: RUF009
-    angular_velocity_covariance: array[float64, 9] = (0.0,) * 9  # type: ignore[assignment]
-    linear_acceleration: Vector3 = Vector3()  # noqa: RUF009
-    linear_acceleration_covariance: array[float64, 9] = (0.0,) * 9  # type: ignore[assignment]
 
 
 @dataclass

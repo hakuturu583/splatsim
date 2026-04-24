@@ -24,7 +24,8 @@ from typing import Optional
 
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.idl import IdlStruct
-from cyclonedds.idl.types import array, float64, int32, uint32
+from cyclonedds.idl.types import array, float64, int32, uint16, uint32
+from cyclonedds.qos import Policy, Qos
 from cyclonedds.pub import DataWriter
 from cyclonedds.topic import Topic
 
@@ -35,7 +36,8 @@ from autoware_carla_scenario import (
     Lanelet2Pose,
     TimeoutCondition,
 )
-from autoware_carla_scenario.actions import AttachIMUSensorAction, IMUSensorConfig
+from autoware_carla_scenario.actions import AttachIMUSensorAction, EngageAction, IMUSensorConfig
+from autoware_carla_scenario.conditions import AutowareStateCondition, AutowareStateField
 from autoware_carla_scenario.coordinate.map_manager import MapManager
 from autoware_carla_scenario.coordinate.transform import _interpolate_at_s
 
@@ -48,7 +50,7 @@ from splatsim.carla_integration import (
 logger = logging.getLogger(__name__)
 
 
-# ── CycloneDDS message types for /initialpose3d ──────────────────────
+# ── CycloneDDS message types ──────────────────────────────────────────
 # Defined here (not imported from autoware_carla_scenario.dds.msg)
 # because that module uses ``from __future__ import annotations``
 # which breaks CycloneDDS Topic creation.
@@ -102,6 +104,15 @@ class _PoseWithCovarianceStamped(
 ):
     header: _Header = _Header()  # noqa: RUF009
     pose: _PoseWithCovariance = _PoseWithCovariance()  # noqa: RUF009
+
+
+@dataclass
+class _LocalizationInitializationState(
+    IdlStruct,
+    typename="autoware_adapi_v1_msgs::msg::dds_::LocalizationInitializationState_",
+):
+    stamp: _Time = _Time()  # noqa: RUF009
+    state: uint16 = 0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -163,6 +174,36 @@ def _publish_initialpose(
     )
 
 
+_TRANSIENT_LOCAL_QOS = Qos(
+    Policy.Durability.TransientLocal,
+    Policy.Reliability.Reliable(max_blocking_time=1_000_000_000),
+    Policy.History.KeepLast(1),
+)
+
+
+def _publish_localization_initialized(participant: DomainParticipant) -> None:
+    """Publish LocalizationInitializationState=INITIALIZED so Autoware exits INITIALIZING."""
+    now_ns = time.time_ns()
+    sec, nanosec = divmod(now_ns, 10**9)
+
+    msg = _LocalizationInitializationState(
+        stamp=_Time(sec=sec, nanosec=nanosec),
+        state=3,  # INITIALIZED
+    )
+    topic = Topic(
+        participant,
+        "rt/localization/initialization_state",
+        _LocalizationInitializationState,
+        qos=_TRANSIENT_LOCAL_QOS,
+    )
+    writer = DataWriter(participant, topic, qos=_TRANSIENT_LOCAL_QOS)
+    for _ in range(5):
+        writer.write(msg)
+        time.sleep(0.1)
+
+    logger.info("Published localization_initialization_state=INITIALIZED(3)")
+
+
 class SpawnOnlyScenario(SplatSimScenario):
     """Spawn the ego at a Lanelet2 pose, attach SplatSim camera, publish to ROS 2."""
 
@@ -184,8 +225,22 @@ class SpawnOnlyScenario(SplatSimScenario):
         self._config = config
         self._splatsim_cfg = splatsim_config
 
+        # Capture the AutowareEntity reference when ScenarioRunner calls
+        # scenario.ego_type().  This happens before setup(), so
+        # self._ego_entity is available for EngageAction registration.
+        self._ego_entity = None
+        _original_type = self.ego_type
+        _self = self
+
+        def _capture_factory():
+            entity = _original_type()
+            _self._ego_entity = entity
+            return entity
+
+        self.ego_type = _capture_factory  # type: ignore[assignment]
+
     def setup(self) -> None:
-        """Snap ego spawn, attach SplatSim camera & IMU, set up ROS 2 publishers."""
+        """Snap ego spawn, attach SplatSim camera & IMU, engage, set up ROS 2 publishers."""
         self._setup_ego_spawn()
 
         scfg = self._splatsim_cfg
@@ -193,6 +248,10 @@ class SpawnOnlyScenario(SplatSimScenario):
         # Publish initial pose to Autoware's simple_planning_simulator
         assert self._spawn_pose is not None  # noqa: S101
         _publish_initialpose(self.dds_participant, self._spawn_pose)
+
+        # Tell Autoware that localization is initialized (CARLA bridge
+        # publishes pose/odometry directly, bypassing NDT/EKF).
+        _publish_localization_initialized(self.dds_participant)
 
         # Attach SplatSim camera to ego vehicle (1.5m above base_link)
         self.attach_splatsim_camera(
@@ -203,6 +262,26 @@ class SpawnOnlyScenario(SplatSimScenario):
             image_topic=scfg.image_topic,
             camera_info_topic=scfg.camera_info_topic,
             frame_id=scfg.frame_id,
+        )
+
+        # Repeatedly publish engage=True until the AutowareEntity confirms
+        # engagement.  The condition fires when entity.is_engaged is False,
+        # so the action keeps publishing until the DDS bridge picks it up.
+        assert self._ego_entity is not None  # noqa: S101
+        not_engaged = AutowareStateCondition(
+            entity=self._ego_entity,
+            field=AutowareStateField.ENGAGED,
+            expected=False,
+            label="ego_not_engaged",
+        )
+        self.register_post_tick(
+            EngageAction(
+                self._ego_entity,
+                value=True,
+                condition=not_engaged,
+                once=False,
+                label="auto_engage",
+            )
         )
 
         # Attach CARLA IMU sensor and publish to /sensing/imu/imu_data
@@ -218,6 +297,31 @@ class SpawnOnlyScenario(SplatSimScenario):
 
         # Register the shared publish callback
         self.register_post_tick(self.publish_ros_topics)
+
+        # Diagnostic: log AutowareEntity state every 20 ticks
+        entity = self._ego_entity
+        diag_state = {"tick": 0}
+
+        def _log_autoware_state(world: object) -> None:
+            diag_state["tick"] += 1
+            if diag_state["tick"] % 20 != 0:
+                return
+            dds = entity._dds
+            logger.info(
+                "[diag] tick=%d engaged=%s ctrl_mode=%d "
+                "ackermann_cmd=%s gear_cmd=%s",
+                diag_state["tick"],
+                dds.is_engaged,
+                dds.control_mode,
+                dds.current_ackermann_cmd is not None,
+                getattr(dds.current_gear_cmd, "command", None),
+            )
+
+        self.register_post_tick(_log_autoware_state)
+
+        # Suppress verbose position/tick logging from base scenario
+        logging.getLogger("autoware_carla_scenario.scenario_base").setLevel(logging.WARNING)
+        logging.getLogger("autoware_carla_scenario.scenario_runner").setLevel(logging.WARNING)
 
         logger.info(
             "Ego spawned on lanelet %d (s=%.1f). "
