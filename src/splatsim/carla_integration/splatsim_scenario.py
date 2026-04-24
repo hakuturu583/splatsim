@@ -97,7 +97,26 @@ class SplatSimScenario(BaseScenario):
         # Registered camera actions and their publishers.
         self._camera_entries: list[_CameraEntry] = []
 
+        # Capture the ego entity reference when ScenarioRunner calls
+        # ego_type().  This happens before setup(), so ego_entity is
+        # available in setup_autoware() and subclass setup() methods.
+        self._ego_entity: object | None = None
+        _original_type = self.ego_type
+        _self = self
+
+        def _capture_factory() -> object:
+            entity = _original_type()
+            _self._ego_entity = entity
+            return entity
+
+        self.ego_type = _capture_factory  # type: ignore[assignment]
+
     # -- public properties ---------------------------------------------------
+
+    @property
+    def ego_entity(self) -> object | None:
+        """The captured ego entity, available after ScenarioRunner calls ``ego_type()``."""
+        return self._ego_entity
 
     @property
     def scene(self) -> Scene:
@@ -114,6 +133,58 @@ class SplatSimScenario(BaseScenario):
         if self._geo_transform is None:
             self._geo_transform = self._build_geo_transform()
         return self._geo_transform
+
+    # -- Autoware integration ------------------------------------------------
+
+    def setup_autoware(self) -> None:
+        """Initialize Autoware integration for the ego entity.
+
+        Call this in subclass ``setup()`` after ``_setup_ego_spawn()``.
+        Performs the following:
+
+        * Publishes ``/initialpose3d`` from the spawn pose.
+        * Publishes ``localization_initialization_state=INITIALIZED``
+          (bypasses NDT/EKF since CARLA bridge publishes pose directly).
+        * Patches the hand-brake release for PARK -> DRIVE transitions.
+        * Registers an auto-engage action that keeps publishing
+          ``engage=True`` until the entity confirms engagement.
+        """
+        from autoware_carla_scenario.actions import EngageAction  # noqa: PLC0415
+        from autoware_carla_scenario.conditions import (  # noqa: PLC0415
+            AutowareStateCondition,
+            AutowareStateField,
+        )
+
+        from splatsim.carla_integration.autoware_bridge import (  # noqa: PLC0415
+            patch_handbrake_release,
+            publish_initialpose,
+            publish_localization_initialized,
+        )
+
+        assert self._spawn_pose is not None  # noqa: S101
+        publish_initialpose(self.dds_participant, self._spawn_pose)
+        publish_localization_initialized(self.dds_participant)
+
+        assert self._ego_entity is not None  # noqa: S101
+        patch_handbrake_release(self._ego_entity)
+
+        not_engaged = AutowareStateCondition(
+            entity=self._ego_entity,
+            field=AutowareStateField.ENGAGED,
+            expected=False,
+            label="ego_not_engaged",
+        )
+        self.register_post_tick(
+            EngageAction(
+                self._ego_entity,
+                value=True,
+                condition=not_engaged,
+                once=False,
+                label="auto_engage",
+            )
+        )
+
+        logger.info("Autoware integration initialized (initialpose, localization, engage)")
 
     # -- convenience helpers -------------------------------------------------
 
