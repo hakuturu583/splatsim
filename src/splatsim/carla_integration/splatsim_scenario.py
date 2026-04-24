@@ -156,7 +156,7 @@ class SplatSimScenario(BaseScenario):
         )
 
         from splatsim.carla_integration.autoware_bridge import (  # noqa: PLC0415
-            patch_handbrake_release,
+            patch_motion_control,
             publish_initialpose,
             publish_localization_initialized,
         )
@@ -166,7 +166,7 @@ class SplatSimScenario(BaseScenario):
         publish_localization_initialized(self.dds_participant)
 
         assert self._ego_entity is not None  # noqa: S101
-        patch_handbrake_release(self._ego_entity)
+        patch_motion_control(self._ego_entity)
 
         not_engaged = AutowareStateCondition(
             entity=self._ego_entity,

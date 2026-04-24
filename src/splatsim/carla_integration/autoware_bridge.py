@@ -174,24 +174,57 @@ def publish_localization_initialized(participant: DomainParticipant) -> None:
     logger.info("Published localization_initialization_state=INITIALIZED(3)")
 
 
-def patch_handbrake_release(entity: Any) -> None:
-    """Monkey-patch ``entity._apply_motion_control`` to release hand brake on PARK -> DRIVE.
+def patch_motion_control(entity: Any) -> None:
+    """Monkey-patch ``entity._apply_motion_control`` to fix two issues.
 
-    The dependency sets ``hand_brake=True`` during PARK but never releases
-    it when switching to DRIVE (``apply_ackermann_control`` does not touch
-    ``hand_brake`` in CARLA).  This patch releases the hand brake once at
-    the transition point.
+    1. **Hand brake**: The dependency sets ``hand_brake=True`` during PARK
+       but never releases it when switching to DRIVE
+       (``apply_ackermann_control`` does not touch ``hand_brake`` in CARLA).
+       This patch releases the hand brake once at the transition point.
+
+    2. **Steering sign**: CARLA ``VehicleAckermannControl.steer`` uses
+       positive = right, while Autoware ``steering_tire_angle`` uses
+       positive = left.  The dependency passes the value without negation,
+       causing inverted steering.  This patch negates the steer value.
     """
-    _orig = entity._apply_motion_control
-    _state: dict[str, bool] = {"released": False}
+    _state: dict[str, bool] = {"handbrake_released": False}
 
     def _patched(_carla: Any, gear_cmd: Any, is_reverse: bool) -> None:
+        assert entity._vehicle is not None  # noqa: S101
+
+        # -- PARK: hand brake, reset state --
         if gear_cmd is not None and gear_cmd.command == _GEAR_PARK:
-            _state["released"] = False
-        elif not _state["released"] and entity._vehicle is not None:
+            entity._vehicle.apply_control(_carla.VehicleControl(hand_brake=True))
+            _state["handbrake_released"] = False
+            return
+
+        # -- Release hand brake once on PARK -> DRIVE transition --
+        if not _state["handbrake_released"]:
             entity._vehicle.apply_control(_carla.VehicleControl(hand_brake=False))
-            _state["released"] = True
+            _state["handbrake_released"] = True
             logger.info("Released CARLA hand brake after PARK -> DRIVE transition")
-        _orig(_carla, gear_cmd, is_reverse)
+
+        # -- Apply ackermann control with corrected steering sign --
+        ackermann_cmd = (
+            entity._dds.current_manual_ackermann_cmd
+            if entity._dds.current_manual_ackermann_cmd is not None
+            else entity._dds.current_ackermann_cmd
+        )
+        if ackermann_cmd is None:
+            return
+
+        speed = float(ackermann_cmd.longitudinal.velocity)
+        if is_reverse:
+            speed = -abs(speed)
+
+        entity._vehicle.apply_ackermann_control(
+            _carla.VehicleAckermannControl(
+                steer=-float(ackermann_cmd.lateral.steering_tire_angle),
+                steer_speed=float(ackermann_cmd.lateral.steering_tire_rotation_rate),
+                speed=speed,
+                acceleration=float(ackermann_cmd.longitudinal.acceleration),
+                jerk=float(ackermann_cmd.longitudinal.jerk),
+            )
+        )
 
     entity._apply_motion_control = _patched  # type: ignore[attr-defined]
