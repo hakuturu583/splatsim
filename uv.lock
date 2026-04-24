@@ -96,7 +96,7 @@ wheels = [
 [[package]]
 name = "autoware-carla-scenario"
 version = "0.1.0"
-source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=93877c08b208321353f7c3cb1d69546c21cb0b38#93877c08b208321353f7c3cb1d69546c21cb0b38" }
+source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=f3b75c42#f3b75c427edf6e836e0a2c2cbf6031462e0656de" }
 dependencies = [
     { name = "cyclonedds", marker = "sys_platform == 'linux'" },
     { name = "fastapi", marker = "sys_platform == 'linux'" },
@@ -125,7 +125,7 @@ carla-0-9-16 = [
 [[package]]
 name = "autoware-lanelet2-to-opendrive"
 version = "2.55.0"
-source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=93877c08b208321353f7c3cb1d69546c21cb0b38#93877c08b208321353f7c3cb1d69546c21cb0b38" }
+source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=f3b75c42#f3b75c427edf6e836e0a2c2cbf6031462e0656de" }
 dependencies = [
     { name = "asam-qc-opendrive", marker = "sys_platform == 'linux'" },
     { name = "hydra-core", marker = "sys_platform == 'linux'" },
@@ -1986,8 +1986,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "3dgs-io", git = "https://github.com/tier4/3dgs_io.git?branch=main" },
-    { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=93877c08b208321353f7c3cb1d69546c21cb0b38" },
-    { name = "autoware-lanelet2-to-opendrive", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=93877c08b208321353f7c3cb1d69546c21cb0b38" },
+    { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=f3b75c42" },
+    { name = "autoware-lanelet2-to-opendrive", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=f3b75c42" },
     { name = "cyclonedds", specifier = ">=11.0.1" },
     { name = "gsplat", specifier = "==1.5.3" },
     { name = "pyproj", specifier = ">=3.7.1" },
@@ -2098,9 +2098,9 @@ dependencies = [
     { name = "typing-extensions", marker = "sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp310-cp310-linux_x86_64.whl", hash = "sha256:2cb28155635e3d3d0be198e3f3e7457a1d7b99e8c2eedc73fe22fab574d11a4c" },
-    { url = "https://download-r2.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp311-cp311-linux_x86_64.whl", hash = "sha256:81397ff1c84a3f2c666d2627144ecac268665325726267e092a80113385ad3e8" },
-    { url = "https://download-r2.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp312-cp312-linux_x86_64.whl", hash = "sha256:f6c94ca3a403e79fd25d4bc2ea7325de7c6682a372c5d525b65b06367b1cc618" },
+    { url = "https://download-r2.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp310-cp310-linux_x86_64.whl", hash = "sha256:2cb28155635e3d3d0be198e3f3e7457a1d7b99e8c2eedc73fe22fab574d11a4c", upload-time = "2024-07-24T23:17:46Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp311-cp311-linux_x86_64.whl", hash = "sha256:81397ff1c84a3f2c666d2627144ecac268665325726267e092a80113385ad3e8", upload-time = "2024-07-24T23:20:22Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp312-cp312-linux_x86_64.whl", hash = "sha256:f6c94ca3a403e79fd25d4bc2ea7325de7c6682a372c5d525b65b06367b1cc618", upload-time = "2024-07-24T23:23:00Z" },
 ]
 
 [[package]]
@@ -2113,9 +2113,9 @@ dependencies = [
     { name = "torch", marker = "sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu124/torchvision-0.19.0%2Bcu124-cp310-cp310-linux_x86_64.whl", hash = "sha256:82cf10450537aeb9584ceaf53633f177bb809d563c5d64526f4b9be7668b2769" },
-    { url = "https://download-r2.pytorch.org/whl/cu124/torchvision-0.19.0%2Bcu124-cp311-cp311-linux_x86_64.whl", hash = "sha256:3a877d3eb44f0e89e3442d5242e7e49a9755e709eee327b4629af0078a479023" },
-    { url = "https://download-r2.pytorch.org/whl/cu124/torchvision-0.19.0%2Bcu124-cp312-cp312-linux_x86_64.whl", hash = "sha256:2aa511f7073928cc3cab03d1e5524d840a7a17da7f9bde7e771116c233d011e8" },
+    { url = "https://download-r2.pytorch.org/whl/cu124/torchvision-0.19.0%2Bcu124-cp310-cp310-linux_x86_64.whl", hash = "sha256:82cf10450537aeb9584ceaf53633f177bb809d563c5d64526f4b9be7668b2769", upload-time = "2024-07-24T23:40:13Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu124/torchvision-0.19.0%2Bcu124-cp311-cp311-linux_x86_64.whl", hash = "sha256:3a877d3eb44f0e89e3442d5242e7e49a9755e709eee327b4629af0078a479023", upload-time = "2024-07-24T23:40:14Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu124/torchvision-0.19.0%2Bcu124-cp312-cp312-linux_x86_64.whl", hash = "sha256:2aa511f7073928cc3cab03d1e5524d840a7a17da7f9bde7e771116c233d011e8", upload-time = "2024-07-24T23:40:15Z" },
 ]
 
 [[package]]

@@ -26,6 +26,7 @@ ego:
   initial_speed_kmh: 0.0
   spawn_lanelet_id: 100
   spawn_s: 5.0
+  is_autoware: true
 
 entity:
   ground_projection_ray_distance_upper: 5.0
