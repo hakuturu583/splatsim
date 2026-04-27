@@ -35,9 +35,9 @@ logger = logging.getLogger(__name__)
 def _find_env_file() -> Path | None:
     """Locate .env file, checking ROS2 share dir then source-tree fallback."""
     try:
-        from ament_index_python.packages import (
+        from ament_index_python.packages import (  # ty: ignore[unresolved-import]
             get_package_share_directory,
-        )  # ty: ignore[unresolved-import]
+        )
 
         share = Path(get_package_share_directory("splatsim"))
         candidate = share / ".env"
