@@ -12,11 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
-    python3-dev \
-    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+ENV UV_PYTHON_INSTALL_DIR=/opt/python
 
 WORKDIR /workspace/splatsim
 
@@ -38,20 +38,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # =============================================================================
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    libgl1-mesa-glx \
-    libegl1 \
-    libxkbcommon0 \
-    libdbus-1-3 \
-    libxcb-xinerama0 \
-    libxcb-cursor0 \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /workspace/splatsim
 
+COPY --from=builder /opt/python /opt/python
 COPY --from=builder /workspace/splatsim/.venv .venv/
 COPY --from=builder /workspace/splatsim/src/ src/
 COPY --from=builder /workspace/splatsim/pyproject.toml .

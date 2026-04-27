@@ -12,12 +12,14 @@ dependencies = [
     "torch==2.4.0+cu124",
     "torchvision==0.19.0+cu124",
     "3dgs-io",
-    "PyQt5>=5.15.0",
     "pyyaml>=6.0",
     "setuptools",
 ]
 
 [project.optional-dependencies]
+gui = [
+    "PyQt5>=5.15.0",
+]
 dds = [
     "cyclonedds>=11.0.1",
 ]
@@ -29,7 +31,7 @@ carla = [
     "pyproj>=3.7.1",
 ]
 all = [
-    "splatsim[carla]",
+    "splatsim[gui,carla]",
 ]
 
 [tool.uv]

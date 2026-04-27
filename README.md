@@ -14,8 +14,11 @@
 ### Local
 
 ```bash
-# Core only
+# Core only (headless)
 uv sync
+
+# With GUI viewer
+uv sync --extra gui
 
 # With DDS support
 uv sync --extra dds
