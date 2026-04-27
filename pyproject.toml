@@ -14,6 +14,9 @@ dependencies = [
     "3dgs-io",
     "pyyaml>=6.0",
     "setuptools",
+    "grpcio>=1.60.0",
+    "protobuf>=4.25.0",
+    "grpcio-tools>=1.60.0",
 ]
 
 [project.optional-dependencies]
@@ -73,6 +76,11 @@ dev = [
 [project.scripts]
 viewer = "splatsim.viewer:main"
 spawn-scenario = "scenarios.odaibatest_spawn.run:main"
+splatsim-grpc-server = "splatsim.grpc_service.cli:main"
+splatsim-tile-server = "splatsim.tile_server.cli:main"
+
+[tool.ruff]
+exclude = ["src/splatsim/grpc_service/_generated"]
 
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]
@@ -85,6 +93,19 @@ module-name = ["splatsim", "scenarios"]
 # that are not installable via pip and unavailable in the uv-managed virtualenv.
 [[tool.ty.overrides]]
 include = ["launch/**"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
+# scenarios also imports ament_index_python (ROS 2 only, not pip-installable).
+[[tool.ty.overrides]]
+include = ["src/scenarios/**"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
+# Generated protobuf/gRPC stubs are produced at build time and gitignored,
+# so they are absent during CI type-checking.
+[[tool.ty.overrides]]
+include = ["src/splatsim/grpc_service/**"]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
 

@@ -19,4 +19,9 @@ test/data/osm/
 outputs
 
 # 3D Tiles data (large binary files)
-test/data/tokyo_teleport/iteration_*/
+test/data/*/iteration_*/
+
+# Generated protobuf/gRPC code
+src/splatsim/grpc_service/_generated/rendering_service_pb2.py
+src/splatsim/grpc_service/_generated/rendering_service_pb2_grpc.py
+src/splatsim/grpc_service/_generated/rendering_service_pb2.pyi

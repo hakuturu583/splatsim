@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 def _find_env_file() -> Path | None:
     """Locate .env file, checking ROS2 share dir then source-tree fallback."""
     try:
-        from ament_index_python.packages import (  # ty: ignore[unresolved-import]
+        from ament_index_python.packages import (
             get_package_share_directory,
         )
 

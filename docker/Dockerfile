@@ -34,8 +34,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     fi \
     && uv sync --extra dds --no-dev --no-install-project
 
-# Copy source and install project
+# Copy source, generate proto code, and install project
 COPY src/ src/
+COPY proto/ proto/
+RUN uv run python src/splatsim/grpc_service/generate_proto.py
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=GH_TOKEN \
     if [ -f /run/secrets/GH_TOKEN ] && [ -s /run/secrets/GH_TOKEN ]; then \
@@ -73,4 +75,5 @@ COPY package.xml ./
 ENV VIRTUAL_ENV=/workspace/splatsim/.venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
-CMD ["bash"]
+EXPOSE 50051
+CMD ["splatsim-grpc-server"]
