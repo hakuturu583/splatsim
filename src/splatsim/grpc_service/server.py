@@ -124,7 +124,14 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
 
                 self._initialized = True
                 logger.info("Initialization complete (%.1f fps)", self._frame_rate)
-                return pb2.InitializeResponse(success=True)
+
+                origin = background.origin
+                scene_origin = pb2.Vector3(
+                    x=float(origin[0]),
+                    y=float(origin[1]),
+                    z=float(origin[2]),
+                )
+                return pb2.InitializeResponse(success=True, scene_origin=scene_origin)
 
             except Exception as exc:
                 logger.exception("Initialize failed")
