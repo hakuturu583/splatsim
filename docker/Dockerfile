@@ -1,26 +1,47 @@
 ARG CUDA_VERSION=12.4.1
 ARG UBUNTU_VERSION=22.04
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+# =============================================================================
+# Build stage
+# =============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System dependencies for lanelet2 and PyQt5
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
     python3-dev \
-    libboost-dev \
-    libboost-serialization-dev \
-    libboost-filesystem-dev \
-    libboost-program-options-dev \
-    libboost-python-dev \
-    libboost-system-dev \
-    libeigen3-dev \
-    libpugixml-dev \
-    libgeographic-dev \
-    librange-v3-dev \
-    # PyQt5 / GUI dependencies
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+WORKDIR /workspace/splatsim
+
+# Install dependencies first (layer cache optimization)
+COPY pyproject.toml uv.lock .python-version ./
+COPY resource/ resource/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=secret,id=gitconfig,target=/root/.gitconfig \
+    uv sync --extra dds --no-dev --no-install-project
+
+# Copy source and install project
+COPY src/ src/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=secret,id=gitconfig,target=/root/.gitconfig \
+    uv sync --extra dds --no-dev
+
+# =============================================================================
+# Runtime stage
+# =============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
     libgl1-mesa-glx \
     libegl1 \
     libxkbcommon0 \
@@ -29,17 +50,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-cursor0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
-
 WORKDIR /workspace/splatsim
-COPY . .
 
-# Install project dependencies
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --dev
+COPY --from=builder /workspace/splatsim/.venv .venv/
+COPY --from=builder /workspace/splatsim/src/ src/
+COPY --from=builder /workspace/splatsim/pyproject.toml .
+COPY launch/ launch/
+COPY package.xml .env ./
 
-# Activate the virtualenv by default
 ENV VIRTUAL_ENV=/workspace/splatsim/.venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
