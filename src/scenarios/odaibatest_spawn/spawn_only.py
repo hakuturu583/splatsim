@@ -96,7 +96,7 @@ class SpawnOnlyScenario(SplatSimScenario):
         self.register_post_tick(self.publish_ros_topics)
 
         # Diagnostic: log AutowareEntity state every 20 ticks
-        entity = self.ego_entity
+        assert (entity := self.ego_entity) is not None  # noqa: S101
         diag_state = {"tick": 0}
 
         def _log_autoware_state(world: object) -> None:
@@ -109,8 +109,9 @@ class SpawnOnlyScenario(SplatSimScenario):
             acc = f"{cmd.longitudinal.acceleration:.3f}" if cmd else "None"
             carla_vel = entity._vehicle.get_velocity() if entity._vehicle else None
             carla_speed = (
-                f"{(carla_vel.x**2 + carla_vel.y**2 + carla_vel.z**2)**0.5:.3f}"
-                if carla_vel else "None"
+                f"{(carla_vel.x**2 + carla_vel.y**2 + carla_vel.z**2) ** 0.5:.3f}"
+                if carla_vel
+                else "None"
             )
             logger.info(
                 "[diag] tick=%d engaged=%s gear=%s "
@@ -118,15 +119,22 @@ class SpawnOnlyScenario(SplatSimScenario):
                 diag_state["tick"],
                 dds.is_engaged,
                 getattr(dds.current_gear_cmd, "command", None),
-                vel, acc, carla_speed,
+                vel,
+                acc,
+                carla_speed,
             )
 
         self.register_post_tick(_log_autoware_state)
 
         # Suppress verbose position/tick logging from base scenario
-        logging.getLogger("autoware_carla_scenario.scenario_base").setLevel(logging.WARNING)
-        logging.getLogger("autoware_carla_scenario.scenario_runner").setLevel(logging.WARNING)
+        logging.getLogger("autoware_carla_scenario.scenario_base").setLevel(
+            logging.WARNING
+        )
+        logging.getLogger("autoware_carla_scenario.scenario_runner").setLevel(
+            logging.WARNING
+        )
 
+        assert self._spawn_pose is not None  # noqa: S101
         logger.info(
             "Ego spawned on lanelet %d (s=%.1f). "
             "SplatSim camera attached -> publishing to %s. "

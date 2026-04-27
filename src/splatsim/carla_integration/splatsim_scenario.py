@@ -31,6 +31,7 @@ if TYPE_CHECKING:
         GroundProjectionConfig,
         Lanelet2Pose,
     )
+    from autoware_carla_scenario.entity import AutowareEntity
     from autoware_carla_scenario.entity_role import EntityRole
     from splatsim.dataclass import SceneConfig
 
@@ -100,21 +101,21 @@ class SplatSimScenario(BaseScenario):
         # Capture the ego entity reference when ScenarioRunner calls
         # ego_type().  This happens before setup(), so ego_entity is
         # available in setup_autoware() and subclass setup() methods.
-        self._ego_entity: object | None = None
+        self._ego_entity: AutowareEntity | None = None
         _original_type = self.ego_type
         _self = self
 
-        def _capture_factory() -> object:
-            entity = _original_type()
+        def _capture_factory() -> AutowareEntity:
+            entity: AutowareEntity = _original_type()  # ty: ignore[invalid-assignment]
             _self._ego_entity = entity
             return entity
 
-        self.ego_type = _capture_factory  # type: ignore[assignment]
+        self.ego_type = _capture_factory  # ty: ignore[invalid-assignment]
 
     # -- public properties ---------------------------------------------------
 
     @property
-    def ego_entity(self) -> object | None:
+    def ego_entity(self) -> AutowareEntity | None:
         """The captured ego entity, available after ScenarioRunner calls ``ego_type()``."""
         return self._ego_entity
 
@@ -184,7 +185,9 @@ class SplatSimScenario(BaseScenario):
             )
         )
 
-        logger.info("Autoware integration initialized (initialpose, localization, engage)")
+        logger.info(
+            "Autoware integration initialized (initialpose, localization, engage)"
+        )
 
     # -- convenience helpers -------------------------------------------------
 
