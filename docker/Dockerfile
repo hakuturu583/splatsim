@@ -25,14 +25,18 @@ WORKDIR /workspace/splatsim
 COPY pyproject.toml uv.lock .python-version README.md ./
 COPY resource/ resource/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=gitconfig,target=/root/.gitconfig \
-    uv sync --extra dds --no-dev --no-install-project
+    --mount=type=secret,id=gitconfig \
+    if [ -s /run/secrets/gitconfig ]; then cp /run/secrets/gitconfig /root/.gitconfig; fi \
+    && uv sync --extra dds --no-dev --no-install-project \
+    && rm -f /root/.gitconfig
 
 # Copy source and install project
 COPY src/ src/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=gitconfig,target=/root/.gitconfig \
-    uv sync --extra dds --no-dev
+    --mount=type=secret,id=gitconfig \
+    if [ -s /run/secrets/gitconfig ]; then cp /run/secrets/gitconfig /root/.gitconfig; fi \
+    && uv sync --extra dds --no-dev \
+    && rm -f /root/.gitconfig
 
 # Remove packages unnecessary for inference/simulation
 RUN rm -rf .venv/lib/python3.10/site-packages/triton \

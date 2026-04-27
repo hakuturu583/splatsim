@@ -52,6 +52,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Prepare git credentials for private dependencies
+        if: ${{ secrets.GH_TOKEN != '' }}
         run: |
           printf '[url "https://x-access-token:%s@github.com/"]\n\tinsteadOf = https://github.com/\n' \
             "${{ secrets.GH_TOKEN }}" > /tmp/.gitconfig
@@ -62,7 +63,6 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: false
-          secrets: |
-            gitconfig=/tmp/.gitconfig
+          secrets: ${{ secrets.GH_TOKEN != '' && 'gitconfig=/tmp/.gitconfig' || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
