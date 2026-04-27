@@ -96,6 +96,19 @@ include = ["launch/**"]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
 
+# scenarios also imports ament_index_python (ROS 2 only, not pip-installable).
+[[tool.ty.overrides]]
+include = ["scenarios/**"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
+# Generated protobuf/gRPC stubs are produced at build time and gitignored,
+# so they are absent during CI type-checking.
+[[tool.ty.overrides]]
+include = ["splatsim/grpc_service/**"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
 [tool.colcon-uv-ros]
 name = "splatsim"
 
