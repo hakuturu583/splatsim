@@ -67,6 +67,7 @@ message InitializeRequest {
 message InitializeResponse {
   bool success = 1;
   string message = 2;
+  Vector3 scene_origin = 3;  // ECEF centroid subtracted for numerical stability
 }
 
 // ── Camera data streaming ────────────────────────────────────────────
