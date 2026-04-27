@@ -57,7 +57,7 @@ COPY --from=builder /workspace/splatsim/.venv .venv/
 COPY --from=builder /workspace/splatsim/src/ src/
 COPY --from=builder /workspace/splatsim/pyproject.toml .
 COPY launch/ launch/
-COPY package.xml .env ./
+COPY package.xml ./
 
 ENV VIRTUAL_ENV=/workspace/splatsim/.venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
