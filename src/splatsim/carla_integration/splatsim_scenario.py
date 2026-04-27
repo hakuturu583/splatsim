@@ -103,11 +103,10 @@ class SplatSimScenario(BaseScenario):
         # available in setup_autoware() and subclass setup() methods.
         self._ego_entity: AutowareEntity | None = None
         _original_type = self.ego_type
-        _self = self
 
         def _capture_factory() -> AutowareEntity:
             entity: AutowareEntity = _original_type()  # ty: ignore[invalid-assignment]
-            _self._ego_entity = entity
+            self._ego_entity = entity
             return entity
 
         self.ego_type = _capture_factory  # ty: ignore[invalid-assignment]

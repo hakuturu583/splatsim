@@ -18,7 +18,7 @@ from typing import Any
 
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.idl import IdlStruct
-from cyclonedds.idl.types import array, float64, int32, uint16, uint32
+from cyclonedds.idl.types import array, float64, uint16
 from cyclonedds.pub import DataWriter
 from cyclonedds.qos import Policy, Qos
 from cyclonedds.topic import Topic
@@ -27,25 +27,14 @@ from autoware_carla_scenario.coordinate import Lanelet2Pose
 from autoware_carla_scenario.coordinate.map_manager import MapManager
 from autoware_carla_scenario.coordinate.transform import _interpolate_at_s
 
+from splatsim.cyclonedds.msg_types import Header as _Header, Time as _Time
+
 logger = logging.getLogger(__name__)
 
 
 # ── CycloneDDS message types ──────────────────────────────────────────
-# Defined here (not in autoware_carla_scenario.dds.msg) because that
-# module uses ``from __future__ import annotations`` which breaks
-# CycloneDDS Topic creation.
-
-
-@dataclass
-class _Time(IdlStruct, typename="builtin_interfaces::msg::dds_::Time_"):
-    sec: int32 = 0
-    nanosec: uint32 = 0
-
-
-@dataclass
-class _Header(IdlStruct, typename="std_msgs::msg::dds_::Header_"):
-    stamp: _Time = _Time()  # noqa: RUF009
-    frame_id: str = ""
+# _Time and _Header are re-used from splatsim.cyclonedds.msg_types.
+# Geometry types below are specific to the Autoware bridge.
 
 
 @dataclass
@@ -103,7 +92,10 @@ _TRANSIENT_LOCAL_QOS = Qos(
     Policy.History.KeepLast(1),
 )
 
-_GEAR_PARK = 22
+_GEAR_PARK = 22  # autoware_auto_vehicle_msgs::msg::GearCommand::PARK
+_LOCALIZATION_INITIALIZED = (
+    3  # autoware_adapi_v1_msgs::msg::LocalizationInitializationState::INITIALIZED
+)
 
 
 # ── Public helpers ────────────────────────────────────────────────────
@@ -147,7 +139,10 @@ def publish_initialpose(
 
     logger.info(
         "Published initialpose3d: map frame (%.2f, %.2f, %.2f) yaw=%.1f deg",
-        x, y, z, math.degrees(heading),
+        x,
+        y,
+        z,
+        math.degrees(heading),
     )
 
 
@@ -158,7 +153,7 @@ def publish_localization_initialized(participant: DomainParticipant) -> None:
 
     msg = _LocalizationInitializationState(
         stamp=_Time(sec=sec, nanosec=nanosec),
-        state=3,  # INITIALIZED
+        state=_LOCALIZATION_INITIALIZED,
     )
     topic = Topic(
         participant,
