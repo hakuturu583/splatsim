@@ -1,3 +1,11 @@
+try:
+    import carla as _carla  # noqa: F401
+except ImportError:
+    raise ImportError(
+        "splatsim.carla_integration requires CARLA dependencies.\n"
+        "Install with: pip install splatsim[carla]"
+    ) from None
+
 from splatsim.carla_integration.attach_splatsim_camera import (
     AttachSplatSimCameraAction,
 )

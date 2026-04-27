@@ -310,7 +310,13 @@ def main() -> None:
     if args.dds:
         import types
 
-        from cyclonedds.domain import DomainParticipant
+        try:
+            from cyclonedds.domain import DomainParticipant
+        except ImportError:
+            raise SystemExit(
+                "Error: --dds requires CycloneDDS.\n"
+                "Install with: pip install splatsim[dds]"
+            ) from None
 
         from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
 

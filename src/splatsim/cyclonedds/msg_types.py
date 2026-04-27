@@ -1,13 +1,7 @@
 """ROS 2 message type definitions for CycloneDDS.
 
 Provides CycloneDDS ``IdlStruct`` equivalents of the standard ROS 2 message
-types used by camera publishers:
-
-* ``builtin_interfaces/msg/Time``
-* ``std_msgs/msg/Header``
-* ``sensor_msgs/msg/RegionOfInterest``
-* ``sensor_msgs/msg/Image``
-* ``sensor_msgs/msg/CameraInfo``
+types used by camera publishers.
 
 .. note::
 
@@ -23,7 +17,7 @@ from cyclonedds.idl.types import array, float64, int32, sequence, uint8, uint32
 
 
 @dataclass
-class Time(IdlStruct, typename="builtin_interfaces.msg.dds_.Time_"):
+class Time(IdlStruct, typename="builtin_interfaces::msg::dds_::Time_"):
     """builtin_interfaces/msg/Time."""
 
     sec: int32 = 0
@@ -31,7 +25,7 @@ class Time(IdlStruct, typename="builtin_interfaces.msg.dds_.Time_"):
 
 
 @dataclass
-class Header(IdlStruct, typename="std_msgs.msg.dds_.Header_"):
+class Header(IdlStruct, typename="std_msgs::msg::dds_::Header_"):
     """std_msgs/msg/Header."""
 
     stamp: Time = Time()  # noqa: RUF009
@@ -39,7 +33,7 @@ class Header(IdlStruct, typename="std_msgs.msg.dds_.Header_"):
 
 
 @dataclass
-class RegionOfInterest(IdlStruct, typename="sensor_msgs.msg.dds_.RegionOfInterest_"):
+class RegionOfInterest(IdlStruct, typename="sensor_msgs::msg::dds_::RegionOfInterest_"):
     """sensor_msgs/msg/RegionOfInterest."""
 
     x_offset: uint32 = 0
@@ -50,7 +44,7 @@ class RegionOfInterest(IdlStruct, typename="sensor_msgs.msg.dds_.RegionOfInteres
 
 
 @dataclass
-class Image(IdlStruct, typename="sensor_msgs.msg.dds_.Image_"):
+class Image(IdlStruct, typename="sensor_msgs::msg::dds_::Image_"):
     """sensor_msgs/msg/Image."""
 
     header: Header = Header()  # noqa: RUF009
@@ -63,7 +57,7 @@ class Image(IdlStruct, typename="sensor_msgs.msg.dds_.Image_"):
 
 
 @dataclass
-class CameraInfo(IdlStruct, typename="sensor_msgs.msg.dds_.CameraInfo_"):
+class CameraInfo(IdlStruct, typename="sensor_msgs::msg::dds_::CameraInfo_"):
     """sensor_msgs/msg/CameraInfo."""
 
     header: Header = Header()  # noqa: RUF009

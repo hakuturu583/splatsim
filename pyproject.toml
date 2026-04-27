@@ -15,11 +15,21 @@ dependencies = [
     "PyQt5>=5.15.0",
     "pyyaml>=6.0",
     "setuptools",
+]
+
+[project.optional-dependencies]
+dds = [
+    "cyclonedds>=11.0.1",
+]
+carla = [
     "autoware-carla-scenario[carla-0-9-16]",
     "autoware-lanelet2-to-opendrive",
     "cyclonedds>=11.0.1",
     "python-dotenv>=1.0.0",
     "pyproj>=3.7.1",
+]
+all = [
+    "splatsim[carla]",
 ]
 
 [tool.uv]
@@ -44,8 +54,8 @@ torchvision = [
 
 3dgs-io = { git = "https://github.com/tier4/3dgs_io.git", branch = "main" }
 
-autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", tag = "v2.55.0", subdirectory = "autoware_carla_scenario" }
-autoware-lanelet2-to-opendrive = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", tag = "v2.55.0", subdirectory = "autoware_lanelet2_to_opendrive" }
+autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "343e8133", subdirectory = "autoware_carla_scenario" }
+autoware-lanelet2-to-opendrive = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "343e8133", subdirectory = "autoware_lanelet2_to_opendrive" }
 lanelet2-python-api-for-autoware = { git = "https://github.com/tier4/lanelet2_python_api_for_autoware", rev = "7745347645fd04aa8e4230cfa8793e253aad6753" }
 
 [dependency-groups]
@@ -66,9 +76,24 @@ spawn-scenario = "scenarios.odaibatest_spawn.run:main"
 requires = ["uv_build>=0.9.7,<0.10.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+module-name = ["splatsim", "scenarios"]
+
+# ROS 2 launch files depend on packages (launch, launch_ros, ament_index_python)
+# that are not installable via pip and unavailable in the uv-managed virtualenv.
+[[tool.ty.overrides]]
+include = ["launch/**"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
 [tool.colcon-uv-ros]
 name = "splatsim"
 
 [tool.colcon-uv-ros.data-files]
 "share/ament_index/resource_index/packages" = ["resource/splatsim"]
-"share/splatsim" = ["package.xml"]
+"share/splatsim" = ["package.xml", ".env"]
+"share/splatsim/launch" = [
+    "launch/splatsim_scenario.launch.xml",
+    "launch/splatsim_scenario.launch.py",
+    "launch/splatsim_viewer.launch.xml",
+]
