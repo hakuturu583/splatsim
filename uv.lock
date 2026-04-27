@@ -2066,6 +2066,7 @@ source = { editable = "." }
 dependencies = [
     { name = "3dgs-io", marker = "sys_platform == 'linux'" },
     { name = "grpcio", marker = "sys_platform == 'linux'" },
+    { name = "grpcio-tools", marker = "sys_platform == 'linux'" },
     { name = "gsplat", marker = "sys_platform == 'linux'" },
     { name = "protobuf", marker = "sys_platform == 'linux'" },
     { name = "pyyaml", marker = "sys_platform == 'linux'" },
@@ -2101,7 +2102,6 @@ gui = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "grpcio-tools", marker = "sys_platform == 'linux'" },
     { name = "mypy", marker = "sys_platform == 'linux'" },
     { name = "pre-commit", marker = "sys_platform == 'linux'" },
     { name = "pytest", marker = "sys_platform == 'linux'" },
@@ -2118,6 +2118,7 @@ requires-dist = [
     { name = "cyclonedds", marker = "extra == 'carla'", specifier = ">=11.0.1" },
     { name = "cyclonedds", marker = "extra == 'dds'", specifier = ">=11.0.1" },
     { name = "grpcio", specifier = ">=1.60.0" },
+    { name = "grpcio-tools", specifier = ">=1.60.0" },
     { name = "gsplat", specifier = "==1.5.3" },
     { name = "protobuf", specifier = ">=4.25.0" },
     { name = "pyproj", marker = "extra == 'carla'", specifier = ">=3.7.1" },
@@ -2133,7 +2134,6 @@ provides-extras = ["gui", "dds", "carla", "all"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "grpcio-tools", specifier = ">=1.60.0" },
     { name = "mypy", specifier = ">=1.10.0" },
     { name = "pre-commit", specifier = ">=4.0.0" },
     { name = "pytest", specifier = ">=8.0.0" },

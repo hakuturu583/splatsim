@@ -16,6 +16,7 @@ dependencies = [
     "setuptools",
     "grpcio>=1.60.0",
     "protobuf>=4.25.0",
+    "grpcio-tools>=1.60.0",
 ]
 
 [project.optional-dependencies]
@@ -70,7 +71,6 @@ dev = [
     "mypy>=1.10.0",
     "pytest-cov>=6.0.0",
     "pre-commit>=4.0.0",
-    "grpcio-tools>=1.60.0",
 ]
 
 [project.scripts]

@@ -34,8 +34,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     fi \
     && uv sync --extra dds --no-dev --no-install-project
 
-# Copy source and install project
+# Copy source, generate proto code, and install project
 COPY src/ src/
+COPY proto/ proto/
+COPY scripts/ scripts/
+RUN uv run python scripts/generate_proto.py
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=GH_TOKEN \
     if [ -f /run/secrets/GH_TOKEN ] && [ -s /run/secrets/GH_TOKEN ]; then \
