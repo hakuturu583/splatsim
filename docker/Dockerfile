@@ -37,7 +37,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # =============================================================================
 # Runtime stage
 # =============================================================================
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
+FROM ubuntu:${UBUNTU_VERSION}
+
+# Enable NVIDIA Container Toolkit GPU access
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 WORKDIR /workspace/splatsim
 
