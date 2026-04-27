@@ -22,7 +22,7 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/python
 WORKDIR /workspace/splatsim
 
 # Install dependencies first (layer cache optimization)
-COPY pyproject.toml uv.lock .python-version ./
+COPY pyproject.toml uv.lock .python-version README.md ./
 COPY resource/ resource/
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gitconfig,target=/root/.gitconfig \
