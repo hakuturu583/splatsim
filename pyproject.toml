@@ -79,6 +79,13 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = ["splatsim", "scenarios"]
 
+# ROS 2 launch files depend on packages (launch, launch_ros, ament_index_python)
+# that are not installable via pip and unavailable in the uv-managed virtualenv.
+[[tool.ty.overrides]]
+include = ["launch/**"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
 [tool.colcon-uv-ros]
 name = "splatsim"
 

@@ -31,10 +31,13 @@ from .spawn_only import SpawnOnlyConfig, SpawnOnlyScenario
 
 logger = logging.getLogger(__name__)
 
+
 def _find_env_file() -> Path | None:
     """Locate .env file, checking ROS2 share dir then source-tree fallback."""
     try:
-        from ament_index_python.packages import get_package_share_directory
+        from ament_index_python.packages import (
+            get_package_share_directory,
+        )  # ty: ignore[unresolved-import]
 
         share = Path(get_package_share_directory("splatsim"))
         candidate = share / ".env"
@@ -50,6 +53,7 @@ def _find_env_file() -> Path | None:
 def _resolve_relative_paths(base_dir: Path) -> None:
     """Resolve relative file paths in env vars to absolute using base_dir."""
     import os
+
     for key in ("ODAIBATEST_LANELET2_PATH", "ODAIBATEST_XODR_PATH"):
         val = os.environ.get(key)
         if val and not Path(val).is_absolute() and (base_dir / val).is_file():

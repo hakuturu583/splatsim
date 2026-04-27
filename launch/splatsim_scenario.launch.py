@@ -21,16 +21,29 @@ def generate_launch_description():
         DeclareLaunchArgument("scene_yaml"),
         DeclareLaunchArgument("spawn_lanelet_id", default_value="2303321"),
         DeclareLaunchArgument("spawn_s", default_value="0.0"),
-        DeclareLaunchArgument("vehicle_type", default_value="vehicle.mini.cooper_s_2021"),
+        DeclareLaunchArgument(
+            "vehicle_type", default_value="vehicle.mini.cooper_s_2021"
+        ),
         DeclareLaunchArgument("timeout_seconds", default_value="3600.0"),
         DeclareLaunchArgument("image_topic", default_value="/splatsim/image_raw"),
-        DeclareLaunchArgument("camera_info_topic", default_value="/splatsim/camera_info"),
+        DeclareLaunchArgument(
+            "camera_info_topic", default_value="/splatsim/camera_info"
+        ),
         DeclareLaunchArgument("frame_id", default_value="splatsim_camera"),
     ]
 
     spawn_scenario = ExecuteProcess(
         cmd=[
-            PathJoinSubstitution([FindPackageShare("splatsim"), "..", "..", "lib", "splatsim", "spawn-scenario"]),
+            PathJoinSubstitution(
+                [
+                    FindPackageShare("splatsim"),
+                    "..",
+                    "..",
+                    "lib",
+                    "splatsim",
+                    "spawn-scenario",
+                ]
+            ),
             ["server.host=", LaunchConfiguration("carla_host")],
             ["server.port=", LaunchConfiguration("carla_port")],
             ["splatsim.scene_yaml=", LaunchConfiguration("scene_yaml")],
