@@ -19,7 +19,7 @@ class TimestampedPose:
 class PoseBuffer:
     """Accumulates timestamped poses and interpolates at arbitrary times."""
 
-    def __init__(self, max_size: int = 10_000) -> None:
+    def __init__(self, max_size: int = 100) -> None:
         self._max_size = max_size
         self._poses: list[TimestampedPose] = []
 
