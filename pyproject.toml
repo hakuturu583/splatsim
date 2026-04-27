@@ -14,6 +14,8 @@ dependencies = [
     "3dgs-io",
     "pyyaml>=6.0",
     "setuptools",
+    "grpcio>=1.60.0",
+    "protobuf>=4.25.0",
 ]
 
 [project.optional-dependencies]
@@ -68,11 +70,17 @@ dev = [
     "mypy>=1.10.0",
     "pytest-cov>=6.0.0",
     "pre-commit>=4.0.0",
+    "grpcio-tools>=1.60.0",
 ]
 
 [project.scripts]
 viewer = "splatsim.viewer:main"
 spawn-scenario = "scenarios.odaibatest_spawn.run:main"
+splatsim-grpc-server = "splatsim.grpc_service.cli:main"
+splatsim-tile-server = "splatsim.tile_server.cli:main"
+
+[tool.ruff]
+exclude = ["src/splatsim/grpc_service/_generated"]
 
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]
