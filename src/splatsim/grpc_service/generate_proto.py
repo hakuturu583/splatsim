@@ -2,7 +2,7 @@
 """Generate gRPC/protobuf Python code from .proto files.
 
 Usage:
-    python scripts/generate_proto.py
+    python src/splatsim/grpc_service/generate_proto.py
 
 The generated files are written to src/splatsim/grpc_service/_generated/.
 Import paths are automatically fixed for the flat _generated layout.
@@ -15,9 +15,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+_THIS_DIR = Path(__file__).resolve().parent
+ROOT = _THIS_DIR.parent.parent.parent  # src/splatsim/grpc_service -> repo root
 PROTO_DIR = ROOT / "proto"
-OUT_DIR = ROOT / "src" / "splatsim" / "grpc_service" / "_generated"
+OUT_DIR = _THIS_DIR / "_generated"
 
 
 def main() -> None:
