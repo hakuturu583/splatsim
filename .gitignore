@@ -17,3 +17,6 @@ test/data/osm/
 
 # Log
 outputs
+
+# 3D Tiles data (large binary files)
+test/data/tokyo_teleport/iteration_*/
