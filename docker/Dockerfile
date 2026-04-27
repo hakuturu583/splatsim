@@ -34,6 +34,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gitconfig,target=/root/.gitconfig \
     uv sync --extra dds --no-dev
 
+# Remove packages unnecessary for inference/simulation
+RUN rm -rf .venv/lib/python3.10/site-packages/triton \
+    .venv/lib/python3.10/site-packages/nvidia/nccl \
+    .venv/lib/python3.10/site-packages/nvidia/cusparse \
+    .venv/lib/python3.10/site-packages/nvidia/cufft \
+    .venv/lib/python3.10/site-packages/nvidia/cusolver
+
 # =============================================================================
 # Runtime stage
 # =============================================================================
