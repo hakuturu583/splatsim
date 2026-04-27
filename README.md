@@ -46,18 +46,23 @@ The Dockerfile uses a multi-stage build with the `dds` extra to keep the image m
 Private git dependencies (e.g. `3dgs-io`) require a GitHub token passed as a build secret.
 
 ```bash
-# 1. Create a .gitconfig with your token
-printf '[url "https://x-access-token:%s@github.com/"]\n\tinsteadOf = https://github.com/\n' \
-  "$(gh auth token)" > /tmp/.gitconfig
-
-# 2. Build
+# Build (GH_TOKEN is needed for private git dependencies)
 docker buildx build \
   -f docker/Dockerfile \
-  --secret id=gitconfig,src=/tmp/.gitconfig \
+  --secret id=GH_TOKEN,env=GH_TOKEN \
   -t splatsim .
 
-# 3. Run (requires NVIDIA Container Toolkit)
+# Run (requires NVIDIA Container Toolkit)
 docker run --rm -it --gpus all splatsim
+```
+
+If you use `gh` CLI, you can set the token inline:
+
+```bash
+GH_TOKEN=$(gh auth token) docker buildx build \
+  -f docker/Dockerfile \
+  --secret id=GH_TOKEN,env=GH_TOKEN \
+  -t splatsim .
 ```
 
 To customize CUDA or Ubuntu versions:
@@ -67,7 +72,7 @@ docker buildx build \
   -f docker/Dockerfile \
   --build-arg CUDA_VERSION=12.4.1 \
   --build-arg UBUNTU_VERSION=22.04 \
-  --secret id=gitconfig,src=/tmp/.gitconfig \
+  --secret id=GH_TOKEN,env=GH_TOKEN \
   -t splatsim .
 ```
 

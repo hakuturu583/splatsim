@@ -25,18 +25,24 @@ WORKDIR /workspace/splatsim
 COPY pyproject.toml uv.lock .python-version README.md ./
 COPY resource/ resource/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=gitconfig \
-    if [ -s /run/secrets/gitconfig ]; then cp /run/secrets/gitconfig /root/.gitconfig; fi \
-    && uv sync --extra dds --no-dev --no-install-project \
-    && rm -f /root/.gitconfig
+    --mount=type=secret,id=GH_TOKEN \
+    if [ -f /run/secrets/GH_TOKEN ] && [ -s /run/secrets/GH_TOKEN ]; then \
+      export GIT_CONFIG_COUNT=1 \
+             GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/GH_TOKEN)@github.com/.insteadOf" \
+             GIT_CONFIG_VALUE_0="https://github.com/"; \
+    fi \
+    && uv sync --extra dds --no-dev --no-install-project
 
 # Copy source and install project
 COPY src/ src/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=gitconfig \
-    if [ -s /run/secrets/gitconfig ]; then cp /run/secrets/gitconfig /root/.gitconfig; fi \
-    && uv sync --extra dds --no-dev \
-    && rm -f /root/.gitconfig
+    --mount=type=secret,id=GH_TOKEN \
+    if [ -f /run/secrets/GH_TOKEN ] && [ -s /run/secrets/GH_TOKEN ]; then \
+      export GIT_CONFIG_COUNT=1 \
+             GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/GH_TOKEN)@github.com/.insteadOf" \
+             GIT_CONFIG_VALUE_0="https://github.com/"; \
+    fi \
+    && uv sync --extra dds --no-dev
 
 # Remove packages unnecessary for inference/simulation
 RUN rm -rf .venv/lib/python3.10/site-packages/triton \
