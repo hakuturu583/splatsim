@@ -5,10 +5,9 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterator
+from typing import Iterator
 
 import grpc
-import numpy as np
 import torch
 
 from cyclonedds.domain import DomainParticipant
@@ -28,9 +27,6 @@ from splatsim.grpc_service.viewmat_builder import (
 )
 from splatsim.renderer import Renderer
 from splatsim.scene import Scene
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +59,6 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         self._frame_rate: float = 30.0
         self._clock_initial_ns: int = 0
 
-    # ── Initialize ────────────────────────────────────────────────────
-
     def Initialize(
         self,
         request: pb2.InitializeRequest,
@@ -76,7 +70,6 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 device = torch.device(request.device or "cuda")
                 self._device = device
 
-                # Scene
                 logger.info("Loading tileset: %s", request.tileset_path)
                 background = Background(
                     request.tileset_path,
@@ -86,7 +79,6 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 self._scene = Scene(background=background)
                 logger.info("Scene loaded: %d Gaussians", background.num_gaussians)
 
-                # Renderer
                 intr = request.intrinsics
                 bg = request.background_color
                 bg_color = (bg.x, bg.y, bg.z) if bg else (0.0, 0.0, 0.0)
@@ -99,10 +91,8 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                     far_plane=request.far_plane or 1000.0,
                 )
 
-                # Intrinsics
                 self._K = build_intrinsics(intr.fx, intr.fy, intr.cx, intr.cy, device)
 
-                # DDS publishers
                 dp = DomainParticipant()
                 frame_id = request.frame_id or "camera"
                 self._image_pub = ImagePublisher(
@@ -126,7 +116,6 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                     frame_id=frame_id,
                 )
 
-                # Frame scheduling
                 self._frame_rate = request.frame_rate or 30.0
                 clk = request.clock_initial
                 self._clock_initial_ns = (
@@ -140,8 +129,6 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             except Exception as exc:
                 logger.exception("Initialize failed")
                 return pb2.InitializeResponse(success=False, message=str(exc))
-
-    # ── StreamCameraData ──────────────────────────────────────────────
 
     def StreamCameraData(
         self,
@@ -202,8 +189,6 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             poses_received=poses_received,
         )
 
-    # ── internals ─────────────────────────────────────────────────────
-
     def _render_and_publish(
         self,
         pose: TimestampedPose,
@@ -211,7 +196,6 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
     ) -> None:
         """Render a single frame at the interpolated pose and publish via DDS."""
         assert self._renderer is not None  # noqa: S101
-        assert self._scene is not None  # noqa: S101
         assert self._K is not None  # noqa: S101
         assert self._device is not None  # noqa: S101
 
@@ -220,9 +204,8 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         with torch.no_grad():
             rgb = self._renderer.render(viewmat, self._K, scene=self._scene)
 
-        # float32 RGB [H, W, 3] → uint8 BGR [H, W, 3]
-        rgb_np = (rgb.clamp(0.0, 1.0) * 255).byte().cpu().numpy()
-        bgr_np = np.ascontiguousarray(rgb_np[:, :, ::-1])
+        # float32 RGB [H, W, 3] → uint8 BGR [H, W, 3] (flip on GPU before transfer)
+        bgr_np = (rgb.clamp(0.0, 1.0) * 255).byte()[:, :, [2, 1, 0]].cpu().numpy()
 
         sec, nanosec = divmod(render_time_ns, 1_000_000_000)
         stamp = Time(sec=sec, nanosec=nanosec)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import bisect
 import math
-import threading
 from dataclasses import dataclass
 
 
@@ -18,80 +17,65 @@ class TimestampedPose:
 
 
 class PoseBuffer:
-    """Accumulates timestamped poses and interpolates at arbitrary times.
-
-    Thread-safe via a :class:`threading.Lock`.
-    """
+    """Accumulates timestamped poses and interpolates at arbitrary times."""
 
     def __init__(self, max_size: int = 10_000) -> None:
         self._max_size = max_size
-        self._times: list[int] = []
         self._poses: list[TimestampedPose] = []
-        self._lock = threading.Lock()
 
     def append(self, pose: TimestampedPose) -> None:
         """Add a new pose.  Poses must arrive in non-decreasing time order."""
-        with self._lock:
-            self._times.append(pose.time_ns)
-            self._poses.append(pose)
-            if len(self._times) > self._max_size:
-                self._times.pop(0)
-                self._poses.pop(0)
+        self._poses.append(pose)
+        if len(self._poses) > self._max_size:
+            self._poses.pop(0)
 
     def interpolate(self, time_ns: int) -> TimestampedPose | None:
         """Interpolate pose at *time_ns*.
 
         Returns ``None`` if *time_ns* is outside the buffered range.
         """
-        with self._lock:
-            if not self._times:
-                return None
+        if not self._poses:
+            return None
 
-            idx = bisect.bisect_right(self._times, time_ns)
+        times = [p.time_ns for p in self._poses]
+        idx = bisect.bisect_right(times, time_ns)
 
-            # Exact match on the last element or beyond range
-            if idx == 0:
-                return None  # before all poses
-            if idx >= len(self._times):
-                # After last pose — only return if exactly at the last pose
-                if self._times[-1] == time_ns:
-                    return self._poses[-1]
-                return None
+        if idx == 0:
+            return None  # before all poses
+        if idx >= len(self._poses):
+            if self._poses[-1].time_ns == time_ns:
+                return self._poses[-1]
+            return None
 
-            p0 = self._poses[idx - 1]
-            p1 = self._poses[idx]
+        p0 = self._poses[idx - 1]
+        p1 = self._poses[idx]
 
-            if p0.time_ns == p1.time_ns:
-                return p0
+        if p0.time_ns == p1.time_ns:
+            return p0
 
-            t = (time_ns - p0.time_ns) / (p1.time_ns - p0.time_ns)
-            pos = _lerp_position(p0.position, p1.position, t)
-            rot = _slerp(p0.rotation, p1.rotation, t)
-            return TimestampedPose(time_ns=time_ns, position=pos, rotation=rot)
+        t = (time_ns - p0.time_ns) / (p1.time_ns - p0.time_ns)
+        pos = _lerp_position(p0.position, p1.position, t)
+        rot = _slerp(p0.rotation, p1.rotation, t)
+        return TimestampedPose(time_ns=time_ns, position=pos, rotation=rot)
 
     def trim_before(self, time_ns: int) -> None:
         """Remove poses older than *time_ns*, keeping one for interpolation."""
-        with self._lock:
-            idx = bisect.bisect_left(self._times, time_ns)
-            # Keep at least one pose before time_ns
-            keep_from = max(0, idx - 1)
-            if keep_from > 0:
-                del self._times[:keep_from]
-                del self._poses[:keep_from]
+        times = [p.time_ns for p in self._poses]
+        idx = bisect.bisect_left(times, time_ns)
+        keep_from = max(0, idx - 1)
+        if keep_from > 0:
+            del self._poses[:keep_from]
 
     @property
     def latest_time_ns(self) -> int | None:
-        with self._lock:
-            return self._times[-1] if self._times else None
+        return self._poses[-1].time_ns if self._poses else None
 
     @property
     def earliest_time_ns(self) -> int | None:
-        with self._lock:
-            return self._times[0] if self._times else None
+        return self._poses[0].time_ns if self._poses else None
 
     def __len__(self) -> int:
-        with self._lock:
-            return len(self._times)
+        return len(self._poses)
 
 
 def _slerp(
