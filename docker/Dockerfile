@@ -75,4 +75,5 @@ COPY package.xml ./
 ENV VIRTUAL_ENV=/workspace/splatsim/.venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
-CMD ["bash"]
+EXPOSE 50051
+CMD ["splatsim-grpc-server"]
