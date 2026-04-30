@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from concurrent import futures
 
 import grpc
@@ -43,8 +44,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    log_level = os.environ.get("SPLATSIM_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level, logging.INFO),
         format="%(levelname)s %(name)s: %(message)s",
     )
     serve(port=args.port, max_workers=args.max_workers)

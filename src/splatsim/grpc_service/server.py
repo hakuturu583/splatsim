@@ -208,6 +208,13 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
 
         viewmat = build_viewmat_from_pose(pose.position, pose.rotation, self._device)
 
+        logger.debug(
+            "Render pose: pos=(%.4f, %.4f, %.4f) rot_wxyz=(%.4f, %.4f, %.4f, %.4f)",
+            *pose.position,
+            *pose.rotation,
+        )
+        logger.debug("Viewmat:\n%s", viewmat.cpu().numpy())
+
         with torch.no_grad():
             rgb = self._renderer.render(viewmat, self._K, scene=self._scene)
 
