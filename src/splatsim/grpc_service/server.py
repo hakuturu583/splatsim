@@ -131,7 +131,18 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                     y=float(origin[1]),
                     z=float(origin[2]),
                 )
-                return pb2.InitializeResponse(success=True, scene_origin=scene_origin)
+                ecef_t = background._ecef_translation
+                ecef_r = background._ecef_rotation
+                return pb2.InitializeResponse(
+                    success=True,
+                    scene_origin=scene_origin,
+                    ecef_translation=pb2.Vector3(
+                        x=float(ecef_t[0]),
+                        y=float(ecef_t[1]),
+                        z=float(ecef_t[2]),
+                    ),
+                    ecef_rotation=ecef_r.flatten().tolist(),
+                )
 
             except Exception as exc:
                 logger.exception("Initialize failed")
