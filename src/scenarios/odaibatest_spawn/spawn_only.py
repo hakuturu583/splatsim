@@ -79,6 +79,7 @@ class SpawnOnlyScenario(SplatSimScenario):
             image_topic=scfg.image_topic,
             camera_info_topic=scfg.camera_info_topic,
             frame_id=scfg.frame_id,
+            compress_format=scfg.compress_format,
         )
 
         # Attach CARLA IMU sensor and publish to /sensing/imu/imu_data

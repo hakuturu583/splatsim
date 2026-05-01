@@ -99,6 +99,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                     dp,
                     topic_name=request.image_topic or "/splatsim/image_raw",
                     frame_id=frame_id,
+                    compress_format=request.compress_format or "",
                 )
 
                 cam_config = _PinholeConfig(

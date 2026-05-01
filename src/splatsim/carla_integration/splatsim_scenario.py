@@ -203,6 +203,7 @@ class SplatSimScenario(BaseScenario):
         image_topic: str = "/splatsim/image_raw",
         camera_info_topic: str = "/splatsim/camera_info",
         frame_id: str = "splatsim_camera",
+        compress_format: str = "",
     ) -> AttachSplatSimCameraAction:
         """Create and register an action that attaches a SplatSim camera.
 
@@ -271,6 +272,7 @@ class SplatSimScenario(BaseScenario):
                 dds_participant,
                 topic_name=image_topic,
                 frame_id=frame_id,
+                compress_format=compress_format,
             )
 
         self._camera_entries.append(

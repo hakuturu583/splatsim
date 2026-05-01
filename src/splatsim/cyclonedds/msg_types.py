@@ -57,6 +57,15 @@ class Image(IdlStruct, typename="sensor_msgs::msg::dds_::Image_"):
 
 
 @dataclass
+class CompressedImage(IdlStruct, typename="sensor_msgs::msg::dds_::CompressedImage_"):
+    """sensor_msgs/msg/CompressedImage."""
+
+    header: Header = Header()  # noqa: RUF009
+    format: str = ""
+    data: sequence[uint8] = b""  # type: ignore[assignment]
+
+
+@dataclass
 class CameraInfo(IdlStruct, typename="sensor_msgs::msg::dds_::CameraInfo_"):
     """sensor_msgs/msg/CameraInfo."""
 
