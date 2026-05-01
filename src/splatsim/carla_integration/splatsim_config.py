@@ -29,3 +29,4 @@ class SplatSimConfig:
     image_topic: str = "/splatsim/image_raw"
     camera_info_topic: str = "/splatsim/camera_info"
     frame_id: str = "splatsim_camera"
+    compress_format: str = ""

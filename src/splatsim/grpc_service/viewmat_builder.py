@@ -19,22 +19,17 @@ def build_viewmat_from_pose(
 
     - *position* is ``(x, y, z)``
     - *rotation_wxyz* is a ``(w, x, y, z)`` quaternion representing
-      camera orientation.  The corresponding rotation matrix's columns
-      are ``[forward(X), right(Y), up(Z)]`` in tile-local world
-      coordinates — the same convention as
-      ``SplatSimCameraSensor._compute_viewmat``.
+      the camera-to-world rotation **already in gsplat RDF convention**
+      (X=right, Y=down, Z=forward).  The client is responsible for
+      applying the RDF remapping before sending.
 
-    The function remaps to gsplat RDF convention and inverts to produce
-    a world-to-camera view matrix.
+    The function inverts this to produce a world-to-camera view matrix.
     """
     q = torch.tensor(rotation_wxyz, device=device, dtype=torch.float32)
-    R_c2w = quat_to_rotation_matrix(q)  # [3, 3], columns = [fwd, right, up]
-
-    # Remap: camera (X=fwd, Y=right, Z=up) → gsplat (X=right, Y=down, Z=fwd)
-    R_rdf = torch.stack([R_c2w[:, 1], -R_c2w[:, 2], R_c2w[:, 0]], dim=1)
+    R_c2w = quat_to_rotation_matrix(q)  # [3, 3], already in RDF convention
 
     # Invert camera-to-world → world-to-camera
-    R_w2c = R_rdf.T
+    R_w2c = R_c2w.T
     pos = torch.tensor(position, device=device, dtype=torch.float32)
     t_w2c = -(R_w2c @ pos)
 

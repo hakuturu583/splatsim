@@ -4,9 +4,10 @@
   <arg name="image_topic" default="/splatsim/image_raw"/>
   <arg name="camera_info_topic" default="/splatsim/camera_info"/>
   <arg name="frame_id" default="splatsim_camera"/>
+  <arg name="compress_format" default=""/>
 
   <node pkg="splatsim" exec="splatsim-viewer" name="splatsim_viewer" output="screen"
-        args="$(var scene_yaml) --dds --topic-image $(var image_topic) --topic-camera-info $(var camera_info_topic) --frame-id $(var frame_id)"
+        args="$(var scene_yaml) --dds --topic-image $(var image_topic) --topic-camera-info $(var camera_info_topic) --frame-id $(var frame_id) --compress-format $(var compress_format)"
         if="$(var dds)"/>
 
   <node pkg="splatsim" exec="splatsim-viewer" name="splatsim_viewer" output="screen"

@@ -47,6 +47,47 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     fi \
     && uv sync --extra dds --no-dev
 
+# Pre-compile gsplat CUDA kernels (JIT) so the runtime image does not need nvcc.
+ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+ENV TORCH_EXTENSIONS_DIR=/workspace/splatsim/.torch_extensions
+RUN uv run python -c "from gsplat.cuda._backend import _C; assert _C is not None, 'gsplat CUDA JIT compilation failed'"
+
+# Patch gsplat _backend.py so it can load the pre-compiled .so without nvcc.
+# The upstream code gates on cuda_toolkit_available() which requires nvcc even
+# when a compiled extension already exists.  This patch adds a fallback that
+# loads the pre-compiled .so directly when the CUDA toolkit is absent.
+COPY <<'PATCH_EOF' /tmp/patch_gsplat.py
+import pathlib
+
+p = pathlib.Path(".venv/lib/python3.10/site-packages/gsplat/cuda/_backend.py")
+src = p.read_text()
+
+old = """\
+    else:
+        Console().print(
+            "[yellow]gsplat: No CUDA toolkit found. gsplat will be disabled.[/yellow]"
+        )"""
+
+new = """\
+    else:
+        # Try loading pre-compiled CUDA extension without toolkit
+        name = "gsplat_cuda"
+        build_dir = _get_build_directory(name, verbose=False)
+        _so = os.path.join(build_dir, f"{name}.so")
+        if os.path.exists(_so):
+            _C = _import_module_from_library(name, build_dir, True)
+        else:
+            Console().print(
+                "[yellow]gsplat: No CUDA toolkit found. gsplat will be disabled.[/yellow]"
+            )"""
+
+assert old in src, "Patch target not found in _backend.py; gsplat version may have changed"
+p.write_text(src.replace(old, new))
+print("_backend.py patched successfully")
+PATCH_EOF
+RUN uv run python /tmp/patch_gsplat.py
+
 # Remove packages unnecessary for inference/simulation
 RUN rm -rf .venv/lib/python3.10/site-packages/triton \
     .venv/lib/python3.10/site-packages/nvidia/nccl \
@@ -67,6 +108,7 @@ WORKDIR /workspace/splatsim
 
 COPY --from=builder /opt/python /opt/python
 COPY --from=builder /workspace/splatsim/.venv .venv/
+COPY --from=builder /workspace/splatsim/.torch_extensions .torch_extensions/
 COPY --from=builder /workspace/splatsim/src/ src/
 COPY --from=builder /workspace/splatsim/pyproject.toml .
 COPY launch/ launch/
@@ -74,6 +116,7 @@ COPY package.xml ./
 
 ENV VIRTUAL_ENV=/workspace/splatsim/.venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+ENV TORCH_EXTENSIONS_DIR=/workspace/splatsim/.torch_extensions
 
 EXPOSE 50051
 CMD ["splatsim-grpc-server"]

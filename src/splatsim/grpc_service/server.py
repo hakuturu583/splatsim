@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -19,7 +20,6 @@ from splatsim.grpc_service._generated import (
     rendering_service_pb2 as pb2,
     rendering_service_pb2_grpc as pb2_grpc,
 )
-from splatsim.grpc_service.frame_scheduler import FrameScheduler
 from splatsim.grpc_service.pose_buffer import PoseBuffer, TimestampedPose
 from splatsim.grpc_service.viewmat_builder import (
     build_intrinsics,
@@ -58,6 +58,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         self._camera_info_pub: CameraInfoPublisher | None = None
         self._frame_rate: float = 30.0
         self._clock_initial_ns: int = 0
+        self._render_count: int = 0
 
     def Initialize(
         self,
@@ -99,6 +100,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                     dp,
                     topic_name=request.image_topic or "/splatsim/image_raw",
                     frame_id=frame_id,
+                    compress_format=request.compress_format or "",
                 )
 
                 cam_config = _PinholeConfig(
@@ -153,7 +155,13 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         request_iterator: Iterator[pb2.CameraData],
         context: grpc.ServicerContext,
     ) -> pb2.StreamSummary:
-        """Consume timestamped camera poses, render, and publish via DDS."""
+        """Consume timestamped camera poses, render, and publish via DDS.
+
+        Reading from the gRPC stream and GPU rendering run on separate
+        threads so that slow rendering never blocks pose ingestion.
+        The render loop always uses the latest available pose, and old
+        poses are automatically dropped from the buffer.
+        """
         if not self._initialized:
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
@@ -166,42 +174,94 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         assert self._device is not None  # noqa: S101
 
         pose_buffer = PoseBuffer()
-        scheduler = FrameScheduler(self._clock_initial_ns, self._frame_rate)
+        stream_done = threading.Event()
+        render_failed = threading.Event()
         frames_rendered = 0
         poses_received = 0
 
-        for camera_data in request_iterator:
-            stamp = camera_data.stamp
-            time_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
+        frame_period_s = 1.0 / self._frame_rate
 
-            p = camera_data.pose.position
-            r = camera_data.pose.rotation
-            pose = TimestampedPose(
-                time_ns=time_ns,
-                position=(p.x, p.y, p.z),
-                rotation=(r.w, r.x, r.y, r.z),
-            )
-            pose_buffer.append(pose)
-            poses_received += 1
+        def _render_loop() -> None:
+            """Render at frame_rate using the latest buffered pose."""
+            nonlocal frames_rendered
+            try:
+                while not stream_done.is_set():
+                    # Wait for a new pose; clear so we block again next iteration
+                    if not pose_buffer.new_pose_event.wait(timeout=1.0):
+                        continue
+                    pose_buffer.new_pose_event.clear()
 
-            while scheduler.should_render(time_ns):
-                render_time_ns = scheduler.next_render_time_ns
+                    render_start = time.monotonic()
 
-                interpolated = pose_buffer.interpolate(render_time_ns)
-                if interpolated is None:
-                    logger.warning(
-                        "Cannot interpolate at t=%d ns; skipping frame %d",
-                        render_time_ns,
-                        scheduler.frame_count,
+                    latest = pose_buffer.get_latest()
+                    if latest is None:
+                        continue
+
+                    render_time_ns = latest.time_ns
+
+                    if frames_rendered <= 3 or frames_rendered % 100 == 0:
+                        logger.info(
+                            "Render #%d: render_t=%d pos=(%.4f, %.4f, %.4f)",
+                            frames_rendered,
+                            render_time_ns,
+                            latest.position[0],
+                            latest.position[1],
+                            latest.position[2],
+                        )
+
+                    self._render_and_publish(latest, render_time_ns)
+                    frames_rendered += 1
+                    pose_buffer.trim_before(render_time_ns)
+
+                    elapsed = time.monotonic() - render_start
+                    sleep_time = frame_period_s - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+
+            except Exception:
+                logger.exception("Render loop failed")
+                render_failed.set()
+
+        render_thread = threading.Thread(target=_render_loop, daemon=True)
+        render_thread.start()
+
+        try:
+            for camera_data in request_iterator:
+                stamp = camera_data.stamp
+                time_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
+
+                p = camera_data.pose.position
+                r = camera_data.pose.rotation
+                pose = TimestampedPose(
+                    time_ns=time_ns,
+                    position=(p.x, p.y, p.z),
+                    rotation=(r.w, r.x, r.y, r.z),
+                )
+                pose_buffer.append(pose)
+                poses_received += 1
+
+                if poses_received <= 3 or poses_received % 100 == 0:
+                    logger.info(
+                        "Received pose #%d: t=%d ns pos=(%.4f, %.4f, %.4f)",
+                        poses_received,
+                        time_ns,
+                        p.x,
+                        p.y,
+                        p.z,
                     )
-                    scheduler.advance()
-                    continue
 
-                self._render_and_publish(interpolated, render_time_ns)
-                frames_rendered += 1
-                scheduler.advance()
-                pose_buffer.trim_before(render_time_ns)
+                if render_failed.is_set():
+                    logger.error("Render thread died, stopping stream reader")
+                    break
+        finally:
+            stream_done.set()
+            render_thread.join(timeout=10.0)
 
+        logger.info(
+            "Stream finished: poses_received=%d, frames_rendered=%d",
+            poses_received,
+            frames_rendered,
+        )
         return pb2.StreamSummary(
             frames_rendered=frames_rendered,
             poses_received=poses_received,
@@ -217,7 +277,9 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         assert self._K is not None  # noqa: S101
         assert self._device is not None  # noqa: S101
 
+        t0 = time.monotonic()
         viewmat = build_viewmat_from_pose(pose.position, pose.rotation, self._device)
+        t_viewmat = time.monotonic()
 
         logger.debug(
             "Render pose: pos=(%.4f, %.4f, %.4f) rot_wxyz=(%.4f, %.4f, %.4f, %.4f)",
@@ -228,9 +290,11 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
 
         with torch.no_grad():
             rgb = self._renderer.render(viewmat, self._K, scene=self._scene)
+        t_render = time.monotonic()
 
         # float32 RGB [H, W, 3] → uint8 BGR [H, W, 3] (flip on GPU before transfer)
         bgr_np = (rgb.clamp(0.0, 1.0) * 255).byte()[:, :, [2, 1, 0]].cpu().numpy()
+        t_transfer = time.monotonic()
 
         sec, nanosec = divmod(render_time_ns, 1_000_000_000)
         stamp = Time(sec=sec, nanosec=nanosec)
@@ -239,3 +303,18 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             self._image_pub.publish(bgr_np, stamp=stamp)
         if self._camera_info_pub is not None:
             self._camera_info_pub.publish(stamp=stamp)
+        t_publish = time.monotonic()
+
+        total_ms = (t_publish - t0) * 1000
+        self._render_count += 1
+        if self._render_count <= 5 or self._render_count % 100 == 0:
+            logger.info(
+                "Render timing #%d: total=%.1fms "
+                "(viewmat=%.1f render=%.1f transfer=%.1f publish=%.1f)",
+                self._render_count,
+                total_ms,
+                (t_viewmat - t0) * 1000,
+                (t_render - t_viewmat) * 1000,
+                (t_transfer - t_render) * 1000,
+                (t_publish - t_transfer) * 1000,
+            )

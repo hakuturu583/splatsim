@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import math
+import threading
 from dataclasses import dataclass
 
 
@@ -17,23 +18,66 @@ class TimestampedPose:
 
 
 class PoseBuffer:
-    """Accumulates timestamped poses and interpolates at arbitrary times."""
+    """Thread-safe pose buffer with interpolation.
+
+    Accumulates timestamped poses and interpolates at arbitrary times.
+    A ``threading.Event`` is set whenever a new pose is appended so that
+    a consumer thread can wake up immediately.
+    """
 
     def __init__(self, max_size: int = 100) -> None:
         self._max_size = max_size
         self._poses: list[TimestampedPose] = []
+        self._lock = threading.Lock()
+        self.new_pose_event = threading.Event()
 
     def append(self, pose: TimestampedPose) -> None:
         """Add a new pose.  Poses must arrive in non-decreasing time order."""
-        self._poses.append(pose)
-        if len(self._poses) > self._max_size:
-            self._poses.pop(0)
+        with self._lock:
+            self._poses.append(pose)
+            if len(self._poses) > self._max_size:
+                self._poses.pop(0)
+        self.new_pose_event.set()
 
     def interpolate(self, time_ns: int) -> TimestampedPose | None:
         """Interpolate pose at *time_ns*.
 
         Returns ``None`` if *time_ns* is outside the buffered range.
         """
+        with self._lock:
+            return self._interpolate_unlocked(time_ns)
+
+    def get_latest(self) -> TimestampedPose | None:
+        """Return the most recently appended pose, or ``None``."""
+        with self._lock:
+            return self._poses[-1] if self._poses else None
+
+    def trim_before(self, time_ns: int) -> None:
+        """Remove poses older than *time_ns*, keeping one for interpolation."""
+        with self._lock:
+            times = [p.time_ns for p in self._poses]
+            idx = bisect.bisect_left(times, time_ns)
+            keep_from = max(0, idx - 1)
+            if keep_from > 0:
+                del self._poses[:keep_from]
+
+    @property
+    def latest_time_ns(self) -> int | None:
+        with self._lock:
+            return self._poses[-1].time_ns if self._poses else None
+
+    @property
+    def earliest_time_ns(self) -> int | None:
+        with self._lock:
+            return self._poses[0].time_ns if self._poses else None
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._poses)
+
+    # ── private ───────────────────────────────────────────────────────
+
+    def _interpolate_unlocked(self, time_ns: int) -> TimestampedPose | None:
         if not self._poses:
             return None
 
@@ -57,25 +101,6 @@ class PoseBuffer:
         pos = _lerp_position(p0.position, p1.position, t)
         rot = _slerp(p0.rotation, p1.rotation, t)
         return TimestampedPose(time_ns=time_ns, position=pos, rotation=rot)
-
-    def trim_before(self, time_ns: int) -> None:
-        """Remove poses older than *time_ns*, keeping one for interpolation."""
-        times = [p.time_ns for p in self._poses]
-        idx = bisect.bisect_left(times, time_ns)
-        keep_from = max(0, idx - 1)
-        if keep_from > 0:
-            del self._poses[:keep_from]
-
-    @property
-    def latest_time_ns(self) -> int | None:
-        return self._poses[-1].time_ns if self._poses else None
-
-    @property
-    def earliest_time_ns(self) -> int | None:
-        return self._poses[0].time_ns if self._poses else None
-
-    def __len__(self) -> int:
-        return len(self._poses)
 
 
 def _slerp(

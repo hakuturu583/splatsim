@@ -286,6 +286,12 @@ def main() -> None:
     parser.add_argument("--topic-camera-info", default="/splatsim/camera_info")
     parser.add_argument("--frame-id", default="camera")
     parser.add_argument(
+        "--compress-format",
+        default="",
+        help="Compress format for published images (e.g. 'jpeg', 'png'). "
+        "Empty string (default) publishes raw sensor_msgs/Image.",
+    )
+    parser.add_argument(
         "--pos",
         type=float,
         nargs=3,
@@ -322,7 +328,10 @@ def main() -> None:
 
         dp = DomainParticipant()
         image_pub = ImagePublisher(
-            dp, topic_name=args.topic_image, frame_id=args.frame_id
+            dp,
+            topic_name=args.topic_image,
+            frame_id=args.frame_id,
+            compress_format=args.compress_format,
         )
 
         # Build a config-like object with the same intrinsics the Viewer uses.
