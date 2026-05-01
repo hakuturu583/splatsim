@@ -51,6 +51,9 @@ class ImagePublisher:
         self._compress_quality = compress_quality
 
         if self._compress_format:
+            import cv2  # noqa: PLC0415
+
+            self._cv2 = cv2
             if not topic_name.endswith("/compressed"):
                 topic_name = topic_name.rstrip("/") + "/compressed"
             topic = Topic(participant, _to_dds_topic(topic_name), CompressedImage)
@@ -98,8 +101,7 @@ class ImagePublisher:
         self._writer.write(msg)
 
     def _publish_compressed(self, image: NDArray[np.uint8], stamp: Time) -> None:
-        import cv2  # noqa: PLC0415
-
+        cv2 = self._cv2
         fmt = self._compress_format
         if fmt == "jpeg":
             encode_param = [cv2.IMWRITE_JPEG_QUALITY, self._compress_quality]

@@ -52,19 +52,6 @@ class PoseBuffer:
         with self._lock:
             return self._poses[-1] if self._poses else None
 
-    def interpolate_or_latest(self, time_ns: int) -> TimestampedPose | None:
-        """Interpolate at *time_ns*, falling back to the latest pose.
-
-        Unlike :meth:`interpolate`, this never returns ``None`` when the
-        buffer is non-empty — if *time_ns* is past the latest pose the
-        latest pose is returned as-is.
-        """
-        with self._lock:
-            result = self._interpolate_unlocked(time_ns)
-            if result is not None:
-                return result
-            return self._poses[-1] if self._poses else None
-
     def trim_before(self, time_ns: int) -> None:
         """Remove poses older than *time_ns*, keeping one for interpolation."""
         with self._lock:

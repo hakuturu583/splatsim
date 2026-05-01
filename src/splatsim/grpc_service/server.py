@@ -58,6 +58,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         self._camera_info_pub: CameraInfoPublisher | None = None
         self._frame_rate: float = 30.0
         self._clock_initial_ns: int = 0
+        self._render_count: int = 0
 
     def Initialize(
         self,
@@ -174,9 +175,9 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
 
         pose_buffer = PoseBuffer()
         stream_done = threading.Event()
+        render_failed = threading.Event()
         frames_rendered = 0
         poses_received = 0
-        render_error: list[Exception] = []
 
         frame_period_s = 1.0 / self._frame_rate
 
@@ -185,50 +186,45 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             nonlocal frames_rendered
             try:
                 while not stream_done.is_set():
-                    # Wait for at least one pose before starting
+                    # Wait for a new pose; clear so we block again next iteration
                     if not pose_buffer.new_pose_event.wait(timeout=1.0):
                         continue
+                    pose_buffer.new_pose_event.clear()
 
                     render_start = time.monotonic()
 
-                    # Use the latest buffered pose directly
                     latest = pose_buffer.get_latest()
                     if latest is None:
-                        time.sleep(frame_period_s)
                         continue
 
                     render_time_ns = latest.time_ns
 
                     if frames_rendered <= 3 or frames_rendered % 100 == 0:
-                        logger.warning(
-                            "Render #%d: render_t=%d pos=(%.4f, %.4f, %.4f) buf_len=%d",
+                        logger.info(
+                            "Render #%d: render_t=%d pos=(%.4f, %.4f, %.4f)",
                             frames_rendered,
                             render_time_ns,
                             latest.position[0],
                             latest.position[1],
                             latest.position[2],
-                            len(pose_buffer),
                         )
 
                     self._render_and_publish(latest, render_time_ns)
                     frames_rendered += 1
                     pose_buffer.trim_before(render_time_ns)
 
-                    # Rate-limit to frame_rate using wall clock
                     elapsed = time.monotonic() - render_start
                     sleep_time = frame_period_s - elapsed
                     if sleep_time > 0:
                         time.sleep(sleep_time)
 
-            except Exception as exc:
+            except Exception:
                 logger.exception("Render loop failed")
-                render_error.append(exc)
+                render_failed.set()
 
-        # Start the render loop in a background thread
         render_thread = threading.Thread(target=_render_loop, daemon=True)
         render_thread.start()
 
-        # Read poses from the gRPC stream (fast, no rendering here)
         try:
             for camera_data in request_iterator:
                 stamp = camera_data.stamp
@@ -245,24 +241,23 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 poses_received += 1
 
                 if poses_received <= 3 or poses_received % 100 == 0:
-                    logger.warning(
-                        "Received pose #%d: t=%d ns pos=(%.4f, %.4f, %.4f) buf_len=%d",
+                    logger.info(
+                        "Received pose #%d: t=%d ns pos=(%.4f, %.4f, %.4f)",
                         poses_received,
                         time_ns,
                         p.x,
                         p.y,
                         p.z,
-                        len(pose_buffer),
                     )
 
-                if render_error:
+                if render_failed.is_set():
                     logger.error("Render thread died, stopping stream reader")
                     break
         finally:
             stream_done.set()
             render_thread.join(timeout=10.0)
 
-        logger.warning(
+        logger.info(
             "Stream finished: poses_received=%d, frames_rendered=%d",
             poses_received,
             frames_rendered,
@@ -311,11 +306,9 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         t_publish = time.monotonic()
 
         total_ms = (t_publish - t0) * 1000
-        if not hasattr(self, "_render_count"):
-            self._render_count = 0
         self._render_count += 1
         if self._render_count <= 5 or self._render_count % 100 == 0:
-            logger.warning(
+            logger.info(
                 "Render timing #%d: total=%.1fms "
                 "(viewmat=%.1f render=%.1f transfer=%.1f publish=%.1f)",
                 self._render_count,
