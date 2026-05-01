@@ -5,11 +5,11 @@
   <arg name="camera_info_topic" default="/splatsim/camera_info"/>
   <arg name="frame_id" default="splatsim_camera"/>
 
-  <node pkg="splatsim" exec="viewer" name="splatsim_viewer" output="screen"
+  <node pkg="splatsim" exec="splatsim-viewer" name="splatsim_viewer" output="screen"
         args="$(var scene_yaml) --dds --topic-image $(var image_topic) --topic-camera-info $(var camera_info_topic) --frame-id $(var frame_id)"
         if="$(var dds)"/>
 
-  <node pkg="splatsim" exec="viewer" name="splatsim_viewer" output="screen"
+  <node pkg="splatsim" exec="splatsim-viewer" name="splatsim_viewer" output="screen"
         args="$(var scene_yaml)"
         unless="$(var dds)"/>
 </launch>
