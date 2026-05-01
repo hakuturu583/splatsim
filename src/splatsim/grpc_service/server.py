@@ -131,7 +131,18 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                     y=float(origin[1]),
                     z=float(origin[2]),
                 )
-                return pb2.InitializeResponse(success=True, scene_origin=scene_origin)
+                ecef_t = background._ecef_translation
+                ecef_r = background._ecef_rotation
+                return pb2.InitializeResponse(
+                    success=True,
+                    scene_origin=scene_origin,
+                    ecef_translation=pb2.Vector3(
+                        x=float(ecef_t[0]),
+                        y=float(ecef_t[1]),
+                        z=float(ecef_t[2]),
+                    ),
+                    ecef_rotation=ecef_r.flatten().tolist(),
+                )
 
             except Exception as exc:
                 logger.exception("Initialize failed")
@@ -207,6 +218,13 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         assert self._device is not None  # noqa: S101
 
         viewmat = build_viewmat_from_pose(pose.position, pose.rotation, self._device)
+
+        logger.debug(
+            "Render pose: pos=(%.4f, %.4f, %.4f) rot_wxyz=(%.4f, %.4f, %.4f, %.4f)",
+            *pose.position,
+            *pose.rotation,
+        )
+        logger.debug("Viewmat:\n%s", viewmat.cpu().numpy())
 
         with torch.no_grad():
             rgb = self._renderer.render(viewmat, self._K, scene=self._scene)

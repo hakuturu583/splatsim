@@ -57,7 +57,7 @@ RUN rm -rf .venv/lib/python3.10/site-packages/triton \
 # =============================================================================
 # Runtime stage
 # =============================================================================
-FROM ubuntu:${UBUNTU_VERSION}
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
 # Enable NVIDIA Container Toolkit GPU access
 ENV NVIDIA_VISIBLE_DEVICES=all
