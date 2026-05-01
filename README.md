@@ -80,7 +80,7 @@ docker buildx build \
 
 ```bash
 # Launch the viewer
-viewer
+splatsim-viewer
 
 # Run a scenario
 spawn-scenario
