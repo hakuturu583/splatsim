@@ -41,9 +41,6 @@ all = [
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
-override-dependencies = [
-    "numpy>=2.1,<2.3",
-]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"
@@ -61,9 +58,9 @@ torchvision = [
 
 3dgs-io = { git = "https://github.com/tier4/3dgs_io.git", branch = "main" }
 
-autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "343e8133", subdirectory = "autoware_carla_scenario" }
-autoware-lanelet2-to-opendrive = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "343e8133", subdirectory = "autoware_lanelet2_to_opendrive" }
-lanelet2-python-api-for-autoware = { git = "https://github.com/tier4/lanelet2_python_api_for_autoware", rev = "7745347645fd04aa8e4230cfa8793e253aad6753" }
+autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "10cd1065", subdirectory = "autoware_carla_scenario" }
+autoware-lanelet2-to-opendrive = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "10cd1065", subdirectory = "autoware_lanelet2_to_opendrive" }
+lanelet2-python-api-for-autoware = { git = "https://github.com/tier4/lanelet2_python_api_for_autoware", rev = "6bd27ff7ab3eed326422b960a2694dff605bdb9a" }
 
 [dependency-groups]
 dev = [
