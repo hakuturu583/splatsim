@@ -56,7 +56,7 @@ torchvision = [
   { index = "pytorch-cu124" },
 ]
 
-3dgs-io = { git = "https://github.com/tier4/3dgs_io.git", branch = "main" }
+3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", branch = "main" }
 
 autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "6165173a", subdirectory = "autoware_carla_scenario" }
 autoware-lanelet2-to-opendrive = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "6165173a", subdirectory = "autoware_lanelet2_to_opendrive" }
