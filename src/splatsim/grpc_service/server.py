@@ -54,6 +54,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         self._renderer: Renderer | None = None
         self._K: torch.Tensor | None = None
         self._device: torch.device | None = None
+        self._dp: DomainParticipant | None = None
         self._image_pub: ImagePublisher | None = None
         self._camera_info_pub: CameraInfoPublisher | None = None
         self._frame_rate: float = 30.0
@@ -95,6 +96,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 self._K = build_intrinsics(intr.fx, intr.fy, intr.cx, intr.cy, device)
 
                 dp = DomainParticipant()
+                self._dp = dp  # prevent GC from destroying DDS entities
                 frame_id = request.frame_id or "camera"
                 self._image_pub = ImagePublisher(
                     dp,
