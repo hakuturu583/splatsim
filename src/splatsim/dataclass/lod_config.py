@@ -28,7 +28,3 @@ class LodConfig:
             LodTier(fraction=0.1, max_distance=float("inf")),
         ]
     )
-
-    radius_clip: float = 0.0
-    """gsplat radius_clip (pixels). Gaussians with projected 2D radius
-    below this value are skipped at the CUDA level."""

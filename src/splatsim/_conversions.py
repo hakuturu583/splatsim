@@ -22,6 +22,17 @@ class GaussianTensors:
     colors: Tensor  # [N, 3] RGB or [N, K, 3] SH coefficients
     sh_degree: int  # 0 = RGB only, 1-3 = SH degree
 
+    def __getitem__(self, idx: Tensor | slice) -> GaussianTensors:
+        """Return a new instance with all tensor fields indexed/sliced by *idx*."""
+        return GaussianTensors(
+            means=self.means[idx],
+            quats=self.quats[idx],
+            scales=self.scales[idx],
+            opacities=self.opacities[idx],
+            colors=self.colors[idx],
+            sh_degree=self.sh_degree,
+        )
+
 
 def cloud_to_tensors(
     cloud: spz.GaussianCloud,  # ty: ignore[unresolved-attribute]

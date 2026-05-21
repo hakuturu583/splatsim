@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor
 
-from splatsim._conversions import GaussianTensors
+from splatsim._conversions import GaussianTensors, apply_rigid_transform
 from splatsim.background import Background
 from splatsim.dataclass import SceneConfig
-from splatsim.lod import LodManager
+from splatsim.lod import LodIndex, LodManager
 from splatsim.renderer import Renderer
 from splatsim.rigid_body import RigidBody
 
@@ -78,7 +78,7 @@ class Scene:
         return self._lod_manager
 
     def collect_tensors(
-        self, camera_position: Tensor | None = None
+        self, camera_position: tuple[float, float, float] | None = None
     ) -> list[GaussianTensors]:
         """Collect Gaussian tensors from all sources, applying LOD if enabled.
 
@@ -89,32 +89,43 @@ class Scene:
         result: list[GaussianTensors] = []
 
         if self.background is not None:
-            tensors = self.background.tensors
-            if (
-                self._lod_manager is not None
-                and camera_position is not None
-                and self.background.lod_index is not None
-            ):
-                tier = self._lod_manager.select_tier(
-                    self.background.lod_index, camera_position
-                )
-                tensors = self._lod_manager.apply(
-                    tensors, self.background.lod_index, tier
-                )
+            tensors = self._filter_lod(
+                self.background.tensors, self.background.lod_index, camera_position
+            )
             result.append(tensors)
 
-        for rb in self.rigid_body_list:
-            tensors = rb.tensors
+        for rb in self._rigid_bodies.values():
             if (
                 self._lod_manager is not None
                 and camera_position is not None
                 and rb.lod_index is not None
             ):
-                tier = self._lod_manager.select_tier(rb.lod_index, camera_position)
-                tensors = self._lod_manager.apply(tensors, rb.lod_index, tier)
+                # Slice base tensors *before* the rigid transform so we
+                # only pay the matrix math for the Gaussians we keep.
+                base = self._lod_manager.filter(
+                    rb.base_tensors, rb.lod_index, camera_position
+                )
+                tensors = apply_rigid_transform(base, rb.position, rb.rotation)
+            else:
+                tensors = rb.tensors
             result.append(tensors)
 
         return result
+
+    def _filter_lod(
+        self,
+        tensors: GaussianTensors,
+        lod_index: LodIndex | None,
+        camera_position: tuple[float, float, float] | None,
+    ) -> GaussianTensors:
+        """Apply LOD filtering if a manager and camera position are available."""
+        if (
+            self._lod_manager is not None
+            and camera_position is not None
+            and lod_index is not None
+        ):
+            return self._lod_manager.filter(tensors, lod_index, camera_position)
+        return tensors
 
     # --- construction --------------------------------------------------------
 

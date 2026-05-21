@@ -70,7 +70,6 @@ class SceneConfig:
             lod = LodConfig(
                 enabled=lod_raw.get("enabled", False),
                 tiers=lod_tiers,
-                radius_clip=lod_raw.get("radius_clip", 0.0),
             )
         else:
             lod = LodConfig(enabled=lod_raw.get("enabled", False))
@@ -85,7 +84,7 @@ class SceneConfig:
             near_plane=renderer_raw.get("near_plane", 0.01),
             far_plane=renderer_raw.get("far_plane", 1000.0),
             device=renderer_raw.get("device", "cuda"),
-            radius_clip=renderer_raw.get("radius_clip", lod.radius_clip),
+            radius_clip=renderer_raw.get("radius_clip", 0.0),
         )
 
         # Viewer

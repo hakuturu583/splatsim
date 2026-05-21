@@ -70,6 +70,11 @@ class RigidBody:
                 self.rotation = rotation.to(device=self._device, dtype=torch.float32)
 
     @property
+    def base_tensors(self) -> GaussianTensors:
+        """Return the untransformed (local-space) base tensors."""
+        return self._base_tensors
+
+    @property
     def tensors(self) -> GaussianTensors:
         """Return transformed tensors with current pose applied."""
         return apply_rigid_transform(self._base_tensors, self.position, self.rotation)

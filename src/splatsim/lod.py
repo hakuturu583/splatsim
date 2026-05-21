@@ -6,10 +6,8 @@ zero-cost tensor slicing at render time.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-
-import torch
-from torch import Tensor
 
 from splatsim._conversions import GaussianTensors
 from splatsim.dataclass.lod_config import LodConfig
@@ -26,18 +24,14 @@ class LodIndex:
 
     tier_counts: list[int]
     tier_max_distances: list[float]
-    centroid: Tensor  # [3]
+    centroid: tuple[float, float, float]
 
 
 class LodManager:
     """Manages LOD pre-computation and per-frame tier selection."""
 
     def __init__(self, config: LodConfig) -> None:
-        self._config = config
-
-    @property
-    def config(self) -> LodConfig:
-        return self._config
+        self._tiers = sorted(config.tiers, key=lambda t: t.max_distance)
 
     def precompute(self, tensors: GaussianTensors) -> tuple[GaussianTensors, LodIndex]:
         """Sort Gaussians by importance and compute tier boundaries.
@@ -51,31 +45,21 @@ class LodManager:
         """
         n = tensors.means.shape[0]
 
-        # importance = max scale axis * opacity
         max_scale = tensors.scales.max(dim=1).values  # [N]
         importance = max_scale * tensors.opacities  # [N]
-
         sorted_idx = importance.argsort(descending=True)
 
-        sorted_tensors = GaussianTensors(
-            means=tensors.means[sorted_idx],
-            quats=tensors.quats[sorted_idx],
-            scales=tensors.scales[sorted_idx],
-            opacities=tensors.opacities[sorted_idx],
-            colors=tensors.colors[sorted_idx],
-            sh_degree=tensors.sh_degree,
-        )
+        sorted_tensors = tensors[sorted_idx]
 
-        # Compute tier counts (sorted by max_distance ascending)
-        tiers = sorted(self._config.tiers, key=lambda t: t.max_distance)
         tier_counts: list[int] = []
         tier_max_distances: list[float] = []
-        for tier in tiers:
-            count = max(1, int(n * tier.fraction))
-            tier_counts.append(count)
+        for tier in self._tiers:
+            tier_counts.append(max(1, int(n * tier.fraction)))
             tier_max_distances.append(tier.max_distance)
 
-        centroid = sorted_tensors.means.mean(dim=0)
+        # Store centroid as plain floats for CPU-side distance computation.
+        c = sorted_tensors.means.mean(dim=0)
+        centroid = (c[0].item(), c[1].item(), c[2].item())
 
         lod_index = LodIndex(
             tier_counts=tier_counts,
@@ -84,30 +68,28 @@ class LodManager:
         )
         return sorted_tensors, lod_index
 
-    def select_tier(self, lod_index: LodIndex, camera_position: Tensor) -> int:
-        """Choose the LOD tier based on camera-to-centroid distance."""
-        dist = torch.linalg.norm(camera_position - lod_index.centroid).item()
-        for i, max_d in enumerate(lod_index.tier_max_distances):
-            if dist <= max_d:
-                return i
-        # Beyond all thresholds — use the coarsest (last) tier
-        return len(lod_index.tier_max_distances) - 1
-
-    def apply(
+    def filter(
         self,
         tensors: GaussianTensors,
         lod_index: LodIndex,
-        tier: int,
+        camera_position: tuple[float, float, float],
     ) -> GaussianTensors:
-        """Return a sliced view of *tensors* for the given LOD tier."""
+        """Select the appropriate LOD tier and return sliced tensors.
+
+        Combines tier selection (by camera-to-centroid distance) and
+        tensor slicing into a single call.
+        """
+        cx, cy, cz = lod_index.centroid
+        px, py, pz = camera_position
+        dist = math.sqrt((px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2)
+
+        tier = len(lod_index.tier_max_distances) - 1
+        for i, max_d in enumerate(lod_index.tier_max_distances):
+            if dist <= max_d:
+                tier = i
+                break
+
         n = lod_index.tier_counts[tier]
         if n >= tensors.means.shape[0]:
             return tensors
-        return GaussianTensors(
-            means=tensors.means[:n],
-            quats=tensors.quats[:n],
-            scales=tensors.scales[:n],
-            opacities=tensors.opacities[:n],
-            colors=tensors.colors[:n],
-            sh_degree=tensors.sh_degree,
-        )
+        return tensors[:n]
