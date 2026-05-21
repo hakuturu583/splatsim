@@ -25,12 +25,14 @@ class Renderer:
         background_color: tuple[float, float, float] = (0.0, 0.0, 0.0),
         near_plane: float = 0.01,
         far_plane: float = 1000.0,
+        radius_clip: float = 0.0,
     ) -> None:
         self.width = width
         self.height = height
         self.device = device
         self.near_plane = near_plane
         self.far_plane = far_plane
+        self._radius_clip = radius_clip
         self._bg_color = torch.tensor(
             [list(background_color)], device=device, dtype=torch.float32
         )  # [1, 3] — shape [C, D] where C=num_cameras
@@ -46,10 +48,15 @@ class Renderer:
         tensor_list: list[GaussianTensors] = []
 
         if scene is not None:
-            if scene.background is not None:
-                tensor_list.append(scene.background.tensors)
-            for rb in scene.rigid_body_list:
-                tensor_list.append(rb.tensors)
+            # Extract camera world-position from viewmat for LOD.
+            # viewmat is world-to-camera: [R | t], camera_pos = -R^T @ t
+            camera_pos: Tensor | None = None
+            if scene.lod_manager is not None:
+                R = viewmat[:3, :3]
+                t = viewmat[:3, 3]
+                camera_pos = -(R.T @ t)
+
+            tensor_list = scene.collect_tensors(camera_pos)
 
         if not tensor_list:
             return torch.zeros(
@@ -87,6 +94,7 @@ class Renderer:
             sh_degree=sh_degree,
             near_plane=self.near_plane,
             far_plane=self.far_plane,
+            radius_clip=self._radius_clip,
             render_mode="RGB",
             packed=False,
             backgrounds=self._bg_color,

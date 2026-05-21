@@ -91,6 +91,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                     background_color=bg_color,
                     near_plane=request.near_plane or 0.01,
                     far_plane=request.far_plane or 1000.0,
+                    radius_clip=getattr(request, "radius_clip", 0.0) or 0.0,
                 )
 
                 self._K = build_intrinsics(intr.fx, intr.fy, intr.cx, intr.cy, device)

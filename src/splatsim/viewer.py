@@ -363,6 +363,7 @@ def main() -> None:
         background_color=rc.background_color,
         near_plane=rc.near_plane,
         far_plane=rc.far_plane,
+        radius_clip=rc.radius_clip,
     )
 
     vc = config.viewer

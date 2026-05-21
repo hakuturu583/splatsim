@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from splatsim._conversions import GaussianTensors, cloud_to_tensors, quat_multiply
+from splatsim.lod import LodIndex, LodManager
 
 _3dgs_io = _importlib.import_module("3dgs_io")
 _load_tileset = _3dgs_io.load_tileset
@@ -24,6 +25,7 @@ class Background:
         device: torch.device = torch.device("cuda"),
         use_sh: bool = False,
         max_tiles: int | None = None,
+        lod_manager: LodManager | None = None,
     ) -> None:
         tiles = _load_tileset(str(tileset_path), max_tiles=max_tiles)
 
@@ -48,6 +50,11 @@ class Background:
         # Re-center to local origin for numerical stability.
         self._origin = tensors.means.mean(dim=0).clone()
         tensors.means = tensors.means - self._origin
+
+        # LOD: sort by importance and compute tier boundaries.
+        self._lod_index: LodIndex | None = None
+        if lod_manager is not None:
+            tensors, self._lod_index = lod_manager.precompute(tensors)
 
         self._tensors = tensors
 
@@ -90,6 +97,10 @@ class Background:
         # Back to spz (x,y,z,w) order
         rotated_np = rotated.cpu().numpy()[:, [1, 2, 3, 0]]
         cloud.rotations = rotated_np.reshape(-1)  # ty: ignore[unresolved-attribute]
+
+    @property
+    def lod_index(self) -> LodIndex | None:
+        return self._lod_index
 
     @property
     def origin(self) -> Tensor:

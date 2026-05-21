@@ -61,6 +61,7 @@ class SplatSimCameraSensor(CameraSensorBase):
             background_color=config.background_color,
             near_plane=config.near_plane,
             far_plane=config.far_plane,
+            radius_clip=getattr(config, "radius_clip", 0.0),
         )
 
         # Intrinsic matrix from CameraSensorConfig (derived from fov + resolution).

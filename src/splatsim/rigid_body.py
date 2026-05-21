@@ -14,6 +14,7 @@ from splatsim._conversions import (
     apply_rigid_transform,
     cloud_to_tensors,
 )
+from splatsim.lod import LodIndex, LodManager
 
 
 class RigidBody:
@@ -25,9 +26,17 @@ class RigidBody:
         *,
         device: torch.device = torch.device("cuda"),
         use_sh: bool = False,
+        lod_manager: LodManager | None = None,
     ) -> None:
         cloud = _load_cloud(source)
-        self._base_tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
+        base_tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
+
+        # LOD: sort base tensors by importance and store tier boundaries.
+        self._lod_index: LodIndex | None = None
+        if lod_manager is not None:
+            base_tensors, self._lod_index = lod_manager.precompute(base_tensors)
+
+        self._base_tensors = base_tensors
         self._device = device
         self.position = torch.zeros(3, device=device, dtype=torch.float32)
         self.rotation = torch.tensor(
@@ -64,6 +73,10 @@ class RigidBody:
     def tensors(self) -> GaussianTensors:
         """Return transformed tensors with current pose applied."""
         return apply_rigid_transform(self._base_tensors, self.position, self.rotation)
+
+    @property
+    def lod_index(self) -> LodIndex | None:
+        return self._lod_index
 
     @property
     def num_gaussians(self) -> int:
