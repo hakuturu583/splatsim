@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -15,8 +14,6 @@ from splatsim.dataclass import SceneConfig
 from splatsim.lod import LodIndex, LodManager
 from splatsim.renderer import Renderer
 from splatsim.rigid_body import RigidBody
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from splatsim.cyclonedds.camera_info_publisher import CameraInfoPublisher
@@ -227,7 +224,8 @@ def _log_lod_tiers(name: str, lod_index: LodIndex) -> None:
         lines.append(
             f"    Tier {i}: {count:>10,} Gaussians ({pct:5.1f}%) | max_distance={dist_str}"
         )
-    logger.info("\n".join(lines))
+    sys.stderr.write("\n".join(lines) + "\n")
+    sys.stderr.flush()
 
 
 def print_progress(step: int, total: int, label: str) -> None:
