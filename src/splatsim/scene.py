@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor
 
-from splatsim._conversions import GaussianTensors, apply_rigid_transform
+from splatsim._conversions import (
+    GaussianTensors,
+    apply_rigid_transform,
+    quat_to_rotation_matrix,
+)
 from splatsim.background import Background
 from splatsim.dataclass import SceneConfig
 from splatsim.lod import LodIndex, LodManager
@@ -120,10 +124,12 @@ class Scene:
             if can_filter and rb.lod_index is not None:
                 assert self._lod_manager is not None  # noqa: S101
                 assert camera_position is not None  # noqa: S101
-                # Slice base tensors *before* the rigid transform so we
-                # only pay the matrix math for the Gaussians we keep.
+                # Transform camera position into the rigid body's local frame
+                # so that octree cell distances are computed correctly.
+                rot_mat = quat_to_rotation_matrix(rb.rotation)  # [3, 3]
+                cam_local = rot_mat.T @ (camera_position - rb.position)
                 base = self._lod_manager.filter(
-                    rb.base_tensors, rb.lod_index, camera_position
+                    rb.base_tensors, rb.lod_index, cam_local
                 )
                 tensors = apply_rigid_transform(base, rb.position, rb.rotation)
             else:
