@@ -209,13 +209,12 @@ class Scene:
 def _log_lod_tiers(name: str, lod_index: LodIndex) -> None:
     """Log the Gaussian distribution across LOD tiers."""
     total_n = lod_index.tier_counts[0] if lod_index.tier_counts else 0
-    # tier_counts are cumulative (each is a prefix length), so find the
-    # total from the largest tier.
     for c in lod_index.tier_counts:
         if c > total_n:
             total_n = c
 
-    lines = [f"  LOD tiers for '{name}' (total: {total_n:,} Gaussians):"]
+    mode = "octree" if lod_index.cell_centers is not None else "centroid"
+    lines = [f"  LOD tiers for '{name}' (total: {total_n:,} Gaussians, mode: {mode}):"]
     for i, (count, max_d) in enumerate(
         zip(lod_index.tier_counts, lod_index.tier_max_distances)
     ):
@@ -224,6 +223,17 @@ def _log_lod_tiers(name: str, lod_index: LodIndex) -> None:
         lines.append(
             f"    Tier {i}: {count:>10,} Gaussians ({pct:5.1f}%) | max_distance={dist_str}"
         )
+
+    if lod_index.cell_centers is not None and lod_index.cell_ranges is not None:
+        num_cells = lod_index.cell_centers.shape[0]
+        cell_counts = lod_index.cell_ranges[:, 1] - lod_index.cell_ranges[:, 0]
+        lines.append(
+            f"    Octree: {num_cells} cells "
+            f"(min={cell_counts.min().item():,}, "
+            f"max={cell_counts.max().item():,}, "
+            f"mean={cell_counts.float().mean().item():,.0f} Gaussians/cell)"
+        )
+
     sys.stderr.write("\n".join(lines) + "\n")
     sys.stderr.flush()
 

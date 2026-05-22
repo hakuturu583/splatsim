@@ -18,3 +18,4 @@ viewer:
 
 lod:
   enabled: true
+  max_gaussians_per_cell: 50000

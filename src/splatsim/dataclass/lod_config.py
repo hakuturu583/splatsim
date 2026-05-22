@@ -20,6 +20,12 @@ class LodConfig:
 
     enabled: bool = False
 
+    max_gaussians_per_cell: int | None = None
+    """Octree leaf threshold. When set, Gaussians are spatially partitioned
+    into cells via recursive octree subdivision so that each leaf contains
+    at most this many Gaussians.  ``None`` falls back to the legacy
+    single-centroid mode."""
+
     tiers: list[LodTier] = field(
         default_factory=lambda: [
             LodTier(fraction=1.0, max_distance=50.0),
