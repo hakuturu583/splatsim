@@ -311,7 +311,21 @@ def main() -> None:
         default=None,
         help="Initial camera yaw in degrees",
     )
+    parser.add_argument(
+        "--log-level",
+        default="WARNING",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Set logging level (default: WARNING)",
+    )
     args = parser.parse_args()
+
+    import logging
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
     from splatsim.dataclass import SceneConfig
 
