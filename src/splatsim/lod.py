@@ -1,19 +1,14 @@
 """Level-of-Detail (LOD) system for Gaussian Splatting.
 
 Pre-computes importance-based LOD tiers at load time and provides
-zero-cost tensor slicing at render time.  Supports two modes:
-
-* **Centroid mode** (default): single centroid per source, fast but
-  breaks when camera moves far from the centroid.
-* **Octree mode** (``max_gaussians_per_cell`` set): density-adaptive
-  spatial partitioning via recursive octree subdivision.  Each leaf
-  cell applies LOD independently based on camera-to-cell distance.
+per-frame tensor filtering at render time using density-adaptive
+octree spatial partitioning.  Each leaf cell applies LOD independently
+based on camera-to-cell distance.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 
 import torch
@@ -33,14 +28,12 @@ class LodIndex:
     tier_max_distances: list[float]
     tier_max_distances_t: Tensor = field(repr=False)
     """[T] float32 GPU tensor of tier max distances (cached for filter)."""
-    centroid: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
-    # --- octree / grid mode (all None in centroid mode) ---
-    cell_centers: Tensor | None = field(default=None, repr=False)
+    cell_centers: Tensor = field(repr=False)
     """[C, 3] center of each leaf cell."""
-    cell_ranges: Tensor | None = field(default=None, repr=False)
+    cell_ranges: Tensor = field(repr=False)
     """[C, 2] int64 (start, end) into the sorted tensors."""
-    cell_tier_counts: Tensor | None = field(default=None, repr=False)
+    cell_tier_counts: Tensor = field(repr=False)
     """[C, T] int64 per-cell Gaussian count for each tier."""
 
 
@@ -50,66 +43,19 @@ class LodManager:
     def __init__(self, config: LodConfig) -> None:
         self._tiers = sorted(config.tiers, key=lambda t: t.max_distance)
         self._max_gpc = config.max_gaussians_per_cell
-        # Per-frame state for change-detection logging.
-        self._prev_centroid_tier: int | None = None
-        self._prev_octree_tier_idx: Tensor | None = None
+        self._prev_tier_idx: Tensor | None = None
 
     # ------------------------------------------------------------------
     # Precompute
     # ------------------------------------------------------------------
 
     def precompute(self, tensors: GaussianTensors) -> tuple[GaussianTensors, LodIndex]:
-        """Sort Gaussians by importance and compute LOD metadata.
-
-        When ``max_gaussians_per_cell`` is set, performs octree-based
-        spatial partitioning; otherwise falls back to centroid mode.
-        """
+        """Sort Gaussians by importance and build octree LOD metadata."""
         n = tensors.means.shape[0]
+        device = tensors.means.device
+
         max_scale = tensors.scales.max(dim=1).values  # [N]
         importance = max_scale * tensors.opacities  # [N]
-
-        if self._max_gpc is not None:
-            return self._precompute_octree(tensors, importance, n)
-        return self._precompute_centroid(tensors, importance, n)
-
-    def _build_global_stats(
-        self, sorted_tensors: GaussianTensors, n: int
-    ) -> tuple[list[int], list[float], tuple[float, float, float]]:
-        """Compute tier counts, max distances, and centroid."""
-        tier_counts = [max(1, int(n * t.fraction)) for t in self._tiers]
-        tier_max_distances = [t.max_distance for t in self._tiers]
-        c = sorted_tensors.means.mean(dim=0)
-        centroid = (c[0].item(), c[1].item(), c[2].item())
-        return tier_counts, tier_max_distances, centroid
-
-    def _precompute_centroid(
-        self,
-        tensors: GaussianTensors,
-        importance: Tensor,
-        n: int,
-    ) -> tuple[GaussianTensors, LodIndex]:
-        sorted_idx = importance.argsort(descending=True)
-        sorted_tensors = tensors[sorted_idx]
-        tier_counts, tier_max_distances, centroid = self._build_global_stats(
-            sorted_tensors, n
-        )
-
-        return sorted_tensors, LodIndex(
-            tier_counts=tier_counts,
-            tier_max_distances=tier_max_distances,
-            tier_max_distances_t=torch.tensor(
-                tier_max_distances, device=tensors.means.device, dtype=torch.float32
-            ),
-            centroid=centroid,
-        )
-
-    def _precompute_octree(
-        self,
-        tensors: GaussianTensors,
-        importance: Tensor,
-        n: int,
-    ) -> tuple[GaussianTensors, LodIndex]:
-        device = tensors.means.device
 
         # --- octree subdivision (CPU) ---
         means_cpu = tensors.means.detach().cpu()
@@ -159,9 +105,9 @@ class LodManager:
                 (cell_counts.float() * tier.fraction).clamp(min=1).long()
             )
 
-        tier_counts, tier_max_distances, centroid = self._build_global_stats(
-            sorted_tensors, n
-        )
+        # Global aggregates used for logging
+        tier_counts = [max(1, int(n * t.fraction)) for t in self._tiers]
+        tier_max_distances = [t.max_distance for t in self._tiers]
 
         return sorted_tensors, LodIndex(
             tier_counts=tier_counts,
@@ -169,7 +115,6 @@ class LodManager:
             tier_max_distances_t=torch.tensor(
                 tier_max_distances, device=device, dtype=torch.float32
             ),
-            centroid=centroid,
             cell_centers=cell_centers,
             cell_ranges=cell_ranges,
             cell_tier_counts=cell_tier_counts,
@@ -186,7 +131,7 @@ class LodManager:
         max_depth: int = 10,
     ) -> None:
         """Recursively subdivide a cell into octants."""
-        if self._max_gpc is None or len(indices) <= self._max_gpc or depth >= max_depth:
+        if len(indices) <= self._max_gpc or depth >= max_depth:
             if len(indices) > 0:
                 leaves.append((indices, lo.clone(), hi.clone()))
             return
@@ -228,72 +173,20 @@ class LodManager:
         lod_index: LodIndex,
         camera_position: Tensor,
     ) -> GaussianTensors:
-        """Select the appropriate LOD tier and return filtered tensors.
+        """Select the appropriate LOD tier per cell and return filtered tensors.
 
         Args:
             camera_position: [3] float32 tensor on the same device.
         """
-        if lod_index.cell_centers is not None:
-            return self._filter_octree(tensors, lod_index, camera_position)
-        return self._filter_centroid(tensors, lod_index, camera_position)
-
-    def _filter_centroid(
-        self,
-        tensors: GaussianTensors,
-        lod_index: LodIndex,
-        camera_position: Tensor,
-    ) -> GaussianTensors:
-        cx, cy, cz = lod_index.centroid
-        px, py, pz = (
-            camera_position[0].item(),
-            camera_position[1].item(),
-            camera_position[2].item(),
-        )
-        dist = math.sqrt((px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2)
-
-        tier = len(lod_index.tier_max_distances) - 1
-        for i, max_d in enumerate(lod_index.tier_max_distances):
-            if dist <= max_d:
-                tier = i
-                break
-
-        if self._prev_centroid_tier != tier:
-            logger.info(
-                "LOD centroid: tier %d -> %d (dist=%.1fm, gaussians=%d/%d)",
-                self._prev_centroid_tier
-                if self._prev_centroid_tier is not None
-                else -1,
-                tier,
-                dist,
-                lod_index.tier_counts[tier],
-                tensors.means.shape[0],
-            )
-            self._prev_centroid_tier = tier
-
-        n = lod_index.tier_counts[tier]
-        if n >= tensors.means.shape[0]:
-            return tensors
-        return tensors[:n]
-
-    def _filter_octree(
-        self,
-        tensors: GaussianTensors,
-        lod_index: LodIndex,
-        camera_position: Tensor,
-    ) -> GaussianTensors:
-        assert lod_index.cell_centers is not None  # noqa: S101
-        assert lod_index.cell_ranges is not None  # noqa: S101
-        assert lod_index.cell_tier_counts is not None  # noqa: S101
-
         device = lod_index.cell_centers.device
         num_cells = lod_index.cell_centers.shape[0]
 
-        # 1. Camera-to-cell distances (camera_position is already a GPU tensor)
+        # 1. Camera-to-cell distances
         dists = torch.norm(
             lod_index.cell_centers - camera_position.unsqueeze(0), dim=1
         )  # [C]
 
-        # 2. Tier selection per cell (tier_max_distances_t is pre-cached)
+        # 2. Tier selection per cell
         max_d = lod_index.tier_max_distances_t  # [T]
         tier_idx = (
             (dists.unsqueeze(1) <= max_d.unsqueeze(0)).to(torch.int64).argmax(dim=1)
@@ -308,8 +201,8 @@ class LodManager:
 
         # Log tier distribution changes
         if logger.isEnabledFor(logging.INFO):
-            changed = self._prev_octree_tier_idx is None or not torch.equal(
-                tier_idx, self._prev_octree_tier_idx
+            changed = self._prev_tier_idx is None or not torch.equal(
+                tier_idx, self._prev_tier_idx
             )
             if changed:
                 num_tiers = len(lod_index.tier_max_distances)
@@ -325,7 +218,7 @@ class LodManager:
                     total_g,
                     tensors.means.shape[0],
                 )
-                self._prev_octree_tier_idx = tier_idx.clone()
+                self._prev_tier_idx = tier_idx.clone()
 
         # 4. Build flat index tensor
         starts = lod_index.cell_ranges[:, 0]  # [C]

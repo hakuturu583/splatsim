@@ -66,18 +66,11 @@ class SceneConfig:
                     max_distance=tier.get("max_distance", float("inf")),
                 )
             )
-        max_gpc = lod_raw.get("max_gaussians_per_cell", None)
+        lod = LodConfig(enabled=lod_raw.get("enabled", False))
+        if "max_gaussians_per_cell" in lod_raw:
+            lod.max_gaussians_per_cell = lod_raw["max_gaussians_per_cell"]
         if lod_tiers:
-            lod = LodConfig(
-                enabled=lod_raw.get("enabled", False),
-                max_gaussians_per_cell=max_gpc,
-                tiers=lod_tiers,
-            )
-        else:
-            lod = LodConfig(
-                enabled=lod_raw.get("enabled", False),
-                max_gaussians_per_cell=max_gpc,
-            )
+            lod.tiers = lod_tiers
 
         # Renderer
         renderer_raw = raw.get("renderer", {})
