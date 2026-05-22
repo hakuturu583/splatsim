@@ -78,40 +78,48 @@ class Scene:
 
     @property
     def lod_enabled(self) -> bool:
-        return self._lod_enabled and self._lod_manager is not None
+        return self._lod_enabled
 
     @lod_enabled.setter
     def lod_enabled(self, value: bool) -> None:
-        self._lod_enabled = value
+        self._lod_enabled = value and self._lod_manager is not None
 
     @property
     def lod_manager(self) -> LodManager | None:
         return self._lod_manager
 
     def collect_tensors(
-        self, camera_position: tuple[float, float, float] | None = None
+        self, camera_position: Tensor | None = None
     ) -> list[GaussianTensors]:
         """Collect Gaussian tensors from all sources, applying LOD if enabled.
 
-        When *camera_position* is provided and an :class:`LodManager` is
-        configured, each source's tensors are filtered to the appropriate
-        LOD tier based on camera-to-centroid distance.
+        Args:
+            camera_position: [3] float32 GPU tensor, or None to skip LOD.
         """
         result: list[GaussianTensors] = []
+        can_filter = (
+            self._lod_enabled
+            and self._lod_manager is not None
+            and camera_position is not None
+        )
 
         if self.background is not None:
-            tensors = self._filter_lod(
-                self.background.tensors, self.background.lod_index, camera_position
-            )
+            if can_filter and self.background.lod_index is not None:
+                assert self._lod_manager is not None  # noqa: S101
+                assert camera_position is not None  # noqa: S101
+                tensors = self._lod_manager.filter(
+                    self.background.tensors,
+                    self.background.lod_index,
+                    camera_position,
+                )
+            else:
+                tensors = self.background.tensors
             result.append(tensors)
 
         for rb in self._rigid_bodies.values():
-            if (
-                self._lod_enabled
-                and self._lod_manager is not None
-                and camera_position is not None
-                and rb.lod_index is not None
-            ):
+            if can_filter and rb.lod_index is not None:
+                assert self._lod_manager is not None  # noqa: S101
+                assert camera_position is not None  # noqa: S101
                 # Slice base tensors *before* the rigid transform so we
                 # only pay the matrix math for the Gaussians we keep.
                 base = self._lod_manager.filter(
@@ -123,22 +131,6 @@ class Scene:
             result.append(tensors)
 
         return result
-
-    def _filter_lod(
-        self,
-        tensors: GaussianTensors,
-        lod_index: LodIndex | None,
-        camera_position: tuple[float, float, float] | None,
-    ) -> GaussianTensors:
-        """Apply LOD filtering if a manager and camera position are available."""
-        if (
-            self._lod_enabled
-            and self._lod_manager is not None
-            and camera_position is not None
-            and lod_index is not None
-        ):
-            return self._lod_manager.filter(tensors, lod_index, camera_position)
-        return tensors
 
     # --- construction --------------------------------------------------------
 
@@ -208,10 +200,7 @@ class Scene:
 
 def _log_lod_tiers(name: str, lod_index: LodIndex) -> None:
     """Log the Gaussian distribution across LOD tiers."""
-    total_n = lod_index.tier_counts[0] if lod_index.tier_counts else 0
-    for c in lod_index.tier_counts:
-        if c > total_n:
-            total_n = c
+    total_n = max(lod_index.tier_counts) if lod_index.tier_counts else 0
 
     mode = "octree" if lod_index.cell_centers is not None else "centroid"
     lines = [f"  LOD tiers for '{name}' (total: {total_n:,} Gaussians, mode: {mode}):"]

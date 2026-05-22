@@ -48,13 +48,12 @@ class Renderer:
         tensor_list: list[GaussianTensors] = []
 
         if scene is not None:
-            camera_pos: tuple[float, float, float] | None = None
+            camera_pos: Tensor | None = None
             if scene.lod_enabled:
                 # viewmat is world-to-camera: [R | t], camera_pos = -R^T @ t
                 R = viewmat[:3, :3]
                 t = viewmat[:3, 3]
-                p = -(R.T @ t)
-                camera_pos = (p[0].item(), p[1].item(), p[2].item())
+                camera_pos = -(R.T @ t)
 
             tensor_list = scene.collect_tensors(camera_pos)
 

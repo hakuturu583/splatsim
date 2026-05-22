@@ -28,7 +28,9 @@ class LodIndex:
 
     tier_counts: list[int]
     tier_max_distances: list[float]
-    centroid: tuple[float, float, float]
+    tier_max_distances_t: Tensor = field(repr=False)
+    """[T] float32 GPU tensor of tier max distances (cached for filter)."""
+    centroid: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     # --- octree / grid mode (all None in centroid mode) ---
     cell_centers: Tensor | None = field(default=None, repr=False)
@@ -64,6 +66,16 @@ class LodManager:
             return self._precompute_octree(tensors, importance, n)
         return self._precompute_centroid(tensors, importance, n)
 
+    def _build_global_stats(
+        self, sorted_tensors: GaussianTensors, n: int
+    ) -> tuple[list[int], list[float], tuple[float, float, float]]:
+        """Compute tier counts, max distances, and centroid."""
+        tier_counts = [max(1, int(n * t.fraction)) for t in self._tiers]
+        tier_max_distances = [t.max_distance for t in self._tiers]
+        c = sorted_tensors.means.mean(dim=0)
+        centroid = (c[0].item(), c[1].item(), c[2].item())
+        return tier_counts, tier_max_distances, centroid
+
     def _precompute_centroid(
         self,
         tensors: GaussianTensors,
@@ -72,19 +84,16 @@ class LodManager:
     ) -> tuple[GaussianTensors, LodIndex]:
         sorted_idx = importance.argsort(descending=True)
         sorted_tensors = tensors[sorted_idx]
-
-        tier_counts: list[int] = []
-        tier_max_distances: list[float] = []
-        for tier in self._tiers:
-            tier_counts.append(max(1, int(n * tier.fraction)))
-            tier_max_distances.append(tier.max_distance)
-
-        c = sorted_tensors.means.mean(dim=0)
-        centroid = (c[0].item(), c[1].item(), c[2].item())
+        tier_counts, tier_max_distances, centroid = self._build_global_stats(
+            sorted_tensors, n
+        )
 
         return sorted_tensors, LodIndex(
             tier_counts=tier_counts,
             tier_max_distances=tier_max_distances,
+            tier_max_distances_t=torch.tensor(
+                tier_max_distances, device=tensors.means.device, dtype=torch.float32
+            ),
             centroid=centroid,
         )
 
@@ -94,7 +103,6 @@ class LodManager:
         importance: Tensor,
         n: int,
     ) -> tuple[GaussianTensors, LodIndex]:
-        assert self._max_gpc is not None  # noqa: S101
         device = tensors.means.device
 
         # --- octree subdivision (CPU) ---
@@ -145,19 +153,16 @@ class LodManager:
                 (cell_counts.float() * tier.fraction).clamp(min=1).long()
             )
 
-        # --- global stats (for backward compat + logging) ---
-        tier_counts: list[int] = []
-        tier_max_distances: list[float] = []
-        for tier in self._tiers:
-            tier_counts.append(max(1, int(n * tier.fraction)))
-            tier_max_distances.append(tier.max_distance)
-
-        c = sorted_tensors.means.mean(dim=0)
-        centroid = (c[0].item(), c[1].item(), c[2].item())
+        tier_counts, tier_max_distances, centroid = self._build_global_stats(
+            sorted_tensors, n
+        )
 
         return sorted_tensors, LodIndex(
             tier_counts=tier_counts,
             tier_max_distances=tier_max_distances,
+            tier_max_distances_t=torch.tensor(
+                tier_max_distances, device=device, dtype=torch.float32
+            ),
             centroid=centroid,
             cell_centers=cell_centers,
             cell_ranges=cell_ranges,
@@ -175,8 +180,7 @@ class LodManager:
         max_depth: int = 10,
     ) -> None:
         """Recursively subdivide a cell into octants."""
-        assert self._max_gpc is not None  # noqa: S101
-        if len(indices) <= self._max_gpc or depth >= max_depth:
+        if self._max_gpc is None or len(indices) <= self._max_gpc or depth >= max_depth:
             if len(indices) > 0:
                 leaves.append((indices, lo.clone(), hi.clone()))
             return
@@ -185,7 +189,6 @@ class LodManager:
         pts = means[indices]
 
         for octant in range(8):
-            # Determine octant bounds from bit pattern: bit0=x, bit1=y, bit2=z
             child_lo = lo.clone()
             child_hi = hi.clone()
             mask = torch.ones(len(indices), dtype=torch.bool)
@@ -217,9 +220,13 @@ class LodManager:
         self,
         tensors: GaussianTensors,
         lod_index: LodIndex,
-        camera_position: tuple[float, float, float],
+        camera_position: Tensor,
     ) -> GaussianTensors:
-        """Select the appropriate LOD tier and return filtered tensors."""
+        """Select the appropriate LOD tier and return filtered tensors.
+
+        Args:
+            camera_position: [3] float32 tensor on the same device.
+        """
         if lod_index.cell_centers is not None:
             return self._filter_octree(tensors, lod_index, camera_position)
         return self._filter_centroid(tensors, lod_index, camera_position)
@@ -228,10 +235,14 @@ class LodManager:
         self,
         tensors: GaussianTensors,
         lod_index: LodIndex,
-        camera_position: tuple[float, float, float],
+        camera_position: Tensor,
     ) -> GaussianTensors:
         cx, cy, cz = lod_index.centroid
-        px, py, pz = camera_position
+        px, py, pz = (
+            camera_position[0].item(),
+            camera_position[1].item(),
+            camera_position[2].item(),
+        )
         dist = math.sqrt((px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2)
 
         tier = len(lod_index.tier_max_distances) - 1
@@ -249,7 +260,7 @@ class LodManager:
         self,
         tensors: GaussianTensors,
         lod_index: LodIndex,
-        camera_position: tuple[float, float, float],
+        camera_position: Tensor,
     ) -> GaussianTensors:
         assert lod_index.cell_centers is not None  # noqa: S101
         assert lod_index.cell_ranges is not None  # noqa: S101
@@ -258,19 +269,16 @@ class LodManager:
         device = lod_index.cell_centers.device
         num_cells = lod_index.cell_centers.shape[0]
 
-        # 1. Camera-to-cell distances
-        cam = torch.tensor(camera_position, device=device, dtype=torch.float32)
-        dists = torch.norm(lod_index.cell_centers - cam.unsqueeze(0), dim=1)  # [C]
+        # 1. Camera-to-cell distances (camera_position is already a GPU tensor)
+        dists = torch.norm(
+            lod_index.cell_centers - camera_position.unsqueeze(0), dim=1
+        )  # [C]
 
-        # 2. Tier selection per cell
-        max_d = torch.tensor(
-            lod_index.tier_max_distances, device=device, dtype=torch.float32
-        )  # [T]
-        # For each cell find first tier whose max_distance >= dist
+        # 2. Tier selection per cell (tier_max_distances_t is pre-cached)
+        max_d = lod_index.tier_max_distances_t  # [T]
         tier_idx = (
             (dists.unsqueeze(1) <= max_d.unsqueeze(0)).to(torch.int64).argmax(dim=1)
         )  # [C]
-        # Cells beyond all thresholds → last tier
         exceeds_all = dists > max_d[-1]
         tier_idx[exceeds_all] = len(lod_index.tier_max_distances) - 1
 
@@ -279,20 +287,19 @@ class LodManager:
             torch.arange(num_cells, device=device), tier_idx
         ]  # [C]
 
-        # Early exit: all Gaussians selected
-        total_selected = selected_counts.sum().item()
-        if total_selected >= tensors.means.shape[0]:
-            return tensors
-
         # 4. Build flat index tensor
         starts = lod_index.cell_ranges[:, 0]  # [C]
-        max_count = int(selected_counts.max().item())
+        max_count = selected_counts.max()  # scalar tensor, stays on GPU
 
         offsets = (
-            torch.arange(max_count, device=device).unsqueeze(0).expand(num_cells, -1)
+            torch.arange(max_count.item(), device=device)
+            .unsqueeze(0)
+            .expand(num_cells, -1)
         )
         abs_indices = starts.unsqueeze(1) + offsets  # [C, max_count]
         mask = offsets < selected_counts.unsqueeze(1)  # [C, max_count]
         selected_indices = abs_indices[mask]  # [total_selected]
 
+        if selected_indices.shape[0] >= tensors.means.shape[0]:
+            return tensors
         return tensors[selected_indices]
