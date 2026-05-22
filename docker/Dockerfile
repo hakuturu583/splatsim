@@ -26,26 +26,14 @@ WORKDIR /workspace/splatsim
 COPY pyproject.toml uv.lock .python-version README.md ./
 COPY resource/ resource/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=GH_TOKEN \
-    if [ -f /run/secrets/GH_TOKEN ] && [ -s /run/secrets/GH_TOKEN ]; then \
-      export GIT_CONFIG_COUNT=1 \
-             GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/GH_TOKEN)@github.com/.insteadOf" \
-             GIT_CONFIG_VALUE_0="https://github.com/"; \
-    fi \
-    && uv sync --extra dds --no-dev --no-install-project
+    uv sync --extra dds --no-dev --no-install-project
 
 # Copy source, generate proto code, and install project
 COPY src/ src/
 COPY proto/ proto/
 RUN uv run python src/splatsim/grpc_service/generate_proto.py
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=GH_TOKEN \
-    if [ -f /run/secrets/GH_TOKEN ] && [ -s /run/secrets/GH_TOKEN ]; then \
-      export GIT_CONFIG_COUNT=1 \
-             GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/GH_TOKEN)@github.com/.insteadOf" \
-             GIT_CONFIG_VALUE_0="https://github.com/"; \
-    fi \
-    && uv sync --extra dds --no-dev
+    uv sync --extra dds --no-dev
 
 # Pre-compile gsplat CUDA kernels (JIT) so the runtime image does not need nvcc.
 ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"

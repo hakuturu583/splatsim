@@ -43,26 +43,14 @@ uv sync --extra all
 
 The Dockerfile uses a multi-stage build with the `dds` extra to keep the image minimal.
 
-Private git dependencies (e.g. `3dgs-io`) require a GitHub token passed as a build secret.
-
 ```bash
-# Build (GH_TOKEN is needed for private git dependencies)
+# Build
 docker buildx build \
   -f docker/Dockerfile \
-  --secret id=GH_TOKEN,env=GH_TOKEN \
   -t splatsim .
 
 # Run (requires NVIDIA Container Toolkit)
 docker run --rm -it --gpus all splatsim
-```
-
-If you use `gh` CLI, you can set the token inline:
-
-```bash
-GH_TOKEN=$(gh auth token) docker buildx build \
-  -f docker/Dockerfile \
-  --secret id=GH_TOKEN,env=GH_TOKEN \
-  -t splatsim .
 ```
 
 To customize CUDA or Ubuntu versions:
@@ -72,7 +60,6 @@ docker buildx build \
   -f docker/Dockerfile \
   --build-arg CUDA_VERSION=12.4.1 \
   --build-arg UBUNTU_VERSION=22.04 \
-  --secret id=GH_TOKEN,env=GH_TOKEN \
   -t splatsim .
 ```
 
