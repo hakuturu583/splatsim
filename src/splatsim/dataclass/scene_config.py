@@ -5,6 +5,7 @@ from pathlib import Path
 
 import yaml
 
+from splatsim.dataclass.lod_config import LodConfig, LodTier
 from splatsim.dataclass.renderer_config import RendererConfig
 from splatsim.dataclass.rigid_body_config import RigidBodyConfig
 from splatsim.dataclass.viewer_config import ViewerConfig
@@ -19,6 +20,7 @@ class SceneConfig:
     rigid_bodies: list[RigidBodyConfig] = field(default_factory=list)
     renderer: RendererConfig = field(default_factory=RendererConfig)
     viewer: ViewerConfig = field(default_factory=ViewerConfig)
+    lod: LodConfig = field(default_factory=LodConfig)
 
     @staticmethod
     def from_yaml(path: str | Path) -> SceneConfig:
@@ -54,6 +56,22 @@ class SceneConfig:
                 )
             )
 
+        # LOD
+        lod_raw = raw.get("lod", {})
+        lod_tiers: list[LodTier] = []
+        for tier in lod_raw.get("tiers", []):
+            lod_tiers.append(
+                LodTier(
+                    fraction=tier.get("fraction", 1.0),
+                    max_distance=tier.get("max_distance", float("inf")),
+                )
+            )
+        lod = LodConfig(enabled=lod_raw.get("enabled", False))
+        if "max_gaussians_per_cell" in lod_raw:
+            lod.max_gaussians_per_cell = lod_raw["max_gaussians_per_cell"]
+        if lod_tiers:
+            lod.tiers = lod_tiers
+
         # Renderer
         renderer_raw = raw.get("renderer", {})
         bg_color = renderer_raw.get("background_color", [0.0, 0.0, 0.0])
@@ -64,6 +82,7 @@ class SceneConfig:
             near_plane=renderer_raw.get("near_plane", 0.01),
             far_plane=renderer_raw.get("far_plane", 1000.0),
             device=renderer_raw.get("device", "cuda"),
+            radius_clip=renderer_raw.get("radius_clip", 0.0),
         )
 
         # Viewer
@@ -80,4 +99,5 @@ class SceneConfig:
             rigid_bodies=rigid_bodies,
             renderer=renderer,
             viewer=viewer,
+            lod=lod,
         )
