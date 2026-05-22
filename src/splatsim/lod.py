@@ -12,6 +12,7 @@ zero-cost tensor slicing at render time.  Supports two modes:
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 
@@ -20,6 +21,8 @@ from torch import Tensor
 
 from splatsim._conversions import GaussianTensors
 from splatsim.dataclass.lod_config import LodConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -47,6 +50,9 @@ class LodManager:
     def __init__(self, config: LodConfig) -> None:
         self._tiers = sorted(config.tiers, key=lambda t: t.max_distance)
         self._max_gpc = config.max_gaussians_per_cell
+        # Per-frame state for change-detection logging.
+        self._prev_centroid_tier: int | None = None
+        self._prev_octree_tier_idx: Tensor | None = None
 
     # ------------------------------------------------------------------
     # Precompute
@@ -251,6 +257,19 @@ class LodManager:
                 tier = i
                 break
 
+        if self._prev_centroid_tier != tier:
+            logger.info(
+                "LOD centroid: tier %d -> %d (dist=%.1fm, gaussians=%d/%d)",
+                self._prev_centroid_tier
+                if self._prev_centroid_tier is not None
+                else -1,
+                tier,
+                dist,
+                lod_index.tier_counts[tier],
+                tensors.means.shape[0],
+            )
+            self._prev_centroid_tier = tier
+
         n = lod_index.tier_counts[tier]
         if n >= tensors.means.shape[0]:
             return tensors
@@ -286,6 +305,27 @@ class LodManager:
         selected_counts = lod_index.cell_tier_counts[
             torch.arange(num_cells, device=device), tier_idx
         ]  # [C]
+
+        # Log tier distribution changes
+        if logger.isEnabledFor(logging.INFO):
+            changed = self._prev_octree_tier_idx is None or not torch.equal(
+                tier_idx, self._prev_octree_tier_idx
+            )
+            if changed:
+                num_tiers = len(lod_index.tier_max_distances)
+                parts = []
+                for t in range(num_tiers):
+                    cnt = (tier_idx == t).sum().item()
+                    if cnt > 0:
+                        parts.append(f"T{t}:{cnt}")
+                total_g = selected_counts.sum().item()
+                logger.info(
+                    "LOD octree: cells=[%s] total_gaussians=%d/%d",
+                    " ".join(parts),
+                    total_g,
+                    tensors.means.shape[0],
+                )
+                self._prev_octree_tier_idx = tier_idx.clone()
 
         # 4. Build flat index tensor
         starts = lod_index.cell_ranges[:, 0]  # [C]
