@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,6 +15,8 @@ from splatsim.dataclass import SceneConfig
 from splatsim.lod import LodIndex, LodManager
 from splatsim.renderer import Renderer
 from splatsim.rigid_body import RigidBody
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from splatsim.cyclonedds.camera_info_publisher import CameraInfoPublisher
@@ -37,6 +42,7 @@ class Scene:
         self.background = background
         self._rigid_bodies: dict[str, RigidBody] = rigid_bodies or {}
         self._lod_manager = lod_manager
+        self._lod_enabled = lod_manager is not None
 
     # --- rigid body access ---------------------------------------------------
 
@@ -74,6 +80,14 @@ class Scene:
     # --- LOD-aware tensor collection -----------------------------------------
 
     @property
+    def lod_enabled(self) -> bool:
+        return self._lod_enabled and self._lod_manager is not None
+
+    @lod_enabled.setter
+    def lod_enabled(self, value: bool) -> None:
+        self._lod_enabled = value
+
+    @property
     def lod_manager(self) -> LodManager | None:
         return self._lod_manager
 
@@ -96,7 +110,8 @@ class Scene:
 
         for rb in self._rigid_bodies.values():
             if (
-                self._lod_manager is not None
+                self._lod_enabled
+                and self._lod_manager is not None
                 and camera_position is not None
                 and rb.lod_index is not None
             ):
@@ -120,7 +135,8 @@ class Scene:
     ) -> GaussianTensors:
         """Apply LOD filtering if a manager and camera position are available."""
         if (
-            self._lod_manager is not None
+            self._lod_enabled
+            and self._lod_manager is not None
             and camera_position is not None
             and lod_index is not None
         ):
@@ -134,13 +150,23 @@ class Scene:
         config: SceneConfig | str | Path,
         *,
         device: torch.device | None = None,
+        progress: Callable[[int, int, str], None] | None = None,
     ) -> Scene:
-        """Build a Scene from a SceneConfig or YAML path."""
+        """Build a Scene from a SceneConfig or YAML path.
+
+        Args:
+            progress: Optional callback ``(step, total, label)`` invoked
+                after each major loading stage completes.
+        """
         if not isinstance(config, SceneConfig):
             config = SceneConfig.from_yaml(config)
 
         if device is None:
             device = torch.device(config.renderer.device)
+
+        has_bg = config.background_tileset is not None
+        total = int(has_bg) + len(config.rigid_bodies)
+        step = 0
 
         lod_manager: LodManager | None = None
         if config.lod.enabled:
@@ -154,6 +180,11 @@ class Scene:
                 use_sh=config.use_sh,
                 lod_manager=lod_manager,
             )
+            step += 1
+            if progress is not None:
+                progress(step, total, "background")
+            if background.lod_index is not None:
+                _log_lod_tiers("background", background.lod_index)
 
         rigid_bodies: dict[str, RigidBody] = {}
         for rb_cfg in config.rigid_bodies:
@@ -165,12 +196,50 @@ class Scene:
             )
             rb.set_pose(rb_cfg.position, rb_cfg.rotation)
             rigid_bodies[rb_cfg.name] = rb
+            step += 1
+            if progress is not None:
+                progress(step, total, rb_cfg.name)
+            if rb.lod_index is not None:
+                _log_lod_tiers(rb_cfg.name, rb.lod_index)
 
         return Scene(
             background=background,
             rigid_bodies=rigid_bodies,
             lod_manager=lod_manager,
         )
+
+
+def _log_lod_tiers(name: str, lod_index: LodIndex) -> None:
+    """Log the Gaussian distribution across LOD tiers."""
+    total_n = lod_index.tier_counts[0] if lod_index.tier_counts else 0
+    # tier_counts are cumulative (each is a prefix length), so find the
+    # total from the largest tier.
+    for c in lod_index.tier_counts:
+        if c > total_n:
+            total_n = c
+
+    lines = [f"  LOD tiers for '{name}' (total: {total_n:,} Gaussians):"]
+    for i, (count, max_d) in enumerate(
+        zip(lod_index.tier_counts, lod_index.tier_max_distances)
+    ):
+        pct = 100.0 * count / total_n if total_n > 0 else 0.0
+        dist_str = f"{max_d:.0f}m" if max_d < float("inf") else "inf"
+        lines.append(
+            f"    Tier {i}: {count:>10,} Gaussians ({pct:5.1f}%) | max_distance={dist_str}"
+        )
+    logger.info("\n".join(lines))
+
+
+def print_progress(step: int, total: int, label: str) -> None:
+    """Print a terminal progress bar to *stderr*."""
+    width = 40
+    filled = int(width * step / total) if total > 0 else width
+    bar = "\u2588" * filled + "\u2591" * (width - filled)
+    pct = 100.0 * step / total if total > 0 else 100.0
+    sys.stderr.write(f"\r  Loading: |{bar}| {pct:5.1f}% ({label})")
+    if step >= total:
+        sys.stderr.write("\n")
+    sys.stderr.flush()
 
 
 def load_scene(
@@ -186,7 +255,7 @@ def load_scene(
         config = SceneConfig.from_yaml(config)
 
     device = torch.device(config.renderer.device)
-    scene = Scene.from_config(config, device=device)
+    scene = Scene.from_config(config, device=device, progress=print_progress)
 
     rc = config.renderer
     renderer = Renderer(

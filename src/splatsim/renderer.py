@@ -49,7 +49,7 @@ class Renderer:
 
         if scene is not None:
             camera_pos: tuple[float, float, float] | None = None
-            if scene.lod_manager is not None:
+            if scene.lod_enabled:
                 # viewmat is world-to-camera: [R | t], camera_pos = -R^T @ t
                 R = viewmat[:3, :3]
                 t = viewmat[:3, 3]

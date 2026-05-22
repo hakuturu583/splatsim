@@ -239,6 +239,9 @@ class Viewer(QMainWindow):
             f"Yaw: {yaw_deg:+7.1f} deg",
             f"FPS: {self._fps:5.1f}",
         ]
+        if self.scene is not None and self.scene.lod_manager is not None:
+            status = "ON" if self.scene.lod_enabled else "OFF"
+            lines.append(f"LOD: {status} (L to toggle)")
         if self._image_pub is not None:
             lines.append("DDS: publishing")
         for i, line in enumerate(lines):
@@ -256,6 +259,9 @@ class Viewer(QMainWindow):
             return
         if event.key() == Qt.Key.Key_Escape:
             self.close()
+            return
+        if event.key() == Qt.Key.Key_L and self.scene is not None:
+            self.scene.lod_enabled = not self.scene.lod_enabled
             return
         self._keys_pressed.add(event.key())
 
@@ -350,10 +356,10 @@ def main() -> None:
             dp, cam_cfg, topic_name=args.topic_camera_info, frame_id=args.frame_id
         )
 
-    from splatsim.scene import Scene
+    from splatsim.scene import Scene, print_progress
 
     device = torch.device(config.renderer.device)
-    scene = Scene.from_config(config, device=device)
+    scene = Scene.from_config(config, device=device, progress=print_progress)
 
     rc = config.renderer
     renderer = Renderer(
