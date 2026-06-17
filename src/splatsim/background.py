@@ -13,37 +13,46 @@ from splatsim.lod import LodIndex, LodManager
 _3dgs_io = _importlib.import_module("3dgs_io")
 _load_tileset = _3dgs_io.load_tileset
 _merge_tileset = _3dgs_io.merge_tileset
+_load_usdz = _3dgs_io.load_usdz
 
 
 class Background:
-    """Loads a Cesium 3D Tileset and stores as GPU-ready Gaussian tensors."""
+    """Loads a 3D Tileset or a 3dgs_io USDZ as GPU-ready Gaussian tensors."""
 
     def __init__(
         self,
-        tileset_path: str | Path,
+        source_path: str | Path,
         *,
         device: torch.device = torch.device("cuda"),
         use_sh: bool = False,
         max_tiles: int | None = None,
         lod_manager: LodManager | None = None,
     ) -> None:
-        tiles = _load_tileset(str(tileset_path), max_tiles=max_tiles)
-
-        # Extract the root tile's ECEF transform for GeoReference.
-        # 3D Tiles stores column-major; reshape then transpose to row-major.
-        root_tf = np.array(tiles[0].transform, dtype=np.float64).reshape(4, 4).T
-        self._ecef_rotation = root_tf[:3, :3].copy()
-        self._ecef_translation = root_tf[:3, 3].copy()
-
-        if len(tiles) == 1:
-            # Single tile: use raw tile-local cloud directly (already RUB, Y=up).
-            # Avoids the ECEF rotation that merge_tileset would apply.
-            cloud = tiles[0].cloud
+        path = Path(source_path)
+        if path.suffix.lower() == ".usdz":
+            # 3dgs_io USDZ wraps a single spz model; no tile hierarchy, no
+            # ECEF transform.
+            cloud = _load_usdz(str(path))
+            self._ecef_rotation = np.eye(3, dtype=np.float64)
+            self._ecef_translation = np.zeros(3, dtype=np.float64)
         else:
-            # Multi-tile: merge into ECEF, then undo the root rotation
-            # so that the result stays in the tile-local orientation.
-            cloud = _merge_tileset(tiles)
-            self._undo_ecef_rotation(cloud, device)
+            tiles = _load_tileset(str(path), max_tiles=max_tiles)
+
+            # Extract the root tile's ECEF transform for GeoReference.
+            # 3D Tiles stores column-major; reshape then transpose to row-major.
+            root_tf = np.array(tiles[0].transform, dtype=np.float64).reshape(4, 4).T
+            self._ecef_rotation = root_tf[:3, :3].copy()
+            self._ecef_translation = root_tf[:3, 3].copy()
+
+            if len(tiles) == 1:
+                # Single tile: use raw tile-local cloud directly (already RUB, Y=up).
+                # Avoids the ECEF rotation that merge_tileset would apply.
+                cloud = tiles[0].cloud
+            else:
+                # Multi-tile: merge into ECEF, then undo the root rotation
+                # so that the result stays in the tile-local orientation.
+                cloud = _merge_tileset(tiles)
+                self._undo_ecef_rotation(cloud, device)
 
         tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
 

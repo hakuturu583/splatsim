@@ -11,8 +11,8 @@ supported-markers = [
 
 [[package]]
 name = "3dgs-io"
-version = "0.1.0"
-source = { git = "https://github.com/autowarefoundation/3dgs_io.git?branch=main#e72f62e99892337b19139cd00dc7b1501fa6aa23" }
+version = "0.3.0"
+source = { git = "https://github.com/autowarefoundation/3dgs_io.git?branch=feat%2Fusdz-io#90807c90bf36bcaab4e81e1ec3e05892803d5d05" }
 dependencies = [
     { name = "numpy", marker = "sys_platform == 'linux'" },
     { name = "spz", marker = "sys_platform == 'linux'" },
@@ -2109,7 +2109,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?branch=main" },
+    { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?branch=feat%2Fusdz-io" },
     { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=6165173a" },
     { name = "autoware-lanelet2-to-opendrive", marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=6165173a" },
     { name = "cyclonedds", marker = "extra == 'carla'", specifier = ">=11.0.1" },
