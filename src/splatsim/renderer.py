@@ -26,12 +26,14 @@ class Renderer:
         near_plane: float = 0.01,
         far_plane: float = 1000.0,
         radius_clip: float = 0.0,
+        exposure: float = 1.0,
     ) -> None:
         self.width = width
         self.height = height
         self.device = device
         self.near_plane = near_plane
         self.far_plane = far_plane
+        self.exposure = float(exposure)
         self._radius_clip = radius_clip
         self._bg_color = torch.tensor(
             [list(background_color)], device=device, dtype=torch.float32
@@ -99,4 +101,7 @@ class Renderer:
             backgrounds=self._bg_color,
         )
 
-        return render_colors[0]  # [H, W, 3]
+        rgb = render_colors[0]
+        if self.exposure != 1.0:
+            rgb = rgb * self.exposure
+        return rgb  # [H, W, 3]

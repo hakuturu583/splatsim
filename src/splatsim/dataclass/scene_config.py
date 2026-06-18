@@ -21,6 +21,11 @@ class SceneConfig:
     renderer: RendererConfig = field(default_factory=RendererConfig)
     viewer: ViewerConfig = field(default_factory=ViewerConfig)
     lod: LodConfig = field(default_factory=LodConfig)
+    # World-frame camera pose seeded from a scene USDZ. Translated into the
+    # viewer's tile-local frame after the background is loaded (see
+    # :func:`splatsim.scene.resolve_initial_pose`).
+    initial_camera_world_position: tuple[float, float, float] | None = None
+    initial_camera_yaw_deg: float | None = None
 
     @staticmethod
     def from_source(path: str | Path) -> SceneConfig:
@@ -36,8 +41,21 @@ class SceneConfig:
 
         Only metadata is read here; the heavy SPZ chunks are loaded later
         by :class:`Background` when it sees the same ``.usdz`` path.
+
+        If the USDZ ships a ``rig_trajectories.json`` sidecar containing
+        cameras, the first camera's intrinsics seed
+        ``renderer.width/height`` and ``viewer.fov_y_deg``, and the
+        composed ``RigPose × CameraExtrinsics`` at the first timestamp
+        seeds ``initial_camera_world_position`` and
+        ``initial_camera_yaw_deg``.
         """
-        from splatsim._usdz import read_scene_json
+        from splatsim._usdz import (
+            camera_to_viewer_intrinsics,
+            first_camera,
+            initial_camera_pose_from_rig_trajectories,
+            read_rig_trajectories,
+            read_scene_json,
+        )
 
         path = Path(path)
         meta = read_scene_json(path)
@@ -46,15 +64,37 @@ class SceneConfig:
         renderer = RendererConfig(
             near_plane=rd.get("near_plane", RendererConfig.near_plane),
             far_plane=rd.get("far_plane", RendererConfig.far_plane),
+            exposure=rd.get("exposure", RendererConfig.exposure),
         )
+        viewer = ViewerConfig()
+        initial_pos: tuple[float, float, float] | None = None
+        initial_yaw: float | None = None
+
+        rig_uri = meta.get("extras", {}).get("rig_trajectories")
+        if rig_uri:
+            rigs = read_rig_trajectories(path, rig_uri)
+            cam = first_camera(rigs)
+            if cam is not None:
+                width, height, fov_y_deg = camera_to_viewer_intrinsics(cam)
+                if width and height:
+                    renderer.width = width
+                    renderer.height = height
+                if fov_y_deg is not None:
+                    viewer.fov_y_deg = fov_y_deg
+
+            pose = initial_camera_pose_from_rig_trajectories(rigs)
+            if pose is not None:
+                initial_pos, initial_yaw = pose
 
         return SceneConfig(
             background_tileset=str(path),
             use_sh=False,
             rigid_bodies=[],
             renderer=renderer,
-            viewer=ViewerConfig(),
+            viewer=viewer,
             lod=LodConfig(),
+            initial_camera_world_position=initial_pos,
+            initial_camera_yaw_deg=initial_yaw,
         )
 
     @staticmethod

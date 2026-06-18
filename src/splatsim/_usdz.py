@@ -27,6 +27,7 @@ from splatsim._conversions import GaussianTensors, cloud_to_tensors
 
 _3dgs_io = _importlib.import_module("3dgs_io")
 _load_spz = _3dgs_io.load_spz
+_parse_rig_trajectories = _3dgs_io.parse_rig_trajectories
 
 
 def read_scene_json(usdz_path: str | Path) -> dict[str, Any]:
@@ -87,6 +88,119 @@ def load_spz_tileset(
 
     merged = _concat_tensors(tensor_list)
     return merged, root_transform
+
+
+def first_camera(rigs: list[Any]) -> Any | None:
+    """Return the first camera nested in the first rig that has one."""
+    for rig in rigs:
+        if rig.cameras:
+            return rig.cameras[0]
+    return None
+
+
+def camera_to_viewer_intrinsics(
+    camera: Any,
+) -> tuple[int | None, int | None, float | None]:
+    """Approximate ``(width, height, fov_y_deg)`` from a ``3dgs_io.Camera``.
+
+    splatsim only supports a pinhole camera, so non-pinhole models
+    (``ftheta`` and similar fisheye lenses) are mapped to a best-effort
+    vertical FOV derived from the model's ``max_angle`` parameter.
+    """
+    params = camera.camera_model.parameters or {}
+    resolution = params.get("resolution")
+    width: int | None = int(resolution[0]) if resolution else None
+    height: int | None = int(resolution[1]) if resolution else None
+
+    model_type = (camera.camera_model.type or "").lower()
+    fov_y_deg: float | None = None
+    if model_type == "pinhole":
+        fy = params.get("fy")
+        if fy and height:
+            fov_y_deg = float(np.degrees(2 * np.arctan(height / (2 * float(fy)))))
+    elif model_type == "ftheta":
+        max_angle = params.get("max_angle")
+        if max_angle is not None and width and height:
+            # max_angle is the half-cone angle (radian). Approximate the
+            # vertical FOV by scaling proportionally to the height of the
+            # image diagonal.
+            diag = float(np.hypot(width, height))
+            fov_y_deg = float(np.degrees(2 * float(max_angle) * height / diag))
+
+    return width, height, fov_y_deg
+
+
+def read_rig_trajectories(usdz_path: str | Path, rig_uri: str) -> list[Any]:
+    """Read ``rig_trajectories.json`` out of a scene USDZ and parse it.
+
+    Returns ``list[3dgs_io.RigTrajectory]``; cameras live inside each rig
+    under :attr:`RigTrajectory.cameras`.
+    """
+    with zipfile.ZipFile(usdz_path) as zf:
+        if rig_uri not in zf.namelist():
+            raise ValueError(f"{usdz_path}: missing {rig_uri}")
+        doc = json.loads(zf.read(rig_uri))
+    return _parse_rig_trajectories(doc)
+
+
+def initial_camera_pose_from_rig_trajectories(
+    rigs: list[Any],
+) -> tuple[tuple[float, float, float], float] | None:
+    """Compose the first rig pose with its first camera's extrinsics.
+
+    Returns ``(world_position, yaw_deg)`` where yaw is the rotation of the
+    composed sensor-in-world transform around the +Z (up) axis; the world
+    position is in root-local frame (the same frame as the gaussians).
+    Returns ``None`` if there is no rig or no camera.
+    """
+    for rig in rigs:
+        if not rig.poses or not rig.cameras:
+            continue
+        rig_pose = rig.poses[0]
+        cam = rig.cameras[0]
+
+        r_rig = _quat_to_matrix(rig_pose.rotation)
+        t_rig = np.asarray(rig_pose.translation, dtype=np.float64)
+        r_sensor = _quat_to_matrix(cam.extrinsics.rotation)
+        t_sensor = np.asarray(cam.extrinsics.translation, dtype=np.float64)
+
+        # T_sensor_world = T_rig_world @ T_sensor_rig
+        t_sensor_world = t_rig + r_rig @ t_sensor
+        r_sensor_world = r_rig @ r_sensor
+
+        # splatsim yaw rotates around +Z; at yaw=0 the camera looks along
+        # world -Y. ``CameraExtrinsics`` follows the OpenGL/glTF convention,
+        # so the camera looks along its own -Z. World forward direction:
+        fwd_world = r_sensor_world @ np.array([0.0, 0.0, -1.0])
+        # Project to the horizontal plane for the yaw. Falls back to 0
+        # for cameras pointing nearly straight up/down (degenerate yaw).
+        horiz = float(np.hypot(fwd_world[0], fwd_world[1]))
+        if horiz < 1e-6:
+            yaw_deg = 0.0
+        else:
+            yaw_rad = float(np.arctan2(fwd_world[0], -fwd_world[1]))
+            yaw_deg = float(np.degrees(yaw_rad))
+
+        position = (
+            float(t_sensor_world[0]),
+            float(t_sensor_world[1]),
+            float(t_sensor_world[2]),
+        )
+        return position, yaw_deg
+    return None
+
+
+def _quat_to_matrix(q: tuple[float, float, float, float]) -> np.ndarray:
+    """Convert a (w, x, y, z) quaternion to a 3x3 rotation matrix."""
+    w, x, y, z = q
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
 
 
 def _concat_tensors(tensors: list[GaussianTensors]) -> GaussianTensors:

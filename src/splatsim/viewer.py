@@ -388,17 +388,26 @@ def main() -> None:
         near_plane=rc.near_plane,
         far_plane=rc.far_plane,
         radius_clip=rc.radius_clip,
+        exposure=rc.exposure,
     )
 
     vc = config.viewer
+    from splatsim.scene import resolve_initial_pose
+
+    initial_position, initial_yaw_deg = resolve_initial_pose(
+        config,
+        scene.background,
+        override_position=tuple(args.pos) if args.pos is not None else None,
+        override_yaw_deg=args.yaw,
+    )
     viewer = Viewer(
         renderer,
         scene=scene,
         fov_y_deg=vc.fov_y_deg,
         move_speed=vc.move_speed,
         rotate_speed=vc.rotate_speed,
-        initial_position=tuple(args.pos) if args.pos else None,
-        initial_yaw_deg=args.yaw,
+        initial_position=initial_position,
+        initial_yaw_deg=initial_yaw_deg,
         image_publisher=image_pub,
         camera_info_publisher=camera_info_pub,
     )
