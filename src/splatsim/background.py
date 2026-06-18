@@ -13,11 +13,10 @@ from splatsim.lod import LodIndex, LodManager
 _3dgs_io = _importlib.import_module("3dgs_io")
 _load_tileset = _3dgs_io.load_tileset
 _merge_tileset = _3dgs_io.merge_tileset
-_load_usdz = _3dgs_io.load_usdz
 
 
 class Background:
-    """Loads a 3D Tileset or a 3dgs_io USDZ as GPU-ready Gaussian tensors."""
+    """Loads a 3D Tileset or a scene USDZ as GPU-ready Gaussian tensors."""
 
     def __init__(
         self,
@@ -30,11 +29,16 @@ class Background:
     ) -> None:
         path = Path(source_path)
         if path.suffix.lower() == ".usdz":
-            # 3dgs_io USDZ wraps a single spz model; no tile hierarchy, no
-            # ECEF transform.
-            cloud = _load_usdz(str(path))
-            self._ecef_rotation = np.eye(3, dtype=np.float64)
-            self._ecef_translation = np.zeros(3, dtype=np.float64)
+            # 3dgs_io scene USDZ wraps tileset.json + chunks/*.spz; extract
+            # to a temp directory and load each SPZ tile as a tensor chunk.
+            from splatsim._usdz import extract_scene_usdz, load_spz_tileset
+
+            scene_dir = extract_scene_usdz(path)
+            tensors, root_tf = load_spz_tileset(
+                scene_dir / "tileset.json", device, use_sh=use_sh
+            )
+            self._ecef_rotation = root_tf[:3, :3].copy()
+            self._ecef_translation = root_tf[:3, 3].copy()
         else:
             tiles = _load_tileset(str(path), max_tiles=max_tiles)
 
@@ -53,8 +57,7 @@ class Background:
                 # so that the result stays in the tile-local orientation.
                 cloud = _merge_tileset(tiles)
                 self._undo_ecef_rotation(cloud, device)
-
-        tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
+            tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
 
         # Re-center to local origin for numerical stability.
         self._origin = tensors.means.mean(dim=0).clone()

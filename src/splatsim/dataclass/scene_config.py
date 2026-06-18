@@ -23,6 +23,41 @@ class SceneConfig:
     lod: LodConfig = field(default_factory=LodConfig)
 
     @staticmethod
+    def from_source(path: str | Path) -> SceneConfig:
+        """Build a SceneConfig from either a scene YAML or a scene USDZ."""
+        path = Path(path)
+        if path.suffix.lower() == ".usdz":
+            return SceneConfig.from_usdz(path)
+        return SceneConfig.from_yaml(path)
+
+    @staticmethod
+    def from_usdz(path: str | Path) -> SceneConfig:
+        """Build a SceneConfig from a scene USDZ's embedded ``scene.json``.
+
+        Only metadata is read here; the heavy SPZ chunks are loaded later
+        by :class:`Background` when it sees the same ``.usdz`` path.
+        """
+        from splatsim._usdz import read_scene_json
+
+        path = Path(path)
+        meta = read_scene_json(path)
+
+        rd = meta.get("render_defaults", {})
+        renderer = RendererConfig(
+            near_plane=rd.get("near_plane", RendererConfig.near_plane),
+            far_plane=rd.get("far_plane", RendererConfig.far_plane),
+        )
+
+        return SceneConfig(
+            background_tileset=str(path),
+            use_sh=False,
+            rigid_bodies=[],
+            renderer=renderer,
+            viewer=ViewerConfig(),
+            lod=LodConfig(),
+        )
+
+    @staticmethod
     def from_yaml(path: str | Path) -> SceneConfig:
         """Load a SceneConfig from a YAML file.
 

@@ -282,7 +282,11 @@ class Viewer(QMainWindow):
 def main() -> None:
     """Entry point: ``uv run viewer scene.yaml``."""
     parser = argparse.ArgumentParser(description="splatsim interactive viewer")
-    parser.add_argument("scene_yaml", type=Path, help="Path to scene YAML file")
+    parser.add_argument(
+        "scene_source",
+        type=Path,
+        help="Path to a scene YAML file or a scene USDZ archive",
+    )
     parser.add_argument(
         "--dds",
         action="store_true",
@@ -329,7 +333,7 @@ def main() -> None:
 
     from splatsim.dataclass import SceneConfig
 
-    config = SceneConfig.from_yaml(args.scene_yaml)
+    config = SceneConfig.from_source(args.scene_source)
 
     image_pub = None
     camera_info_pub = None

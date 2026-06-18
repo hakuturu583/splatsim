@@ -12,7 +12,7 @@ supported-markers = [
 [[package]]
 name = "3dgs-io"
 version = "0.3.0"
-source = { git = "https://github.com/autowarefoundation/3dgs_io.git?branch=feat%2Fusdz-io#90807c90bf36bcaab4e81e1ec3e05892803d5d05" }
+source = { git = "https://github.com/autowarefoundation/3dgs_io.git?branch=feat%2Fusdz-io#e09e9ebbfe426c68c4d6e5189ad7509c1f7b4046" }
 dependencies = [
     { name = "numpy", marker = "sys_platform == 'linux'" },
     { name = "spz", marker = "sys_platform == 'linux'" },
