@@ -19,6 +19,7 @@ import json
 import struct
 import tempfile
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -160,6 +161,90 @@ def camera_to_viewer_intrinsics(
             fov_y_deg = float(np.degrees(2 * float(max_angle) * height / diag))
 
     return width, height, fov_y_deg
+
+
+def camera_intrinsics_K(camera: Any) -> tuple[np.ndarray, int, int]:
+    """Return ``(K, width, height)`` for a pinhole rig camera.
+
+    ``K`` is a 3x3 OpenCV intrinsic matrix in pixel units; ``width``/``height``
+    are the image resolution. Raises ``ValueError`` if the camera is not
+    pinhole or lacks the required parameters.
+    """
+    params = camera.camera_model.parameters or {}
+    model_type = (camera.camera_model.type or "").lower()
+    if model_type != "pinhole":
+        raise ValueError(
+            f"camera {camera.name!r}: K-matrix render requires a pinhole "
+            f"camera, got {model_type!r}"
+        )
+    resolution = params.get("resolution")
+    if not resolution or len(resolution) < 2:
+        raise ValueError(f"camera {camera.name!r}: missing resolution")
+    width = int(resolution[0])
+    height = int(resolution[1])
+    fx_raw = params.get("fx")
+    fy_raw = params.get("fy")
+    if fx_raw is None:
+        fx_raw = fy_raw
+    if fy_raw is None:
+        fy_raw = fx_raw
+    if fx_raw is None or fy_raw is None:
+        raise ValueError(f"camera {camera.name!r}: missing fx/fy")
+    fx = float(fx_raw)
+    fy = float(fy_raw)
+    cx = float(params.get("cx", width / 2.0))
+    cy = float(params.get("cy", height / 2.0))
+    K = np.array(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    return K, width, height
+
+
+def iter_world_to_camera_root_local(
+    rigs: list[Any], *, name: str | None = None
+) -> Iterator[tuple[float, np.ndarray]]:
+    """Yield ``(timestamp, world_to_camera)`` per rig pose for one camera.
+
+    ``world_to_camera`` is a 4x4 OpenCV extrinsic (``+Z`` forward) that maps
+    points in the *root-local* world frame (the frame the gaussians live in
+    before :class:`Background` re-centers them) to the camera frame. Callers
+    rendering against a tile-local scene must add ``R_w2c @ background.origin``
+    to the translation column.
+
+    The composition mirrors :func:`initial_camera_pose_from_rig_trajectories`:
+    despite the ``T_sensor_rig`` field name, ``3dgs_io`` stores the rig→sensor
+    matrix in OpenCV convention, so we invert it implicitly via
+    ``R_w2c = R_rs @ R_rig.T`` and ``t_w2c = t_rs - R_w2c @ t_rig``.
+    """
+    available: list[str] = []
+    for rig in rigs:
+        if not rig.poses or not rig.cameras:
+            available.extend(c.name for c in rig.cameras or [])
+            continue
+        if name is None:
+            cam = rig.cameras[0]
+        else:
+            cam = next((c for c in rig.cameras if c.name == name), None)
+            if cam is None:
+                available.extend(c.name for c in rig.cameras)
+                continue
+        r_rs = _quat_to_matrix(cam.extrinsics.rotation)
+        t_rs = np.asarray(cam.extrinsics.translation, dtype=np.float64)
+        for pose in rig.poses:
+            r_rig = _quat_to_matrix(pose.rotation)
+            t_rig = np.asarray(pose.translation, dtype=np.float64)
+            r_w2c = r_rs @ r_rig.T
+            t_w2c = t_rs - r_w2c @ t_rig
+            w2c = np.eye(4, dtype=np.float64)
+            w2c[:3, :3] = r_w2c
+            w2c[:3, 3] = t_w2c
+            yield float(pose.timestamp_us), w2c
+        return
+    if name is not None:
+        raise ValueError(
+            f"camera {name!r} not found in rig_trajectories; available: {available}"
+        )
 
 
 def read_rig_trajectories(usdz_path: str | Path, rig_uri: str) -> list[Any]:

@@ -325,6 +325,23 @@ def main() -> None:
         help="Initial camera yaw in degrees",
     )
     parser.add_argument(
+        "--mp4",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Render the scene along the selected rig camera's GT trajectory "
+            "and write it to this MP4 file instead of launching the viewer. "
+            "Requires a scene USDZ with a rig_trajectories sidecar."
+        ),
+    )
+    parser.add_argument(
+        "--mp4-fps",
+        type=int,
+        default=30,
+        help="Frame rate of the MP4 written by --mp4 (default: 30)",
+    )
+    parser.add_argument(
         "--lod",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -355,6 +372,9 @@ def main() -> None:
     config = SceneConfig.from_source(
         args.scene_source, camera_name=args.camera, lod_enabled=args.lod
     )
+
+    if args.mp4 and args.dds:
+        raise SystemExit("Error: --mp4 and --dds cannot be combined")
 
     image_pub = None
     camera_info_pub = None
@@ -411,6 +431,20 @@ def main() -> None:
         radius_clip=rc.radius_clip,
         exposure=rc.exposure,
     )
+
+    if args.mp4:
+        from splatsim._mp4 import render_trajectory_mp4
+
+        n_frames = render_trajectory_mp4(
+            scene,
+            renderer,
+            args.scene_source,
+            output_path=args.mp4,
+            camera_name=args.camera,
+            fps=args.mp4_fps,
+        )
+        print(f"Wrote {n_frames} frames to {args.mp4}")
+        return
 
     vc = config.viewer
     from splatsim.scene import resolve_initial_pose
