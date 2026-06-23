@@ -247,6 +247,116 @@ def iter_world_to_camera_root_local(
         )
 
 
+def iter_world_to_camera_interpolated(
+    rigs: list[Any], *, name: str | None = None, fps: float
+) -> Iterator[tuple[float, np.ndarray]]:
+    """Yield ``(timestamp_us, world_to_camera)`` sampled uniformly at ``fps``.
+
+    Spans the full GT timeline of the selected camera; rotations are SLERPed
+    and translations are linearly interpolated between adjacent GT poses so
+    that playback wall-clock matches the captured trajectory regardless of
+    its native cadence.
+    """
+    if fps <= 0:
+        raise ValueError(f"fps must be > 0, got {fps}")
+
+    target_rig, target_cam = _find_rig_with_camera(rigs, name=name)
+    if target_rig is None or target_cam is None:
+        return
+
+    timestamps = np.asarray(
+        [pose.timestamp_us for pose in target_rig.poses], dtype=np.float64
+    )
+    translations = np.asarray(
+        [pose.translation for pose in target_rig.poses], dtype=np.float64
+    )
+    quaternions = np.asarray(
+        [pose.rotation for pose in target_rig.poses], dtype=np.float64
+    )
+
+    r_rs = _quat_to_matrix(target_cam.extrinsics.rotation)
+    t_rs = np.asarray(target_cam.extrinsics.translation, dtype=np.float64)
+
+    n_poses = timestamps.shape[0]
+    if n_poses == 1:
+        r_rig = _quat_to_matrix(tuple(quaternions[0]))
+        yield float(timestamps[0]), _compose_w2c(r_rs, t_rs, r_rig, translations[0])
+        return
+
+    t_first = float(timestamps[0])
+    t_last = float(timestamps[-1])
+    step_us = 1_000_000.0 / float(fps)
+    n_samples = int(np.floor((t_last - t_first) / step_us)) + 1
+
+    for k in range(n_samples):
+        t = t_first + k * step_us
+        i = int(np.searchsorted(timestamps, t, side="right")) - 1
+        i = max(0, min(i, n_poses - 2))
+        ts0 = timestamps[i]
+        ts1 = timestamps[i + 1]
+        alpha = (t - ts0) / (ts1 - ts0) if ts1 > ts0 else 0.0
+        alpha = float(max(0.0, min(1.0, alpha)))
+
+        t_rig = (1.0 - alpha) * translations[i] + alpha * translations[i + 1]
+        q = _slerp(quaternions[i], quaternions[i + 1], alpha)
+        r_rig = _quat_to_matrix(tuple(q))
+
+        yield float(t), _compose_w2c(r_rs, t_rs, r_rig, t_rig)
+
+
+def _find_rig_with_camera(
+    rigs: list[Any], *, name: str | None
+) -> tuple[Any | None, Any | None]:
+    """Return the first ``(rig, camera)`` matching ``name`` (or the first available)."""
+    available: list[str] = []
+    for rig in rigs:
+        if not rig.poses or not rig.cameras:
+            available.extend(c.name for c in rig.cameras or [])
+            continue
+        if name is None:
+            return rig, rig.cameras[0]
+        cam = next((c for c in rig.cameras if c.name == name), None)
+        if cam is None:
+            available.extend(c.name for c in rig.cameras)
+            continue
+        return rig, cam
+    if name is not None:
+        raise ValueError(
+            f"camera {name!r} not found in rig_trajectories; available: {available}"
+        )
+    return None, None
+
+
+def _compose_w2c(
+    r_rs: np.ndarray, t_rs: np.ndarray, r_rig: np.ndarray, t_rig: np.ndarray
+) -> np.ndarray:
+    """Compose rig→sensor (OpenCV) with rig pose into a 4x4 world→camera matrix."""
+    r_w2c = r_rs @ r_rig.T
+    t_w2c = t_rs - r_w2c @ t_rig
+    w2c = np.eye(4, dtype=np.float64)
+    w2c[:3, :3] = r_w2c
+    w2c[:3, 3] = t_w2c
+    return w2c
+
+
+def _slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
+    """SLERP between two ``(x, y, z, w)`` unit quaternions."""
+    q0 = q0 / np.linalg.norm(q0)
+    q1 = q1 / np.linalg.norm(q1)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:
+        result = (1.0 - t) * q0 + t * q1
+        return result / np.linalg.norm(result)
+    theta = float(np.arccos(dot))
+    sin_theta = float(np.sin(theta))
+    s0 = float(np.sin((1.0 - t) * theta) / sin_theta)
+    s1 = float(np.sin(t * theta) / sin_theta)
+    return s0 * q0 + s1 * q1
+
+
 def read_rig_trajectories(usdz_path: str | Path, rig_uri: str) -> list[Any]:
     """Read ``rig_trajectories.json`` out of a scene USDZ and parse it.
 

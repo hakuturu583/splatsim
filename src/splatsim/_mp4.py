@@ -13,7 +13,7 @@ import torch
 from splatsim._usdz import (
     camera_intrinsics_K,
     first_camera,
-    iter_world_to_camera_root_local,
+    iter_world_to_camera_interpolated,
     read_rig_trajectories,
     read_scene_json,
 )
@@ -78,7 +78,9 @@ def render_trajectory_mp4(
 
     frame_count = 0
     try:
-        for _ts, w2c in iter_world_to_camera_root_local(rigs, name=camera_name):
+        for _ts, w2c in iter_world_to_camera_interpolated(
+            rigs, name=camera_name, fps=float(fps)
+        ):
             if origin is not None:
                 # gaussians live in tile-local frame (p_world - origin); shift
                 # the translation column so the rendered camera lines up.
