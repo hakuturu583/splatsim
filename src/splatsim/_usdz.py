@@ -109,16 +109,38 @@ def load_spz_tileset(
 def first_camera(rigs: list[Any], name: str | None = None) -> Any | None:
     """Return a camera from the rigs.
 
-    If ``name`` is ``None``, returns the first camera nested in the first rig
-    that has one (legacy behavior). If ``name`` is given, returns the camera
-    whose ``name`` attribute matches; raises ``ValueError`` if no such camera
-    exists, including the available names in the message.
+    If ``name`` is ``None``, picks the camera whose OpenCV +Z (forward) is
+    most aligned with the vehicle's forward axis (rig +X). This avoids
+    initializing the viewer with a back- or side-facing camera just because
+    it sorts first in ``rig_trajectories.json``. Ties (and fully unaligned
+    rigs) fall back to the first camera in the first rig that has one.
+
+    If ``name`` is given, returns the camera whose ``name`` attribute
+    matches; raises ``ValueError`` if no such camera exists, including the
+    available names in the message.
     """
     if name is None:
+        best: tuple[float, Any] | None = None
+        fallback: Any | None = None
         for rig in rigs:
-            if rig.cameras:
-                return rig.cameras[0]
-        return None
+            for cam in rig.cameras or []:
+                if fallback is None:
+                    fallback = cam
+                # r_sensor_rig is rig->sensor (memory: 3dgs_io extrinsic
+                # convention). Sensor +Z expressed in rig coords is the
+                # third column of r_sensor_rig.T, i.e. the third row of
+                # r_sensor_rig. Vehicle forward is rig +X, so the X
+                # component of that vector measures forwardness.
+                try:
+                    r_sr = _quat_to_matrix(cam.extrinsics.rotation)
+                except Exception:
+                    continue
+                fwd_x_in_rig = float(r_sr[2, 0])
+                if best is None or fwd_x_in_rig > best[0]:
+                    best = (fwd_x_in_rig, cam)
+        if best is not None and best[0] > 0.5:
+            return best[1]
+        return fallback
 
     available: list[str] = []
     for rig in rigs:
