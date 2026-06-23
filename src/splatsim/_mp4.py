@@ -66,9 +66,8 @@ def render_trajectory_mp4(
 
     K = torch.tensor(K_np, device=renderer.device, dtype=torch.float32)
 
-    origin: np.ndarray | None = None
-    if scene.background is not None:
-        origin = scene.background.origin.detach().cpu().numpy().astype(np.float64)
+    if scene.background is None:
+        raise ValueError("scene.background must be loaded before rendering MP4")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # ty: ignore[unresolved-attribute]
@@ -79,14 +78,11 @@ def render_trajectory_mp4(
     frame_count = 0
     try:
         for _ts, w2c in iter_world_to_camera_interpolated(
-            rigs, name=camera_name, fps=float(fps)
+            rigs,
+            background=scene.background,
+            fps=float(fps),
+            name=camera_name,
         ):
-            if origin is not None:
-                # gaussians live in tile-local frame (p_world - origin); shift
-                # the translation column so the rendered camera lines up.
-                w2c = w2c.copy()
-                w2c[:3, 3] = w2c[:3, 3] + w2c[:3, :3] @ origin
-
             viewmat = torch.tensor(w2c, device=renderer.device, dtype=torch.float32)
             with torch.no_grad():
                 rgb = renderer.render(viewmat, K, scene=scene)

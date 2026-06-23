@@ -8,7 +8,7 @@ Conversion pipeline (all in float64 to avoid precision loss)::
       → LLA   (MGRSProjector.reverse — matches the actual map projection)
       → ECEF  (WGS84 via pyproj)
       → tile-local  (inverse of tileset.json transform)
-      → re-centered (subtract Background._origin)
+      → re-centered (subtract Background.tile_local_centroid)
 
 The rotation is converted via:
     R_carla → S @ R_carla (flip y axis: CARLA South → ENU North)
@@ -52,7 +52,7 @@ class GeoTransform:
         3-vector ECEF translation (from tileset.json).
     tile_origin:
         3-vector subtracted from tile-local positions for re-centering
-        (``Background._origin``).
+        (``Background.tile_local_centroid``).
     """
 
     def __init__(

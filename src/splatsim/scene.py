@@ -259,7 +259,7 @@ def resolve_initial_pose(
     ``viewer.initial_position``/``initial_yaw_deg`` (already tile-local),
     then ``initial_camera_world_position``/``initial_camera_yaw_deg`` from
     a scene USDZ (converted to tile-local by subtracting
-    ``background.origin``).
+    ``background.tile_local_centroid``).
     """
     vc = config.viewer
     if override_position is not None:
@@ -267,9 +267,9 @@ def resolve_initial_pose(
     elif vc.initial_position is not None:
         position = vc.initial_position
     elif config.initial_camera_world_position is not None and background is not None:
-        origin = background.origin.detach().cpu().numpy()
+        centroid = background.tile_local_centroid.detach().cpu().numpy()
         world = np.asarray(config.initial_camera_world_position, dtype=np.float64)
-        local = world - origin
+        local = world - centroid
         position = (float(local[0]), float(local[1]), float(local[2]))
     else:
         position = None

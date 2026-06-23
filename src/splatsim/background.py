@@ -59,9 +59,12 @@ class Background:
                 self._undo_ecef_rotation(cloud, device)
             tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
 
-        # Re-center to local origin for numerical stability.
-        self._origin = tensors.means.mean(dim=0).clone()
-        tensors.means = tensors.means - self._origin
+        # Re-center to the cloud's tile-local centroid for numerical
+        # stability. Despite living *near* the GeoReference origin in some
+        # tilesets, this offset is the gaussians' own centroid in the
+        # tile-local frame, not the ECEF origin (see ``ecef_translation``).
+        self._tile_local_centroid = tensors.means.mean(dim=0).clone()
+        tensors.means = tensors.means - self._tile_local_centroid
 
         # LOD: sort by importance and compute tier boundaries.
         self._lod_index: LodIndex | None = None
@@ -115,9 +118,38 @@ class Background:
         return self._lod_index
 
     @property
-    def origin(self) -> Tensor:
-        """The ECEF centroid that was subtracted (GeoReference origin)."""
-        return self._origin
+    def tile_local_centroid(self) -> Tensor:
+        """Tile-local centroid subtracted from gaussian means for numerical stability.
+
+        This is ``means.mean(dim=0)`` in the *tile-local* (RUB, Y-up) frame
+        that the gaussians live in, **not** an ECEF translation. Renderers
+        that consume world-frame poses (e.g. rig trajectories) must add this
+        back to the translation column of their world-to-camera matrices to
+        line the camera up with the re-centered cloud.
+
+        For the ECEF translation of the root tile, see :attr:`ecef_translation`.
+        """
+        return self._tile_local_centroid
+
+    @property
+    def ecef_translation(self) -> np.ndarray:
+        """ECEF translation of the root tile, in meters (3,) ``float64``.
+
+        Read from the 3D Tiles root transform (or the USDZ scene's root
+        transform); never applied to the gaussians, which stay in
+        tile-local coordinates.
+        """
+        return self._ecef_translation
+
+    @property
+    def ecef_rotation(self) -> np.ndarray:
+        """ECEF rotation of the root tile, 3x3 ``float64``.
+
+        Read from the 3D Tiles root transform; never applied to the
+        gaussians. For multi-tile tilesets, the inverse is applied to the
+        merged cloud to bring it back to tile-local before re-centering.
+        """
+        return self._ecef_rotation
 
     @property
     def tensors(self) -> GaussianTensors:

@@ -18,6 +18,7 @@ import importlib as _importlib
 import json
 import struct
 import tempfile
+import typing
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -27,6 +28,9 @@ import numpy as np
 import torch
 
 from splatsim._conversions import GaussianTensors, cloud_to_tensors
+
+if typing.TYPE_CHECKING:
+    from splatsim.background import Background
 
 _3dgs_io = _importlib.import_module("3dgs_io")
 _load_spz = _3dgs_io.load_spz
@@ -223,16 +227,16 @@ def camera_intrinsics_K(camera: Any) -> tuple[np.ndarray, int, int]:
     return K, width, height
 
 
-def iter_world_to_camera_root_local(
+def iter_world_to_camera_uncentered(
     rigs: list[Any], *, name: str | None = None
 ) -> Iterator[tuple[float, np.ndarray]]:
     """Yield ``(timestamp, world_to_camera)`` per rig pose for one camera.
 
     ``world_to_camera`` is a 4x4 OpenCV extrinsic (``+Z`` forward) that maps
-    points in the *root-local* world frame (the frame the gaussians live in
-    before :class:`Background` re-centers them) to the camera frame. Callers
-    rendering against a tile-local scene must add ``R_w2c @ background.origin``
-    to the translation column.
+    points in the *root-local* world frame to the camera frame. This is the
+    frame the gaussians live in *before* :class:`Background` re-centers
+    them, so this iterator is rarely what callers want directly — prefer
+    :func:`iter_world_to_camera`, which compensates for the re-centering.
 
     The composition mirrors :func:`initial_camera_pose_from_rig_trajectories`:
     despite the ``T_sensor_rig`` field name, ``3dgs_io`` stores the rig→sensor
@@ -269,10 +273,57 @@ def iter_world_to_camera_root_local(
         )
 
 
+def _apply_tile_local_centroid(w2c: np.ndarray, centroid: np.ndarray) -> np.ndarray:
+    """Shift a root-local OpenCV w2c so it lines up with a re-centered scene."""
+    w2c = w2c.copy()
+    w2c[:3, 3] = w2c[:3, 3] + w2c[:3, :3] @ centroid
+    return w2c
+
+
+def iter_world_to_camera(
+    rigs: list[Any], *, background: Background, name: str | None = None
+) -> Iterator[tuple[float, np.ndarray]]:
+    """Yield ``(timestamp, world_to_camera)`` aligned with ``background``.
+
+    Wraps :func:`iter_world_to_camera_uncentered` and shifts the translation
+    column by ``R_w2c @ background.tile_local_centroid`` so the resulting
+    camera lines up with the gaussians stored on the background (which are
+    re-centered to their tile-local centroid for numerical stability).
+    """
+    centroid = background.tile_local_centroid.detach().cpu().numpy().astype(np.float64)
+    for ts, w2c in iter_world_to_camera_uncentered(rigs, name=name):
+        yield ts, _apply_tile_local_centroid(w2c, centroid)
+
+
 def iter_world_to_camera_interpolated(
+    rigs: list[Any],
+    *,
+    background: Background,
+    fps: float,
+    name: str | None = None,
+) -> Iterator[tuple[float, np.ndarray]]:
+    """Interpolated counterpart of :func:`iter_world_to_camera`.
+
+    Same SLERP/LERP sampling as
+    :func:`iter_world_to_camera_interpolated_uncentered`, with the
+    background centroid compensation applied so the result is ready to
+    render against a :class:`Background`-loaded scene.
+    """
+    centroid = background.tile_local_centroid.detach().cpu().numpy().astype(np.float64)
+    for ts, w2c in iter_world_to_camera_interpolated_uncentered(
+        rigs, fps=fps, name=name
+    ):
+        yield ts, _apply_tile_local_centroid(w2c, centroid)
+
+
+def iter_world_to_camera_interpolated_uncentered(
     rigs: list[Any], *, name: str | None = None, fps: float
 ) -> Iterator[tuple[float, np.ndarray]]:
     """Yield ``(timestamp_us, world_to_camera)`` sampled uniformly at ``fps``.
+
+    Same root-local convention as :func:`iter_world_to_camera_uncentered` —
+    prefer :func:`iter_world_to_camera_interpolated` for rendering against
+    a :class:`Background`-loaded scene.
 
     Spans the full GT timeline of the selected camera; rotations are SLERPed
     and translations are linearly interpolated between adjacent GT poses so
