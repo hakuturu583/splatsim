@@ -288,6 +288,15 @@ def main() -> None:
         help="Path to a scene YAML file or a scene USDZ archive",
     )
     parser.add_argument(
+        "--camera",
+        default=None,
+        help=(
+            "Name of the rig camera in a scene USDZ to seed intrinsics and "
+            "initial pose (e.g. CAM_FRONT). Defaults to the first camera in "
+            "the first rig."
+        ),
+    )
+    parser.add_argument(
         "--dds",
         action="store_true",
         help="Publish images and camera info via CycloneDDS",
@@ -316,6 +325,16 @@ def main() -> None:
         help="Initial camera yaw in degrees",
     )
     parser.add_argument(
+        "--lod",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable/disable level-of-detail (LoD) filtering. Pass --lod or "
+            "--no-lod to override; without either flag the scene file's "
+            "default is used (USDZ and the dataclass default to enabled)."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="WARNING",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -333,7 +352,9 @@ def main() -> None:
 
     from splatsim.dataclass import SceneConfig
 
-    config = SceneConfig.from_source(args.scene_source)
+    config = SceneConfig.from_source(
+        args.scene_source, camera_name=args.camera, lod_enabled=args.lod
+    )
 
     image_pub = None
     camera_info_pub = None

@@ -16,7 +16,7 @@ class SceneConfig:
     """Top-level scene configuration loaded from YAML."""
 
     background_tileset: str | None = None
-    use_sh: bool = False
+    use_sh: bool = True
     rigid_bodies: list[RigidBodyConfig] = field(default_factory=list)
     renderer: RendererConfig = field(default_factory=RendererConfig)
     viewer: ViewerConfig = field(default_factory=ViewerConfig)
@@ -28,15 +28,32 @@ class SceneConfig:
     initial_camera_yaw_deg: float | None = None
 
     @staticmethod
-    def from_source(path: str | Path) -> SceneConfig:
-        """Build a SceneConfig from either a scene YAML or a scene USDZ."""
+    def from_source(
+        path: str | Path,
+        *,
+        camera_name: str | None = None,
+        lod_enabled: bool | None = None,
+    ) -> SceneConfig:
+        """Build a SceneConfig from either a scene YAML or a scene USDZ.
+
+        ``camera_name`` selects which rig camera seeds intrinsics and initial
+        pose for scene USDZ inputs; ignored for YAML.
+
+        ``lod_enabled`` overrides ``cfg.lod.enabled`` after loading when not
+        ``None``. Pass ``True``/``False`` from the CLI to force LoD on/off
+        regardless of the file's default.
+        """
         path = Path(path)
         if path.suffix.lower() == ".usdz":
-            return SceneConfig.from_usdz(path)
-        return SceneConfig.from_yaml(path)
+            cfg = SceneConfig.from_usdz(path, camera_name=camera_name)
+        else:
+            cfg = SceneConfig.from_yaml(path)
+        if lod_enabled is not None:
+            cfg.lod.enabled = lod_enabled
+        return cfg
 
     @staticmethod
-    def from_usdz(path: str | Path) -> SceneConfig:
+    def from_usdz(path: str | Path, *, camera_name: str | None = None) -> SceneConfig:
         """Build a SceneConfig from a scene USDZ's embedded ``scene.json``.
 
         Only metadata is read here; the heavy SPZ chunks are loaded later
@@ -73,7 +90,7 @@ class SceneConfig:
         rig_uri = meta.get("extras", {}).get("rig_trajectories")
         if rig_uri:
             rigs = read_rig_trajectories(path, rig_uri)
-            cam = first_camera(rigs)
+            cam = first_camera(rigs, name=camera_name)
             if cam is not None:
                 width, height, fov_y_deg = camera_to_viewer_intrinsics(cam)
                 if width and height:
@@ -82,13 +99,13 @@ class SceneConfig:
                 if fov_y_deg is not None:
                     viewer.fov_y_deg = fov_y_deg
 
-            pose = initial_camera_pose_from_rig_trajectories(rigs)
+            pose = initial_camera_pose_from_rig_trajectories(rigs, name=camera_name)
             if pose is not None:
                 initial_pos, initial_yaw = pose
 
         return SceneConfig(
             background_tileset=str(path),
-            use_sh=False,
+            use_sh=True,
             rigid_bodies=[],
             renderer=renderer,
             viewer=viewer,
@@ -141,7 +158,7 @@ class SceneConfig:
                     max_distance=tier.get("max_distance", float("inf")),
                 )
             )
-        lod = LodConfig(enabled=lod_raw.get("enabled", False))
+        lod = LodConfig(enabled=lod_raw.get("enabled", True))
         if "max_gaussians_per_cell" in lod_raw:
             lod.max_gaussians_per_cell = lod_raw["max_gaussians_per_cell"]
         if lod_tiers:
@@ -170,7 +187,7 @@ class SceneConfig:
 
         return SceneConfig(
             background_tileset=bg_tileset,
-            use_sh=raw.get("use_sh", False),
+            use_sh=raw.get("use_sh", True),
             rigid_bodies=rigid_bodies,
             renderer=renderer,
             viewer=viewer,

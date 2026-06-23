@@ -13,8 +13,10 @@ reader.
 
 from __future__ import annotations
 
+import gzip
 import importlib as _importlib
 import json
+import struct
 import tempfile
 import zipfile
 from pathlib import Path
@@ -78,10 +80,23 @@ def load_spz_tileset(
     tensor_list: list[GaussianTensors] = []
     for child in root.get("children", []):
         chunk_uri = child["content"]["uri"]
-        cloud = _load_spz(str(base_dir / chunk_uri))
+        chunk_path = base_dir / chunk_uri
+        cloud = _load_spz(str(chunk_path))
         if cloud.num_points == 0:
             continue
-        tensor_list.append(cloud_to_tensors(cloud, device, use_sh=use_sh))
+        tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
+        # SPZ stores positions as 24-bit signed fixed-point, so positions
+        # outside ±(2^24 / 2^fractionalBits / 2) wrap around. For scenes
+        # authored in large local coordinates (e.g. MGRS-relative, ~10^5 m),
+        # 3dgs_io's SPZ writer silently emits wrapped positions. Use the
+        # child tile's boundingVolume center to detect the wrap offset and
+        # restore root_local coordinates.
+        bbox_center = _child_bbox_center(child)
+        if bbox_center is not None:
+            shift = _spz_wrap_shift(chunk_path, tensors.means, bbox_center)
+            if shift is not None:
+                tensors.means = tensors.means + shift.to(tensors.means)
+        tensor_list.append(tensors)
 
     if not tensor_list:
         raise ValueError(f"{tileset_path}: no SPZ chunks found")
@@ -90,12 +105,29 @@ def load_spz_tileset(
     return merged, root_transform
 
 
-def first_camera(rigs: list[Any]) -> Any | None:
-    """Return the first camera nested in the first rig that has one."""
+def first_camera(rigs: list[Any], name: str | None = None) -> Any | None:
+    """Return a camera from the rigs.
+
+    If ``name`` is ``None``, returns the first camera nested in the first rig
+    that has one (legacy behavior). If ``name`` is given, returns the camera
+    whose ``name`` attribute matches; raises ``ValueError`` if no such camera
+    exists, including the available names in the message.
+    """
+    if name is None:
+        for rig in rigs:
+            if rig.cameras:
+                return rig.cameras[0]
+        return None
+
+    available: list[str] = []
     for rig in rigs:
-        if rig.cameras:
-            return rig.cameras[0]
-    return None
+        for cam in rig.cameras or []:
+            if cam.name == name:
+                return cam
+            available.append(cam.name)
+    raise ValueError(
+        f"camera {name!r} not found in rig_trajectories; available: {available}"
+    )
 
 
 def camera_to_viewer_intrinsics(
@@ -145,33 +177,54 @@ def read_rig_trajectories(usdz_path: str | Path, rig_uri: str) -> list[Any]:
 
 def initial_camera_pose_from_rig_trajectories(
     rigs: list[Any],
+    name: str | None = None,
 ) -> tuple[tuple[float, float, float], float] | None:
-    """Compose the first rig pose with its first camera's extrinsics.
+    """Compose the first rig pose with the chosen camera's extrinsics.
+
+    If ``name`` is ``None``, picks the first camera of the first rig that has
+    any. If ``name`` is given, picks the camera whose ``name`` attribute
+    matches and uses the first pose of the rig that owns it; raises
+    ``ValueError`` if no such camera exists.
 
     Returns ``(world_position, yaw_deg)`` where yaw is the rotation of the
     composed sensor-in-world transform around the +Z (up) axis; the world
     position is in root-local frame (the same frame as the gaussians).
     Returns ``None`` if there is no rig or no camera.
     """
+    available: list[str] = []
     for rig in rigs:
         if not rig.poses or not rig.cameras:
+            if name is not None:
+                available.extend(c.name for c in rig.cameras or [])
             continue
+        if name is None:
+            cam = rig.cameras[0]
+        else:
+            cam = next((c for c in rig.cameras if c.name == name), None)
+            if cam is None:
+                available.extend(c.name for c in rig.cameras)
+                continue
         rig_pose = rig.poses[0]
-        cam = rig.cameras[0]
 
         r_rig = _quat_to_matrix(rig_pose.rotation)
         t_rig = np.asarray(rig_pose.translation, dtype=np.float64)
-        r_sensor = _quat_to_matrix(cam.extrinsics.rotation)
-        t_sensor = np.asarray(cam.extrinsics.translation, dtype=np.float64)
+        # Despite the ``T_sensor_rig`` field name, 3dgs_io rig_trajectories
+        # store the rig→sensor (OpenCV/COLMAP, +Z forward) matrix — verified
+        # empirically on Tier IV NuRec exports where the documented
+        # sensor→rig reading puts the camera 1.3m underground. Invert to
+        # get sensor pose in the rig frame.
+        r_rs = _quat_to_matrix(cam.extrinsics.rotation)
+        t_rs = np.asarray(cam.extrinsics.translation, dtype=np.float64)
+        r_sensor = r_rs.T
+        t_sensor = -r_rs.T @ t_rs
 
         # T_sensor_world = T_rig_world @ T_sensor_rig
         t_sensor_world = t_rig + r_rig @ t_sensor
         r_sensor_world = r_rig @ r_sensor
 
         # splatsim yaw rotates around +Z; at yaw=0 the camera looks along
-        # world -Y. ``CameraExtrinsics`` follows the OpenGL/glTF convention,
-        # so the camera looks along its own -Z. World forward direction:
-        fwd_world = r_sensor_world @ np.array([0.0, 0.0, -1.0])
+        # world -Y. With OpenCV extrinsics the camera looks along sensor +Z.
+        fwd_world = r_sensor_world @ np.array([0.0, 0.0, 1.0])
         # Project to the horizontal plane for the yaw. Falls back to 0
         # for cameras pointing nearly straight up/down (degenerate yaw).
         horiz = float(np.hypot(fwd_world[0], fwd_world[1]))
@@ -187,12 +240,76 @@ def initial_camera_pose_from_rig_trajectories(
             float(t_sensor_world[2]),
         )
         return position, yaw_deg
+    if name is not None:
+        raise ValueError(
+            f"camera {name!r} not found in rig_trajectories; available: {available}"
+        )
     return None
 
 
+def _child_bbox_center(child: dict[str, Any]) -> np.ndarray | None:
+    """Read the 3D Tiles ``boundingVolume.box`` center for a tile child."""
+    box = child.get("boundingVolume", {}).get("box")
+    if not box or len(box) < 3:
+        return None
+    return np.asarray(box[:3], dtype=np.float64)
+
+
+def _spz_wrap_shift(
+    chunk_path: Path,
+    means: torch.Tensor,
+    bbox_center: np.ndarray,
+) -> torch.Tensor | None:
+    """Compute the per-axis integer-wrap correction for an SPZ chunk.
+
+    Niantic SPZ stores positions as ``int24`` scaled by ``2^fractionalBits``,
+    so any coordinate outside ``±(2^23 / 2^fractionalBits) m`` wraps back
+    into range when encoded. Returns the ``(dx, dy, dz)`` shift in meters
+    that maps the centered cloud to the child tile's bbox center, snapped
+    to integer multiples of the wrap period.
+    """
+    fractional_bits = _read_spz_fractional_bits(chunk_path)
+    if fractional_bits is None:
+        return None
+    wrap_period = 2.0 ** (24 - fractional_bits)  # meters, e.g. 4096 at fb=12
+    centroid = means.mean(dim=0).detach().cpu().numpy().astype(np.float64)
+    raw_delta = bbox_center - centroid
+    k = np.round(raw_delta / wrap_period)
+    shift = k * wrap_period
+    if not np.any(k):
+        return None
+    return torch.from_numpy(shift)
+
+
+def _read_spz_fractional_bits(chunk_path: Path) -> int | None:
+    """Return ``fractionalBits`` from an SPZ file header, or ``None`` on miss.
+
+    SPZ v3 layout: magic (4) + version (4) + num_points (4) + sh_degree (1)
+    + fractionalBits (1) + flags (1) + reserved (1). Files are gzipped.
+    """
+    with chunk_path.open("rb") as f:
+        head = f.read(16)
+    if len(head) < 16:
+        return None
+    if head[:2] == b"\x1f\x8b":
+        # gzip — only need the first ~16 bytes; decompress a small prefix.
+        with gzip.open(chunk_path, "rb") as f:
+            head = f.read(16)
+        if len(head) < 16:
+            return None
+    magic = struct.unpack("<I", head[:4])[0]
+    if magic != 0x5053474E:  # b"NGSP" little-endian
+        return None
+    return head[13]
+
+
 def _quat_to_matrix(q: tuple[float, float, float, float]) -> np.ndarray:
-    """Convert a (w, x, y, z) quaternion to a 3x3 rotation matrix."""
-    w, x, y, z = q
+    """Convert an ``(x, y, z, w)`` quaternion to a 3x3 rotation matrix.
+
+    ``3dgs_io.parse_rig_trajectories`` exposes rotations in ``(x, y, z, w)``
+    order (the same convention as scipy / Eigen / glTF).
+    """
+    x, y, z, w = q
     return np.array(
         [
             [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],

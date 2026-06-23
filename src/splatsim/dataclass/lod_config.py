@@ -18,7 +18,7 @@ class LodTier:
 class LodConfig:
     """Level-of-Detail configuration."""
 
-    enabled: bool = False
+    enabled: bool = True
 
     max_gaussians_per_cell: int = 50000
     """Octree leaf threshold. Gaussians are spatially partitioned into cells
