@@ -282,7 +282,20 @@ class Viewer(QMainWindow):
 def main() -> None:
     """Entry point: ``uv run viewer scene.yaml``."""
     parser = argparse.ArgumentParser(description="splatsim interactive viewer")
-    parser.add_argument("scene_yaml", type=Path, help="Path to scene YAML file")
+    parser.add_argument(
+        "scene_source",
+        type=Path,
+        help="Path to a scene YAML file or a scene USDZ archive",
+    )
+    parser.add_argument(
+        "--camera",
+        default=None,
+        help=(
+            "Name of the rig camera in a scene USDZ to seed intrinsics and "
+            "initial pose (e.g. CAM_FRONT). Defaults to the first camera in "
+            "the first rig."
+        ),
+    )
     parser.add_argument(
         "--dds",
         action="store_true",
@@ -312,6 +325,33 @@ def main() -> None:
         help="Initial camera yaw in degrees",
     )
     parser.add_argument(
+        "--mp4",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Render the scene along the selected rig camera's GT trajectory "
+            "and write it to this MP4 file instead of launching the viewer. "
+            "Requires a scene USDZ with a rig_trajectories sidecar."
+        ),
+    )
+    parser.add_argument(
+        "--mp4-fps",
+        type=int,
+        default=30,
+        help="Frame rate of the MP4 written by --mp4 (default: 30)",
+    )
+    parser.add_argument(
+        "--lod",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable/disable level-of-detail (LoD) filtering. Pass --lod or "
+            "--no-lod to override; without either flag the scene file's "
+            "default is used (USDZ and the dataclass default to enabled)."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="WARNING",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -329,7 +369,12 @@ def main() -> None:
 
     from splatsim.dataclass import SceneConfig
 
-    config = SceneConfig.from_yaml(args.scene_yaml)
+    config = SceneConfig.from_source(
+        args.scene_source, camera_name=args.camera, lod_enabled=args.lod
+    )
+
+    if args.mp4 and args.dds:
+        raise SystemExit("Error: --mp4 and --dds cannot be combined")
 
     image_pub = None
     camera_info_pub = None
@@ -384,17 +429,40 @@ def main() -> None:
         near_plane=rc.near_plane,
         far_plane=rc.far_plane,
         radius_clip=rc.radius_clip,
+        exposure=rc.exposure,
     )
 
+    if args.mp4:
+        from splatsim._mp4 import render_trajectory_mp4
+
+        n_frames = render_trajectory_mp4(
+            scene,
+            renderer,
+            args.scene_source,
+            output_path=args.mp4,
+            camera_name=args.camera,
+            fps=args.mp4_fps,
+        )
+        print(f"Wrote {n_frames} frames to {args.mp4}")
+        return
+
     vc = config.viewer
+    from splatsim.scene import resolve_initial_pose
+
+    initial_position, initial_yaw_deg = resolve_initial_pose(
+        config,
+        scene.background,
+        override_position=tuple(args.pos) if args.pos is not None else None,
+        override_yaw_deg=args.yaw,
+    )
     viewer = Viewer(
         renderer,
         scene=scene,
         fov_y_deg=vc.fov_y_deg,
         move_speed=vc.move_speed,
         rotate_speed=vc.rotate_speed,
-        initial_position=tuple(args.pos) if args.pos else None,
-        initial_yaw_deg=args.yaw,
+        initial_position=initial_position,
+        initial_yaw_deg=initial_yaw_deg,
         image_publisher=image_pub,
         camera_info_publisher=camera_info_pub,
     )

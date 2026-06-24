@@ -16,40 +16,55 @@ _merge_tileset = _3dgs_io.merge_tileset
 
 
 class Background:
-    """Loads a Cesium 3D Tileset and stores as GPU-ready Gaussian tensors."""
+    """Loads a 3D Tileset or a scene USDZ as GPU-ready Gaussian tensors."""
 
     def __init__(
         self,
-        tileset_path: str | Path,
+        source_path: str | Path,
         *,
         device: torch.device = torch.device("cuda"),
         use_sh: bool = False,
         max_tiles: int | None = None,
         lod_manager: LodManager | None = None,
     ) -> None:
-        tiles = _load_tileset(str(tileset_path), max_tiles=max_tiles)
+        path = Path(source_path)
+        if path.suffix.lower() == ".usdz":
+            # 3dgs_io scene USDZ wraps tileset.json + chunks/*.spz; extract
+            # to a temp directory and load each SPZ tile as a tensor chunk.
+            from splatsim._usdz import extract_scene_usdz, load_spz_tileset
 
-        # Extract the root tile's ECEF transform for GeoReference.
-        # 3D Tiles stores column-major; reshape then transpose to row-major.
-        root_tf = np.array(tiles[0].transform, dtype=np.float64).reshape(4, 4).T
-        self._ecef_rotation = root_tf[:3, :3].copy()
-        self._ecef_translation = root_tf[:3, 3].copy()
-
-        if len(tiles) == 1:
-            # Single tile: use raw tile-local cloud directly (already RUB, Y=up).
-            # Avoids the ECEF rotation that merge_tileset would apply.
-            cloud = tiles[0].cloud
+            scene_dir = extract_scene_usdz(path)
+            tensors, root_tf = load_spz_tileset(
+                scene_dir / "tileset.json", device, use_sh=use_sh
+            )
+            self._ecef_rotation = root_tf[:3, :3].copy()
+            self._ecef_translation = root_tf[:3, 3].copy()
         else:
-            # Multi-tile: merge into ECEF, then undo the root rotation
-            # so that the result stays in the tile-local orientation.
-            cloud = _merge_tileset(tiles)
-            self._undo_ecef_rotation(cloud, device)
+            tiles = _load_tileset(str(path), max_tiles=max_tiles)
 
-        tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
+            # Extract the root tile's ECEF transform for GeoReference.
+            # 3D Tiles stores column-major; reshape then transpose to row-major.
+            root_tf = np.array(tiles[0].transform, dtype=np.float64).reshape(4, 4).T
+            self._ecef_rotation = root_tf[:3, :3].copy()
+            self._ecef_translation = root_tf[:3, 3].copy()
 
-        # Re-center to local origin for numerical stability.
-        self._origin = tensors.means.mean(dim=0).clone()
-        tensors.means = tensors.means - self._origin
+            if len(tiles) == 1:
+                # Single tile: use raw tile-local cloud directly (already RUB, Y=up).
+                # Avoids the ECEF rotation that merge_tileset would apply.
+                cloud = tiles[0].cloud
+            else:
+                # Multi-tile: merge into ECEF, then undo the root rotation
+                # so that the result stays in the tile-local orientation.
+                cloud = _merge_tileset(tiles)
+                self._undo_ecef_rotation(cloud, device)
+            tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
+
+        # Re-center to the cloud's tile-local centroid for numerical
+        # stability. Despite living *near* the GeoReference origin in some
+        # tilesets, this offset is the gaussians' own centroid in the
+        # tile-local frame, not the ECEF origin (see ``ecef_translation``).
+        self._tile_local_centroid = tensors.means.mean(dim=0).clone()
+        tensors.means = tensors.means - self._tile_local_centroid
 
         # LOD: sort by importance and compute tier boundaries.
         self._lod_index: LodIndex | None = None
@@ -103,9 +118,38 @@ class Background:
         return self._lod_index
 
     @property
-    def origin(self) -> Tensor:
-        """The ECEF centroid that was subtracted (GeoReference origin)."""
-        return self._origin
+    def tile_local_centroid(self) -> Tensor:
+        """Tile-local centroid subtracted from gaussian means for numerical stability.
+
+        This is ``means.mean(dim=0)`` in the *tile-local* (RUB, Y-up) frame
+        that the gaussians live in, **not** an ECEF translation. Renderers
+        that consume world-frame poses (e.g. rig trajectories) must add this
+        back to the translation column of their world-to-camera matrices to
+        line the camera up with the re-centered cloud.
+
+        For the ECEF translation of the root tile, see :attr:`ecef_translation`.
+        """
+        return self._tile_local_centroid
+
+    @property
+    def ecef_translation(self) -> np.ndarray:
+        """ECEF translation of the root tile, in meters (3,) ``float64``.
+
+        Read from the 3D Tiles root transform (or the USDZ scene's root
+        transform); never applied to the gaussians, which stay in
+        tile-local coordinates.
+        """
+        return self._ecef_translation
+
+    @property
+    def ecef_rotation(self) -> np.ndarray:
+        """ECEF rotation of the root tile, 3x3 ``float64``.
+
+        Read from the 3D Tiles root transform; never applied to the
+        gaussians. For multi-tile tilesets, the inverse is applied to the
+        merged cloud to bring it back to tile-local before re-centering.
+        """
+        return self._ecef_rotation
 
     @property
     def tensors(self) -> GaussianTensors:

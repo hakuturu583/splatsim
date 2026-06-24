@@ -130,14 +130,14 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 self._initialized = True
                 logger.info("Initialization complete (%.1f fps)", self._frame_rate)
 
-                origin = background.origin
+                centroid = background.tile_local_centroid
                 scene_origin = pb2.Vector3(
-                    x=float(origin[0]),
-                    y=float(origin[1]),
-                    z=float(origin[2]),
+                    x=float(centroid[0]),
+                    y=float(centroid[1]),
+                    z=float(centroid[2]),
                 )
-                ecef_t = background._ecef_translation
-                ecef_r = background._ecef_rotation
+                ecef_t = background.ecef_translation
+                ecef_r = background.ecef_rotation
                 return pb2.InitializeResponse(
                     success=True,
                     scene_origin=scene_origin,

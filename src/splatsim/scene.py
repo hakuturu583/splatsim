@@ -5,6 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -245,6 +246,48 @@ def print_progress(step: int, total: int, label: str) -> None:
     sys.stderr.flush()
 
 
+def resolve_initial_pose(
+    config: SceneConfig,
+    background: Background | None,
+    *,
+    override_position: tuple[float, float, float] | None = None,
+    override_yaw_deg: float | None = None,
+) -> tuple[tuple[float, float, float] | None, float | None]:
+    """Resolve the initial camera pose, in the viewer's tile-local frame.
+
+    Precedence (highest first): explicit override args, then
+    ``viewer.initial_position``/``initial_yaw_deg`` (already tile-local),
+    then ``initial_camera_world_position``/``initial_camera_yaw_deg`` from
+    a scene USDZ (converted to tile-local by subtracting
+    ``background.tile_local_centroid``).
+    """
+    vc = config.viewer
+    if override_position is not None:
+        position: tuple[float, float, float] | None = override_position
+    elif vc.initial_position is not None:
+        position = vc.initial_position
+    elif config.initial_camera_world_position is not None and background is not None:
+        centroid = (
+            background.tile_local_centroid.detach().cpu().numpy().astype(np.float64)
+        )
+        world = np.asarray(config.initial_camera_world_position, dtype=np.float64)
+        local = world - centroid
+        position = (float(local[0]), float(local[1]), float(local[2]))
+    else:
+        position = None
+
+    if override_yaw_deg is not None:
+        yaw_deg: float | None = override_yaw_deg
+    elif vc.initial_yaw_deg is not None:
+        yaw_deg = vc.initial_yaw_deg
+    elif config.initial_camera_yaw_deg is not None:
+        yaw_deg = config.initial_camera_yaw_deg
+    else:
+        yaw_deg = None
+
+    return position, yaw_deg
+
+
 def load_scene(
     config: SceneConfig | str | Path,
     *,
@@ -269,15 +312,19 @@ def load_scene(
         near_plane=rc.near_plane,
         far_plane=rc.far_plane,
         radius_clip=rc.radius_clip,
+        exposure=rc.exposure,
     )
 
     vc = config.viewer
+    initial_position, initial_yaw_deg = resolve_initial_pose(config, scene.background)
     return Viewer(
         renderer,
         scene=scene,
         fov_y_deg=vc.fov_y_deg,
         move_speed=vc.move_speed,
         rotate_speed=vc.rotate_speed,
+        initial_position=initial_position,
+        initial_yaw_deg=initial_yaw_deg,
         image_publisher=image_publisher,
         camera_info_publisher=camera_info_publisher,
     )

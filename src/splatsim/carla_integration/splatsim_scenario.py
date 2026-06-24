@@ -345,13 +345,13 @@ class SplatSimScenario(BaseScenario):
                 "(no tileset.json ECEF data)"
             )
 
-        # 3. Get tile origin (torch Tensor on GPU → numpy float64)
-        tile_origin = bg.origin.cpu().numpy().astype(_np.float64)
+        # 3. Get tile-local centroid (torch Tensor on GPU → numpy float64)
+        tile_origin = bg.tile_local_centroid.detach().cpu().numpy().astype(_np.float64)
 
         return GeoTransform(
             proj_origin=proj_origin,
-            ecef_rotation=bg._ecef_rotation,
-            ecef_translation=bg._ecef_translation,
+            ecef_rotation=bg.ecef_rotation,
+            ecef_translation=bg.ecef_translation,
             tile_origin=tile_origin,
         )
 

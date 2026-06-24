@@ -14,3 +14,4 @@ class RendererConfig:
     far_plane: float = 1000.0
     device: str = "cuda"
     radius_clip: float = 0.0
+    exposure: float = 1.0
