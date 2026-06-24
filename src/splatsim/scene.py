@@ -267,7 +267,9 @@ def resolve_initial_pose(
     elif vc.initial_position is not None:
         position = vc.initial_position
     elif config.initial_camera_world_position is not None and background is not None:
-        centroid = background.tile_local_centroid.detach().cpu().numpy()
+        centroid = (
+            background.tile_local_centroid.detach().cpu().numpy().astype(np.float64)
+        )
         world = np.asarray(config.initial_camera_world_position, dtype=np.float64)
         local = world - centroid
         position = (float(local[0]), float(local[1]), float(local[2]))

@@ -346,7 +346,7 @@ class SplatSimScenario(BaseScenario):
             )
 
         # 3. Get tile-local centroid (torch Tensor on GPU → numpy float64)
-        tile_origin = bg.tile_local_centroid.cpu().numpy().astype(_np.float64)
+        tile_origin = bg.tile_local_centroid.detach().cpu().numpy().astype(_np.float64)
 
         return GeoTransform(
             proj_origin=proj_origin,

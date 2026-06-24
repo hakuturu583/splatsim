@@ -25,3 +25,9 @@ test/data/*/iteration_*/
 src/splatsim/grpc_service/_generated/rendering_service_pb2.py
 src/splatsim/grpc_service/_generated/rendering_service_pb2_grpc.py
 src/splatsim/grpc_service/_generated/rendering_service_pb2.pyi
+
+# Serena MCP server cache
+.serena/
+
+# Local render artifacts
+output.mp4
