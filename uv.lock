@@ -89,9 +89,8 @@ dependencies = [
 [[package]]
 name = "autoware-carla-scenario"
 version = "0.1.0"
-source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=6165173a#6165173adc9d6ca4f110b8bba2d93ebaa9ec014c" }
+source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=c8ce279827e1bf85c5566eebe815c32a1d6b623c#c8ce279827e1bf85c5566eebe815c32a1d6b623c" }
 dependencies = [
-    { name = "cyclonedds", marker = "sys_platform == 'linux'" },
     { name = "fastapi", marker = "sys_platform == 'linux'" },
     { name = "ffmpeg-python", marker = "sys_platform == 'linux'" },
     { name = "hydra-core", marker = "sys_platform == 'linux'" },
@@ -116,8 +115,8 @@ carla-0-9-16 = [
 
 [[package]]
 name = "autoware-lanelet2-to-opendrive"
-version = "2.59.7"
-source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=6165173a#6165173adc9d6ca4f110b8bba2d93ebaa9ec014c" }
+version = "2.59.24"
+source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=c8ce279827e1bf85c5566eebe815c32a1d6b623c#c8ce279827e1bf85c5566eebe815c32a1d6b623c" }
 dependencies = [
     { name = "asam-qc-opendrive", marker = "sys_platform == 'linux'" },
     { name = "hydra-core", marker = "sys_platform == 'linux'" },
@@ -589,7 +588,7 @@ wheels = [
 [[package]]
 name = "gsplat"
 version = "1.5.3"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/nerfstudio-project/gsplat.git?rev=4e52698e45eaaed929ed3a5065e96a688d085df6#4e52698e45eaaed929ed3a5065e96a688d085df6" }
 dependencies = [
     { name = "jaxtyping", version = "0.3.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' and sys_platform == 'linux'" },
     { name = "jaxtyping", version = "0.3.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' and sys_platform == 'linux'" },
@@ -598,9 +597,11 @@ dependencies = [
     { name = "rich", marker = "sys_platform == 'linux'" },
     { name = "torch", marker = "sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/94/a0963873708223385ac926112dc3e40ab08297784ac53d95309b4cb5a801/gsplat-1.5.3.tar.gz", hash = "sha256:343f080c470e891ba3c697c03bdf0952cb982d1d535fdc24adb23c2cb4fba906", size = 4743603, upload-time = "2025-07-04T16:50:42.899Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/aa/68/c5cbbdb86421a3f45ac0b52cf9860b1048d089335151d3f37c23aabcbef1/gsplat-1.5.3-py3-none-any.whl", hash = "sha256:515a3773641f5e7f7717acab6276c0b1d6dbcad087b7968ca653337c3189a982", size = 6519041, upload-time = "2025-07-04T16:50:40.559Z" },
+
+[package.optional-dependencies]
+lidar = [
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' and sys_platform == 'linux'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' and sys_platform == 'linux'" },
 ]
 
 [[package]]
@@ -807,7 +808,7 @@ wheels = [
 [[package]]
 name = "lanelet2-python-api-for-autoware"
 version = "0.1.0"
-source = { git = "https://github.com/tier4/lanelet2_python_api_for_autoware?rev=6bd27ff7ab3eed326422b960a2694dff605bdb9a#6bd27ff7ab3eed326422b960a2694dff605bdb9a" }
+source = { git = "https://github.com/tier4/lanelet2_python_api_for_autoware?rev=21cafbf9a855afbc4b89d4dfc3d299a411b64dde#21cafbf9a855afbc4b89d4dfc3d299a411b64dde" }
 dependencies = [
     { name = "matplotlib", marker = "sys_platform == 'linux'" },
     { name = "numpy", marker = "sys_platform == 'linux'" },
@@ -2062,7 +2063,7 @@ dependencies = [
     { name = "3dgs-io", marker = "sys_platform == 'linux'" },
     { name = "grpcio", marker = "sys_platform == 'linux'" },
     { name = "grpcio-tools", marker = "sys_platform == 'linux'" },
-    { name = "gsplat", marker = "sys_platform == 'linux'" },
+    { name = "gsplat", extra = ["lidar"], marker = "sys_platform == 'linux'" },
     { name = "packaging", marker = "sys_platform == 'linux'" },
     { name = "protobuf", marker = "sys_platform == 'linux'" },
     { name = "pyyaml", marker = "sys_platform == 'linux'" },
@@ -2110,13 +2111,13 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?branch=feat%2Fusdz-io" },
-    { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=6165173a" },
-    { name = "autoware-lanelet2-to-opendrive", marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=6165173a" },
+    { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=c8ce279827e1bf85c5566eebe815c32a1d6b623c" },
+    { name = "autoware-lanelet2-to-opendrive", marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=c8ce279827e1bf85c5566eebe815c32a1d6b623c" },
     { name = "cyclonedds", marker = "extra == 'carla'", specifier = ">=11.0.1" },
     { name = "cyclonedds", marker = "extra == 'dds'", specifier = ">=11.0.1" },
     { name = "grpcio", specifier = ">=1.60.0" },
     { name = "grpcio-tools", specifier = ">=1.60.0" },
-    { name = "gsplat", specifier = "==1.5.3" },
+    { name = "gsplat", extras = ["lidar"], git = "https://github.com/nerfstudio-project/gsplat.git?rev=4e52698e45eaaed929ed3a5065e96a688d085df6" },
     { name = "opencv-python-headless", marker = "extra == 'dds'", specifier = ">=4.0.0" },
     { name = "packaging" },
     { name = "protobuf", specifier = ">=4.25.0" },

@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 from splatsim.dataclass.lod_config import LodConfig, LodTier
+from splatsim.dataclass.lidar_config import LidarConfig
 from splatsim.dataclass.renderer_config import RendererConfig
 from splatsim.dataclass.rigid_body_config import RigidBodyConfig
 from splatsim.dataclass.viewer_config import ViewerConfig
@@ -18,6 +19,7 @@ class SceneConfig:
     background_tileset: str | None = None
     use_sh: bool = True
     rigid_bodies: list[RigidBodyConfig] = field(default_factory=list)
+    lidar_sensors: list[LidarConfig] = field(default_factory=list)
     renderer: RendererConfig = field(default_factory=RendererConfig)
     viewer: ViewerConfig = field(default_factory=ViewerConfig)
     lod: LodConfig = field(default_factory=LodConfig)
@@ -107,6 +109,7 @@ class SceneConfig:
             background_tileset=str(path),
             use_sh=True,
             rigid_bodies=[],
+            lidar_sensors=[],
             renderer=renderer,
             viewer=viewer,
             lod=LodConfig(),
@@ -185,10 +188,37 @@ class SceneConfig:
             rotate_speed=viewer_raw.get("rotate_speed", 1.5),
         )
 
+        # LiDAR sensors
+        lidar_sensors: list[LidarConfig] = []
+        for lidar in raw.get("lidar_sensors", []):
+            pos = lidar.get("position", [0.0, 0.0, 1.8])
+            rot = lidar.get("rotation", [0.0, 0.0, 0.0])
+            lidar_sensors.append(
+                LidarConfig(
+                    name=lidar.get("name", "lidar"),
+                    enabled=lidar.get("enabled", True),
+                    sensor_type=lidar.get("sensor_type", "OT128"),
+                    n_rows=lidar.get("n_rows", 128),
+                    n_columns=lidar.get("n_columns", 2048),
+                    fps=lidar.get("fps", 10.0),
+                    min_range_m=lidar.get("min_range_m", 0.3),
+                    max_range_m=lidar.get("max_range_m", 120.0),
+                    position=tuple(pos),
+                    rotation=tuple(rot),
+                    pointcloud_topic=lidar.get(
+                        "pointcloud_topic", "/splatsim/lidar/pointcloud"
+                    ),
+                    frame_id=lidar.get("frame_id", "splatsim_lidar"),
+                    drop_threshold=lidar.get("drop_threshold", 0.5),
+                    alpha_threshold=lidar.get("alpha_threshold", 0.1),
+                )
+            )
+
         return SceneConfig(
             background_tileset=bg_tileset,
             use_sh=raw.get("use_sh", True),
             rigid_bodies=rigid_bodies,
+            lidar_sensors=lidar_sensors,
             renderer=renderer,
             viewer=viewer,
             lod=lod,

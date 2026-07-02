@@ -593,6 +593,16 @@ def _concat_tensors(tensors: list[GaussianTensors]) -> GaussianTensors:
     if len(sh_degrees) != 1:
         raise ValueError(f"Mixed SH degrees across chunks: {sh_degrees}")
     sh_degree = sh_degrees.pop()
+    # LiDAR attributes concatenate only if every chunk carries them; otherwise
+    # drop to None so the renderer falls back uniformly.
+    if all(t.intensity_raw is not None for t in tensors):
+        intensity_raw = torch.cat([t.intensity_raw for t in tensors], dim=0)  # type: ignore[misc]
+    else:
+        intensity_raw = None
+    if all(t.raydrop_logit is not None for t in tensors):
+        raydrop_logit = torch.cat([t.raydrop_logit for t in tensors], dim=0)  # type: ignore[misc]
+    else:
+        raydrop_logit = None
     return GaussianTensors(
         means=torch.cat([t.means for t in tensors], dim=0),
         quats=torch.cat([t.quats for t in tensors], dim=0),
@@ -600,4 +610,6 @@ def _concat_tensors(tensors: list[GaussianTensors]) -> GaussianTensors:
         opacities=torch.cat([t.opacities for t in tensors], dim=0),
         colors=torch.cat([t.colors for t in tensors], dim=0),
         sh_degree=sh_degree,
+        intensity_raw=intensity_raw,
+        raydrop_logit=raydrop_logit,
     )

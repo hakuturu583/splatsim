@@ -80,3 +80,30 @@ class CameraInfo(IdlStruct, typename="sensor_msgs::msg::dds_::CameraInfo_"):
     binning_x: uint32 = 0
     binning_y: uint32 = 0
     roi: RegionOfInterest = RegionOfInterest()  # noqa: RUF009
+
+
+@dataclass
+class PointField(IdlStruct, typename="sensor_msgs::msg::dds_::PointField_"):
+    """sensor_msgs/msg/PointField."""
+
+    # datatype constants: 1=INT8, 2=UINT8, 3=INT16, 4=UINT16, 5=INT32,
+    # 6=UINT32, 7=FLOAT32, 8=FLOAT64.
+    name: str = ""
+    offset: uint32 = 0
+    datatype: uint8 = 0
+    count: uint32 = 1
+
+
+@dataclass
+class PointCloud2(IdlStruct, typename="sensor_msgs::msg::dds_::PointCloud2_"):
+    """sensor_msgs/msg/PointCloud2."""
+
+    header: Header = Header()  # noqa: RUF009
+    height: uint32 = 0
+    width: uint32 = 0
+    fields: sequence[PointField] = ()  # type: ignore[assignment]
+    is_bigendian: bool = False
+    point_step: uint32 = 0
+    row_step: uint32 = 0
+    data: sequence[uint8] = b""  # type: ignore[assignment]
+    is_dense: bool = True

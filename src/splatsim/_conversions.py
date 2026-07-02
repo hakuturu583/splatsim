@@ -21,6 +21,12 @@ class GaussianTensors:
     opacities: Tensor  # [N] range [0, 1] (sigmoid applied)
     colors: Tensor  # [N, 3] RGB or [N, K, 3] SH coefficients
     sh_degree: int  # 0 = RGB only, 1-3 = SH degree
+    # Optional per-Gaussian LiDAR attributes. Populated only for scenes trained
+    # with tier4/gaussian_factory (see PLY properties `lidar_intensity_raw`,
+    # `lidar_raydrop_logit`). Standard 3DGS scenes leave these as None and the
+    # LiDAR renderer falls back to SH-derived intensity and a fixed low raydrop.
+    intensity_raw: Tensor | None = None  # [N] unbounded, sigmoid at render
+    raydrop_logit: Tensor | None = None  # [N] unbounded logit
 
     def __getitem__(self, idx: Tensor | slice) -> GaussianTensors:
         """Return a new instance with all tensor fields indexed/sliced by *idx*."""
@@ -31,6 +37,12 @@ class GaussianTensors:
             opacities=self.opacities[idx],
             colors=self.colors[idx],
             sh_degree=self.sh_degree,
+            intensity_raw=None
+            if self.intensity_raw is None
+            else self.intensity_raw[idx],
+            raydrop_logit=None
+            if self.raydrop_logit is None
+            else self.raydrop_logit[idx],
         )
 
 
@@ -170,4 +182,6 @@ def apply_rigid_transform(
         opacities=tensors.opacities,
         colors=tensors.colors,
         sh_degree=tensors.sh_degree,
+        intensity_raw=tensors.intensity_raw,
+        raydrop_logit=tensors.raydrop_logit,
     )

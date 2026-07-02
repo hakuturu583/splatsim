@@ -26,6 +26,7 @@ from autoware_carla_scenario.actions import AttachIMUSensorAction, IMUSensorConf
 from splatsim.carla_integration import (
     SplatSimCameraSensorConfig,
     SplatSimConfig,
+    SplatSimLidarSensorConfig,
     SplatSimScenario,
 )
 
@@ -81,6 +82,19 @@ class SpawnOnlyScenario(SplatSimScenario):
             frame_id=scfg.frame_id,
             compress_format=scfg.compress_format,
         )
+
+        lidar_configs = self.scene_config.lidar_sensors if self.scene_config else []
+        for lidar_config in lidar_configs:
+            if not lidar_config.enabled:
+                continue
+            self.attach_splatsim_lidar(
+                EGO_ROLE_NAME,
+                sensor_config=SplatSimLidarSensorConfig.from_scene_config(lidar_config),
+                label=f"ego_splatsim_lidar_{lidar_config.name}",
+                dds_participant=self.dds_participant,
+                pointcloud_topic=lidar_config.pointcloud_topic,
+                frame_id=lidar_config.frame_id,
+            )
 
         # Attach CARLA IMU sensor and publish to /sensing/imu/imu_data
         imu_action = AttachIMUSensorAction(
@@ -139,11 +153,13 @@ class SpawnOnlyScenario(SplatSimScenario):
         logger.info(
             "Ego spawned on lanelet %d (s=%.1f). "
             "SplatSim camera attached -> publishing to %s. "
+            "SplatSim LiDAR sensors: %d. "
             "IMU sensor attached -> publishing to /sensing/imu/imu_data. "
             "Waiting %.1f s ...",
             self._spawn_pose.lanelet_id,
             self._spawn_pose.s,
             scfg.image_topic,
+            sum(1 for cfg in lidar_configs if cfg.enabled),
             self._config.timeout_seconds,
         )
 

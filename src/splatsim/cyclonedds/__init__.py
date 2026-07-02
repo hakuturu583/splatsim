@@ -8,8 +8,10 @@ except ImportError:
 
 from splatsim.cyclonedds.camera_info_publisher import CameraInfoPublisher
 from splatsim.cyclonedds.image_publisher import ImagePublisher
+from splatsim.cyclonedds.pointcloud2_publisher import PointCloud2Publisher
 
 __all__ = [
     "CameraInfoPublisher",
     "ImagePublisher",
+    "PointCloud2Publisher",
 ]
