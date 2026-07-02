@@ -596,11 +596,15 @@ def _concat_tensors(tensors: list[GaussianTensors]) -> GaussianTensors:
     # LiDAR attributes concatenate only if every chunk carries them; otherwise
     # drop to None so the renderer falls back uniformly.
     if all(t.intensity_raw is not None for t in tensors):
-        intensity_raw = torch.cat([t.intensity_raw for t in tensors], dim=0)  # type: ignore[misc]
+        intensity_raw = torch.cat(
+            [t.intensity_raw for t in tensors if t.intensity_raw is not None], dim=0
+        )
     else:
         intensity_raw = None
     if all(t.raydrop_logit is not None for t in tensors):
-        raydrop_logit = torch.cat([t.raydrop_logit for t in tensors], dim=0)  # type: ignore[misc]
+        raydrop_logit = torch.cat(
+            [t.raydrop_logit for t in tensors if t.raydrop_logit is not None], dim=0
+        )
     else:
         raydrop_logit = None
     return GaussianTensors(

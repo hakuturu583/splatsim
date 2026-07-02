@@ -89,8 +89,9 @@ dependencies = [
 [[package]]
 name = "autoware-carla-scenario"
 version = "0.1.0"
-source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=c8ce279827e1bf85c5566eebe815c32a1d6b623c#c8ce279827e1bf85c5566eebe815c32a1d6b623c" }
+source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=348108571cf4abec1f668ca0999753b75b8a5e4b#348108571cf4abec1f668ca0999753b75b8a5e4b" }
 dependencies = [
+    { name = "cyclonedds", marker = "sys_platform == 'linux'" },
     { name = "fastapi", marker = "sys_platform == 'linux'" },
     { name = "ffmpeg-python", marker = "sys_platform == 'linux'" },
     { name = "hydra-core", marker = "sys_platform == 'linux'" },
@@ -116,7 +117,7 @@ carla-0-9-16 = [
 [[package]]
 name = "autoware-lanelet2-to-opendrive"
 version = "2.59.24"
-source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=c8ce279827e1bf85c5566eebe815c32a1d6b623c#c8ce279827e1bf85c5566eebe815c32a1d6b623c" }
+source = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=348108571cf4abec1f668ca0999753b75b8a5e4b#348108571cf4abec1f668ca0999753b75b8a5e4b" }
 dependencies = [
     { name = "asam-qc-opendrive", marker = "sys_platform == 'linux'" },
     { name = "hydra-core", marker = "sys_platform == 'linux'" },
@@ -2111,8 +2112,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?branch=feat%2Fusdz-io" },
-    { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=c8ce279827e1bf85c5566eebe815c32a1d6b623c" },
-    { name = "autoware-lanelet2-to-opendrive", marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=c8ce279827e1bf85c5566eebe815c32a1d6b623c" },
+    { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=348108571cf4abec1f668ca0999753b75b8a5e4b" },
+    { name = "autoware-lanelet2-to-opendrive", marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=348108571cf4abec1f668ca0999753b75b8a5e4b" },
     { name = "cyclonedds", marker = "extra == 'carla'", specifier = ">=11.0.1" },
     { name = "cyclonedds", marker = "extra == 'dds'", specifier = ">=11.0.1" },
     { name = "grpcio", specifier = ">=1.60.0" },
