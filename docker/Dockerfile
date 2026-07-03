@@ -22,6 +22,13 @@ ENV UV_LINK_MODE=copy
 
 WORKDIR /workspace/splatsim
 
+# gsplat is pinned to a git rev and compiles CUDA kernels during `uv sync`;
+# TORCH_CUDA_ARCH_LIST must be set before the first sync or the build fails
+# with an IndexError from torch's _get_cuda_arch_flags.
+ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+ENV TORCH_EXTENSIONS_DIR=/workspace/splatsim/.torch_extensions
+
 # Install dependencies first (layer cache optimization)
 COPY pyproject.toml uv.lock .python-version README.md ./
 COPY resource/ resource/
@@ -36,9 +43,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --extra dds --no-dev
 
 # Pre-compile gsplat CUDA kernels (JIT) so the runtime image does not need nvcc.
-ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
-ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
-ENV TORCH_EXTENSIONS_DIR=/workspace/splatsim/.torch_extensions
 RUN uv run python -c "from gsplat.cuda._backend import _C; assert _C is not None, 'gsplat CUDA JIT compilation failed'"
 
 # Patch gsplat _backend.py so it can load the pre-compiled .so without nvcc.
