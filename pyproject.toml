@@ -8,7 +8,7 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "gsplat==1.5.3",
+    "gsplat[lidar]",
     "torch==2.4.0+cu124",
     "torchvision==0.19.0+cu124",
     "3dgs-io",
@@ -58,9 +58,14 @@ torchvision = [
 
 3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", branch = "feat/usdz-io" }
 
-autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "6165173a", subdirectory = "autoware_carla_scenario" }
-autoware-lanelet2-to-opendrive = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "6165173a", subdirectory = "autoware_lanelet2_to_opendrive" }
-lanelet2-python-api-for-autoware = { git = "https://github.com/tier4/lanelet2_python_api_for_autoware", rev = "6bd27ff7ab3eed326422b960a2694dff605bdb9a" }
+# gsplat main pinned past PR #890 (Add LiDAR sensor support) to enable
+# camera_model="lidar" rasterization via RowOffsetStructuredSpinningLidarModelParameters.
+# Rev tracks the pin used by tier4/gaussian_factory.
+gsplat = { git = "https://github.com/nerfstudio-project/gsplat.git", rev = "4e52698e45eaaed929ed3a5065e96a688d085df6" }
+
+autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "348108571cf4abec1f668ca0999753b75b8a5e4b", subdirectory = "autoware_carla_scenario" }
+autoware-lanelet2-to-opendrive = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "348108571cf4abec1f668ca0999753b75b8a5e4b", subdirectory = "autoware_lanelet2_to_opendrive" }
+lanelet2-python-api-for-autoware = { git = "https://github.com/tier4/lanelet2_python_api_for_autoware", rev = "21cafbf9a855afbc4b89d4dfc3d299a411b64dde" }
 
 [dependency-groups]
 dev = [

@@ -13,13 +13,25 @@ from autoware_carla_scenario.scenario_base import BaseScenario, EgoConfig
 from splatsim.carla_integration.attach_splatsim_camera import (
     AttachSplatSimCameraAction,
 )
+from splatsim.carla_integration.attach_splatsim_lidar import (
+    AttachSplatSimLidarAction,
+)
 from splatsim.carla_integration.geo_transform import GeoTransform, parse_geo_reference
 from splatsim.carla_integration.splatsim_camera import (
     SplatSimCameraSensor,
     SplatSimCameraSensorConfig,
 )
-from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
+from splatsim.carla_integration.splatsim_lidar import (
+    SplatSimLidarSensor,
+    SplatSimLidarSensorConfig,
+)
+from splatsim.cyclonedds import (
+    CameraInfoPublisher,
+    ImagePublisher,
+    PointCloud2Publisher,
+)
 from splatsim.cyclonedds.msg_types import Time
+from splatsim.dataclass import SceneConfig
 from splatsim.scene import Scene
 
 if TYPE_CHECKING:
@@ -33,8 +45,6 @@ if TYPE_CHECKING:
     )
     from autoware_carla_scenario.entity import AutowareEntity
     from autoware_carla_scenario.entity_role import EntityRole
-    from splatsim.dataclass import SceneConfig
-
 logger = logging.getLogger(__name__)
 
 
@@ -79,6 +89,7 @@ class SplatSimScenario(BaseScenario):
         ground_projection: GroundProjectionConfig | None = None,
         random_seed: int = BaseScenario.DEFAULT_RANDOM_SEED,
         sensor_config: SplatSimCameraSensorConfig | None = None,
+        lidar_sensor_config: SplatSimLidarSensorConfig | None = None,
     ) -> None:
         super().__init__(
             ego_config,
@@ -87,16 +98,23 @@ class SplatSimScenario(BaseScenario):
             random_seed=random_seed,
         )
 
+        self._scene_config: SceneConfig | None = None
         if isinstance(scene, Scene):
             self._scene = scene
-        else:
+        elif isinstance(scene, SceneConfig):
+            self._scene_config = scene
             self._scene = Scene.from_config(scene)
+        else:
+            self._scene_config = SceneConfig.from_source(scene)
+            self._scene = Scene.from_config(self._scene_config)
 
         self._sensor_config = sensor_config
+        self._lidar_sensor_config = lidar_sensor_config
         self._geo_transform: GeoTransform | None = None
 
         # Registered camera actions and their publishers.
         self._camera_entries: list[_CameraEntry] = []
+        self._lidar_entries: list[_LidarEntry] = []
 
         # Capture the ego entity reference when ScenarioRunner calls
         # ego_type().  This happens before setup(), so ego_entity is
@@ -122,6 +140,11 @@ class SplatSimScenario(BaseScenario):
     def scene(self) -> Scene:
         """The Gaussian Splatting scene used for rendering."""
         return self._scene
+
+    @property
+    def scene_config(self) -> SceneConfig | None:
+        """Scene config used to build :attr:`scene`, if available."""
+        return self._scene_config
 
     @property
     def geo_transform(self) -> GeoTransform:
@@ -287,12 +310,61 @@ class SplatSimScenario(BaseScenario):
         )
         return action
 
+    def attach_splatsim_lidar(
+        self,
+        entity_name: Union[EntityRole, str],
+        *,
+        sensor_config: SplatSimLidarSensorConfig | None = None,
+        condition: BaseCondition | None = None,
+        timing: TickTiming | None = None,
+        label: str = "attach_splatsim_lidar",
+        once: bool = True,
+        dds_participant: DomainParticipant | None = None,
+        pointcloud_topic: str = "/splatsim/lidar/pointcloud",
+        frame_id: str = "splatsim_lidar",
+    ) -> AttachSplatSimLidarAction:
+        """Create and register an action that attaches a SplatSim LiDAR."""
+        from autoware_carla_scenario.actions import TickTiming as _TickTiming
+
+        if timing is None:
+            timing = _TickTiming.POST_TICK
+
+        config = sensor_config or self._lidar_sensor_config
+
+        action = AttachSplatSimLidarAction(
+            entity_name,
+            self._scene,
+            self.geo_transform,
+            sensor_config=config,
+            condition=condition,
+            timing=timing,
+            label=label,
+            once=once,
+        )
+        self.register_post_tick(action)
+
+        pointcloud_pub: PointCloud2Publisher | None = None
+        if dds_participant is not None:
+            pointcloud_pub = PointCloud2Publisher(
+                dds_participant,
+                topic_name=pointcloud_topic,
+                frame_id=frame_id,
+            )
+
+        self._lidar_entries.append(
+            _LidarEntry(
+                action=action,
+                pointcloud_pub=pointcloud_pub,
+            )
+        )
+        return action
+
     def publish_ros_topics(self, world: carla.World) -> None:
-        """Render all attached SplatSim cameras and publish to ROS 2.
+        """Render all attached SplatSim sensors and publish to ROS 2.
 
         This should be registered as a post-tick callback via
-        :meth:`register_post_tick`.  Image and CameraInfo messages
-        share the same timestamp derived from the CARLA world snapshot.
+        :meth:`register_post_tick`.  Image, CameraInfo, and PointCloud2
+        messages share the same timestamp derived from the CARLA world snapshot.
 
         Parameters
         ----------
@@ -326,6 +398,22 @@ class SplatSimScenario(BaseScenario):
 
             if entry.camera_info_pub is not None:
                 entry.camera_info_pub.publish(stamp=stamp)
+
+        for entry in self._lidar_entries:
+            sensor = entry.action.sensor
+            if sensor is None:
+                continue
+            assert isinstance(sensor, SplatSimLidarSensor)  # noqa: S101
+
+            point_cloud = sensor.get_point_cloud()
+            if point_cloud is None or entry.pointcloud_pub is None:
+                continue
+
+            entry.pointcloud_pub.publish(
+                point_cloud[:, :3],
+                point_cloud[:, 3],
+                stamp=stamp,
+            )
 
     # -- internals -----------------------------------------------------------
 
@@ -389,6 +477,21 @@ class _CameraEntry:
         self.dds_participant = dds_participant
         self.camera_info_topic = camera_info_topic
         self.frame_id = frame_id
+
+
+class _LidarEntry:
+    """Bookkeeping for one attached SplatSim LiDAR + its publisher."""
+
+    __slots__ = ("action", "pointcloud_pub")
+
+    def __init__(
+        self,
+        *,
+        action: AttachSplatSimLidarAction,
+        pointcloud_pub: PointCloud2Publisher | None,
+    ) -> None:
+        self.action = action
+        self.pointcloud_pub = pointcloud_pub
 
 
 def _carla_timestamp_to_ros(ts: carla.Timestamp) -> Time:

@@ -36,6 +36,8 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --dev
+        env:
+          BUILD_NO_CUDA: "1"
 
       - name: Run pre-commit
         uses: pre-commit/action@v3.0.1

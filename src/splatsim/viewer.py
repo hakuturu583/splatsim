@@ -19,7 +19,58 @@ from splatsim.renderer import Renderer
 if TYPE_CHECKING:
     from splatsim.cyclonedds.camera_info_publisher import CameraInfoPublisher
     from splatsim.cyclonedds.image_publisher import ImagePublisher
+    from splatsim.lidar_renderer import LidarRenderer
     from splatsim.scene import Scene
+
+
+# When a LiDAR panorama is shown instead of a camera image, the window is
+# resized to something readable (panoramas are typically 2048 x 128 which is
+# too flat at native size). The aspect ratio is preserved on the horizontal
+# axis; the vertical axis is stretched by ``_LIDAR_ROW_SCALE`` so individual
+# scan rows remain visible.
+_LIDAR_DISPLAY_WIDTH: int = 1600
+_LIDAR_ROW_SCALE: int = 4
+
+
+def _turbo_like_colormap(t: np.ndarray) -> np.ndarray:
+    """Cheap jet/turbo-flavoured colormap: t in [0, 1] -> (H, W, 3) float in [0, 1]."""
+    r = np.clip(1.5 - np.abs(4.0 * t - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * t - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * t - 1.0), 0.0, 1.0)
+    return np.stack([r, g, b], axis=-1)
+
+
+def _lidar_panorama_to_rgb(
+    panorama: dict[str, torch.Tensor],
+    *,
+    min_range_m: float,
+    max_range_m: float,
+    alpha_threshold: float = 0.1,
+) -> np.ndarray:
+    """Colourise a LiDAR panorama for GUI display.
+
+    Distance is turbo-mapped (near = red, far = blue) and modulated by
+    per-pixel intensity so lit surfaces read as brighter. Invalid pixels
+    (low alpha or out-of-range) are rendered black.
+    """
+    distance = panorama["distance"].detach().cpu().numpy()
+    intensity = panorama["intensity"].detach().cpu().numpy()
+    alpha = panorama["alpha"].detach().cpu().numpy()
+
+    valid = (
+        (alpha > alpha_threshold)
+        & (distance >= min_range_m)
+        & (distance <= max_range_m)
+    )
+
+    range_norm = np.clip(
+        (distance - min_range_m) / max(max_range_m - min_range_m, 1e-6), 0.0, 1.0
+    )
+    rgb = _turbo_like_colormap(range_norm)
+    intensity_gain = 0.4 + 0.6 * np.clip(intensity, 0.0, 1.0)
+    rgb = rgb * intensity_gain[..., None]
+    rgb[~valid] = 0.0
+    return np.ascontiguousarray((rgb * 255.0 + 0.5).astype(np.uint8))
 
 
 class Viewer(QMainWindow):
@@ -37,6 +88,7 @@ class Viewer(QMainWindow):
         initial_yaw_deg: float | None = None,
         image_publisher: ImagePublisher | None = None,
         camera_info_publisher: CameraInfoPublisher | None = None,
+        lidar_renderer: LidarRenderer | None = None,
     ) -> None:
         # QApplication must exist before QMainWindow.__init__
         self._app = QApplication.instance() or QApplication(sys.argv)
@@ -47,6 +99,7 @@ class Viewer(QMainWindow):
         self.fov_y_deg = fov_y_deg
         self.move_speed = move_speed
         self.rotate_speed = rotate_speed
+        self.lidar_renderer = lidar_renderer
 
         # Camera state (RUB: +X=right, +Y=up, -Z=forward)
         if initial_position is not None:
@@ -69,8 +122,25 @@ class Viewer(QMainWindow):
         # Qt setup
         self._label = QLabel(self)
         self.setCentralWidget(self._label)
-        self.setFixedSize(renderer.width, renderer.height)
-        self.setWindowTitle("splatsim viewer")
+        if lidar_renderer is not None:
+            display_h = max(
+                1,
+                int(
+                    round(
+                        _LIDAR_DISPLAY_WIDTH
+                        * lidar_renderer.n_rows
+                        * _LIDAR_ROW_SCALE
+                        / lidar_renderer.n_columns
+                    )
+                ),
+            )
+            self.setFixedSize(_LIDAR_DISPLAY_WIDTH, display_h)
+            self.setWindowTitle(
+                f"splatsim viewer (LiDAR: {lidar_renderer.sensor_spec.name})"
+            )
+        else:
+            self.setFixedSize(renderer.width, renderer.height)
+            self.setWindowTitle("splatsim viewer")
 
         # FPS tracking
         self._last_tick_time: float = time.monotonic()
@@ -194,6 +264,56 @@ class Viewer(QMainWindow):
         if Qt.Key.Key_Right in self._keys_pressed:
             self._yaw += rot_speed
 
+    def _build_base_to_world(self) -> torch.Tensor:
+        """Build the 4x4 base_link->world transform for LiDAR rendering.
+
+        base_link convention: +X forward, +Y left, +Z up. World: +Z up, yaw
+        rotates around Z. At yaw=0 the camera looks along world -Y, so base
+        +X aligns with world -Y and base +Y aligns with world +X.
+        """
+        cos_y = math.cos(self._yaw)
+        sin_y = math.sin(self._yaw)
+        r_b2w = torch.tensor(
+            [
+                [sin_y, cos_y, 0.0],
+                [-cos_y, sin_y, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            device=self.renderer.device,
+            dtype=torch.float32,
+        )
+        base_to_world = torch.eye(4, device=self.renderer.device, dtype=torch.float32)
+        base_to_world[:3, :3] = r_b2w
+        base_to_world[:3, 3] = self._position
+        return base_to_world
+
+    def _render_camera_np(self) -> np.ndarray:
+        viewmat = self._build_viewmat()
+        with torch.no_grad():
+            image = self.renderer.render(viewmat, self._K, scene=self.scene)
+        image_np = (image.clamp(0.0, 1.0) * 255).byte().cpu().numpy()
+        image_np = np.ascontiguousarray(image_np)
+
+        if self._image_pub is not None:
+            bgr_np = np.ascontiguousarray(image_np[:, :, ::-1])
+            self._image_pub.publish(bgr_np)
+            if self._camera_info_pub is not None:
+                self._camera_info_pub.publish()
+
+        return image_np
+
+    def _render_lidar_np(self) -> np.ndarray:
+        assert self.lidar_renderer is not None
+        assert self.scene is not None
+        base_to_world = self._build_base_to_world()
+        with torch.no_grad():
+            panorama = self.lidar_renderer.render(base_to_world, scene=self.scene)
+        return _lidar_panorama_to_rgb(
+            panorama,
+            min_range_m=self.lidar_renderer.min_range_m,
+            max_range_m=self.lidar_renderer.max_range_m,
+        )
+
     def _tick(self) -> None:
         now = time.monotonic()
         dt = now - self._last_tick_time
@@ -203,26 +323,23 @@ class Viewer(QMainWindow):
             self._fps += self._fps_alpha * (instant_fps - self._fps)
 
         self._handle_input(self._dt)
-        viewmat = self._build_viewmat()
 
-        with torch.no_grad():
-            image = self.renderer.render(viewmat, self._K, scene=self.scene)
-
-        # float32 RGB [H, W, 3] -> uint8 RGB [H, W, 3]
-        image_np = (image.clamp(0.0, 1.0) * 255).byte().cpu().numpy()
-        image_np = np.ascontiguousarray(image_np)
-
-        # Publish to DDS
-        if self._image_pub is not None:
-            bgr_np = np.ascontiguousarray(image_np[:, :, ::-1])
-            self._image_pub.publish(bgr_np)
-            if self._camera_info_pub is not None:
-                self._camera_info_pub.publish()
+        if self.lidar_renderer is not None:
+            image_np = self._render_lidar_np()
+        else:
+            image_np = self._render_camera_np()
 
         # Qt display
         h, w, _ = image_np.shape
         qimg = QImage(image_np.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
+        if self.lidar_renderer is not None:
+            pixmap = pixmap.scaled(
+                self.width(),
+                self.height(),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
 
         # Draw HUD overlay
         painter = QPainter(pixmap)
@@ -242,6 +359,12 @@ class Viewer(QMainWindow):
         if self.scene is not None and self.scene.lod_manager is not None:
             status = "ON" if self.scene.lod_enabled else "OFF"
             lines.append(f"LOD: {status} (L to toggle)")
+        if self.lidar_renderer is not None:
+            spec = self.lidar_renderer.sensor_spec
+            lines.append(
+                f"LiDAR: {spec.name} ({spec.sensor_type or 'uniform'}, "
+                f"{self.lidar_renderer.n_rows}x{self.lidar_renderer.n_columns})"
+            )
         if self._image_pub is not None:
             lines.append("DDS: publishing")
         for i, line in enumerate(lines):
@@ -352,6 +475,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--lidar",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Render a LiDAR panorama for the named sensor from the scene "
+            "YAML's ``lidar_sensors`` list instead of the RGB camera. "
+            "Movement / rotation controls are unchanged."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="WARNING",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -375,6 +508,16 @@ def main() -> None:
 
     if args.mp4 and args.dds:
         raise SystemExit("Error: --mp4 and --dds cannot be combined")
+    if args.lidar is not None and not args.lidar:
+        raise SystemExit("Error: --lidar requires a sensor name; got an empty string")
+    if args.lidar is not None and args.mp4:
+        raise SystemExit("Error: --lidar and --mp4 cannot be combined")
+    if args.lidar is not None and args.dds:
+        raise SystemExit("Error: --lidar does not publish DDS topics yet; drop --dds")
+    if args.lidar is not None and not config.lidar_sensors:
+        raise SystemExit(
+            "Error: --lidar was set but the scene YAML has no lidar_sensors entries"
+        )
 
     image_pub = None
     camera_info_pub = None
@@ -455,6 +598,11 @@ def main() -> None:
         override_position=tuple(args.pos) if args.pos is not None else None,
         override_yaw_deg=args.yaw,
     )
+
+    lidar_renderer = None
+    if args.lidar is not None:
+        lidar_renderer = _build_lidar_renderer(config, args.lidar, device)
+
     viewer = Viewer(
         renderer,
         scene=scene,
@@ -465,8 +613,30 @@ def main() -> None:
         initial_yaw_deg=initial_yaw_deg,
         image_publisher=image_pub,
         camera_info_publisher=camera_info_pub,
+        lidar_renderer=lidar_renderer,
     )
     viewer.run()
+
+
+def _build_lidar_renderer(
+    config, lidar_name: str, device: torch.device
+) -> LidarRenderer:
+    from splatsim.lidar_renderer import LidarRenderer, build_lidar_sensors_from_config
+
+    lidar_cfg = next((s for s in config.lidar_sensors if s.name == lidar_name), None)
+    if lidar_cfg is None:
+        available = ", ".join(sorted(s.name for s in config.lidar_sensors)) or "<none>"
+        raise SystemExit(
+            f"Error: LiDAR sensor '{lidar_name}' not found in scene. "
+            f"Available sensors: {available}"
+        )
+    specs = build_lidar_sensors_from_config([lidar_cfg])
+    return LidarRenderer(
+        specs[0],
+        device=device,
+        min_range_m=lidar_cfg.min_range_m,
+        max_range_m=lidar_cfg.max_range_m,
+    )
 
 
 if __name__ == "__main__":
