@@ -25,7 +25,7 @@ WORKDIR /workspace/splatsim
 # gsplat is pinned to a git rev and compiles CUDA kernels during `uv sync`;
 # TORCH_CUDA_ARCH_LIST must be set before the first sync or the build fails
 # with an IndexError from torch's _get_cuda_arch_flags.
-ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
+ARG TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 ENV TORCH_EXTENSIONS_DIR=/workspace/splatsim/.torch_extensions
 
