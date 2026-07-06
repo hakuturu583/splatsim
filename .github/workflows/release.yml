@@ -62,7 +62,7 @@ jobs:
         id: bump
         run: |
           set -euo pipefail
-          uv version --bump "${{ steps.pr.outputs.bump }}"
+          uv version --bump "${{ steps.pr.outputs.bump }}" --no-sync
           next=$(uv version --short)
           echo "next=${next}" >> "$GITHUB_OUTPUT"
           echo "tag=v${next}" >> "$GITHUB_OUTPUT"
