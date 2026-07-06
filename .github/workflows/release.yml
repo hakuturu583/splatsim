@@ -62,8 +62,31 @@ jobs:
         id: bump
         run: |
           set -euo pipefail
-          uv version --bump "${{ steps.pr.outputs.bump }}" --no-sync
-          next=$(uv version --short)
+          uv version --bump "${{ steps.pr.outputs.bump }}" --frozen
+          next=$(
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          pyproject = Path("pyproject.toml").read_text()
+          project = re.search(r'(?ms)^\[project\]\n(.*?)(?=^\[|\Z)', pyproject)
+          if project is None:
+              raise SystemExit("failed to find [project] in pyproject.toml")
+          version_match = re.search(r'(?m)^version = "([^"]+)"', project.group(1))
+          if version_match is None:
+              raise SystemExit("failed to find project version in pyproject.toml")
+          version = version_match.group(1)
+
+          lock_path = Path("uv.lock")
+          lock = lock_path.read_text()
+          pattern = re.compile(r'(?m)(\[\[package\]\]\nname = "splatsim"\nversion = )"[^"]+"')
+          lock, count = pattern.subn(lambda match: f'{match.group(1)}"{version}"', lock, count=1)
+          if count != 1:
+              raise SystemExit("failed to update splatsim version in uv.lock")
+          lock_path.write_text(lock)
+          print(version)
+          PY
+          )
           echo "next=${next}" >> "$GITHUB_OUTPUT"
           echo "tag=v${next}" >> "$GITHUB_OUTPUT"
           echo "Bumped to ${next} (${{ steps.pr.outputs.bump }})"
