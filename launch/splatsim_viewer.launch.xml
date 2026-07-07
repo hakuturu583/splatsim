@@ -10,9 +10,15 @@
   <arg name="lidar_name" default=""
        description="Name of the LiDAR sensor (from scene YAML lidar_sensors) to render when use_lidar is true."/>
 
-  <node pkg="splatsim" exec="splatsim-viewer" name="splatsim_viewer" output="screen"
-        args="$(var scene_yaml) --lidar $(var lidar_name)"
-        if="$(var use_lidar)"/>
+  <group if="$(var use_lidar)">
+    <node pkg="splatsim" exec="splatsim-viewer" name="splatsim_viewer" output="screen"
+          args="$(var scene_yaml) --lidar $(var lidar_name) --dds"
+          if="$(var dds)"/>
+
+    <node pkg="splatsim" exec="splatsim-viewer" name="splatsim_viewer" output="screen"
+          args="$(var scene_yaml) --lidar $(var lidar_name)"
+          unless="$(var dds)"/>
+  </group>
 
   <group unless="$(var use_lidar)">
     <node pkg="splatsim" exec="splatsim-viewer" name="splatsim_viewer" output="screen"

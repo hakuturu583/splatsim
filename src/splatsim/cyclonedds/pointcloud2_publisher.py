@@ -67,32 +67,48 @@ class PointCloud2Publisher:
             intensity: (N,) float32 in [0, 1].
             stamp: Optional ROS 2 timestamp. Defaults to wall-clock now.
         """
-        if xyz.ndim != 2 or xyz.shape[1] != 3:
-            raise ValueError(f"xyz must be (N, 3); got shape {xyz.shape}")
-        if intensity.ndim != 1 or intensity.shape[0] != xyz.shape[0]:
-            raise ValueError(
-                f"intensity must be (N,) matching xyz rows; got {intensity.shape} vs {xyz.shape}",
-            )
         stamp = stamp if stamp is not None else _now()
-
-        n = xyz.shape[0]
-        # Pack into a contiguous (N, 4) float32 buffer: [x, y, z, intensity].
-        packed = np.empty((n, 4), dtype=np.float32)
-        packed[:, :3] = xyz.astype(np.float32, copy=False)
-        packed[:, 3] = intensity.astype(np.float32, copy=False)
-
-        msg = PointCloud2(
-            header=Header(stamp=stamp, frame_id=self._frame_id),
-            height=1,
-            width=n,
-            fields=list(_FIELDS),
-            is_bigendian=False,
-            point_step=_POINT_STEP,
-            row_step=_POINT_STEP * n,
-            data=packed.tobytes(),
-            is_dense=True,
+        msg = _make_pointcloud2_message(
+            xyz,
+            intensity,
+            stamp=stamp,
+            frame_id=self._frame_id,
         )
         self._writer.write(msg)
+
+
+def _make_pointcloud2_message(
+    xyz: NDArray[np.float32],
+    intensity: NDArray[np.float32],
+    *,
+    stamp: Time,
+    frame_id: str,
+) -> PointCloud2:
+    """Build the packed ``sensor_msgs/PointCloud2`` message."""
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must be (N, 3); got shape {xyz.shape}")
+    if intensity.ndim != 1 or intensity.shape[0] != xyz.shape[0]:
+        raise ValueError(
+            f"intensity must be (N,) matching xyz rows; got {intensity.shape} vs {xyz.shape}",
+        )
+
+    n = xyz.shape[0]
+    # Pack into a contiguous (N, 4) float32 buffer: [x, y, z, intensity].
+    packed = np.empty((n, 4), dtype=np.float32)
+    packed[:, :3] = xyz.astype(np.float32, copy=False)
+    packed[:, 3] = intensity.astype(np.float32, copy=False)
+
+    return PointCloud2(
+        header=Header(stamp=stamp, frame_id=frame_id),
+        height=1,
+        width=n,
+        fields=list(_FIELDS),
+        is_bigendian=False,
+        point_step=_POINT_STEP,
+        row_step=_POINT_STEP * n,
+        data=packed.tobytes(),
+        is_dense=True,
+    )
 
 
 def _to_dds_topic(ros_topic: str) -> str:

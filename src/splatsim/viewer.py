@@ -19,6 +19,8 @@ from splatsim.renderer import Renderer
 if TYPE_CHECKING:
     from splatsim.cyclonedds.camera_info_publisher import CameraInfoPublisher
     from splatsim.cyclonedds.image_publisher import ImagePublisher
+    from splatsim.cyclonedds.pointcloud2_publisher import PointCloud2Publisher
+    from splatsim.dataclass import LidarConfig
     from splatsim.lidar_renderer import LidarRenderer
     from splatsim.scene import Scene
 
@@ -89,6 +91,9 @@ class Viewer(QMainWindow):
         image_publisher: ImagePublisher | None = None,
         camera_info_publisher: CameraInfoPublisher | None = None,
         lidar_renderer: LidarRenderer | None = None,
+        pointcloud_publisher: PointCloud2Publisher | None = None,
+        lidar_drop_threshold: float = 0.5,
+        lidar_alpha_threshold: float = 0.1,
     ) -> None:
         # QApplication must exist before QMainWindow.__init__
         self._app = QApplication.instance() or QApplication(sys.argv)
@@ -153,6 +158,9 @@ class Viewer(QMainWindow):
         # DDS publishers (optional)
         self._image_pub = image_publisher
         self._camera_info_pub = camera_info_publisher
+        self._pointcloud_pub = pointcloud_publisher
+        self._lidar_drop_threshold = lidar_drop_threshold
+        self._lidar_alpha_threshold = lidar_alpha_threshold
 
         # Render timer (~30 FPS)
         self._timer = QTimer(self)
@@ -308,10 +316,21 @@ class Viewer(QMainWindow):
         base_to_world = self._build_base_to_world()
         with torch.no_grad():
             panorama = self.lidar_renderer.render(base_to_world, scene=self.scene)
+            if self._pointcloud_pub is not None:
+                point_cloud = self.lidar_renderer.panorama_to_point_cloud(
+                    panorama,
+                    drop_threshold=self._lidar_drop_threshold,
+                    alpha_threshold=self._lidar_alpha_threshold,
+                )
+                self._pointcloud_pub.publish(
+                    point_cloud["xyz"],
+                    point_cloud["intensity"],
+                )
         return _lidar_panorama_to_rgb(
             panorama,
             min_range_m=self.lidar_renderer.min_range_m,
             max_range_m=self.lidar_renderer.max_range_m,
+            alpha_threshold=self._lidar_alpha_threshold,
         )
 
     def _tick(self) -> None:
@@ -365,7 +384,7 @@ class Viewer(QMainWindow):
                 f"LiDAR: {spec.name} ({spec.sensor_type or 'uniform'}, "
                 f"{self.lidar_renderer.n_rows}x{self.lidar_renderer.n_columns})"
             )
-        if self._image_pub is not None:
+        if self._image_pub is not None or self._pointcloud_pub is not None:
             lines.append("DDS: publishing")
         for i, line in enumerate(lines):
             painter.drawText(10, 20 + i * 18, line)
@@ -512,18 +531,14 @@ def main() -> None:
         raise SystemExit("Error: --lidar requires a sensor name; got an empty string")
     if args.lidar is not None and args.mp4:
         raise SystemExit("Error: --lidar and --mp4 cannot be combined")
-    if args.lidar is not None and args.dds:
-        raise SystemExit("Error: --lidar does not publish DDS topics yet; drop --dds")
-    if args.lidar is not None and not config.lidar_sensors:
-        raise SystemExit(
-            "Error: --lidar was set but the scene YAML has no lidar_sensors entries"
-        )
+    lidar_cfg = (
+        _find_lidar_config(config, args.lidar) if args.lidar is not None else None
+    )
 
     image_pub = None
     camera_info_pub = None
+    pointcloud_pub = None
     if args.dds:
-        import types
-
         try:
             from cyclonedds.domain import DomainParticipant
         except ImportError:
@@ -532,31 +547,45 @@ def main() -> None:
                 "Install with: pip install splatsim[dds]"
             ) from None
 
-        from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
-
         dp = DomainParticipant()
-        image_pub = ImagePublisher(
-            dp,
-            topic_name=args.topic_image,
-            frame_id=args.frame_id,
-            compress_format=args.compress_format,
-        )
+        if lidar_cfg is None:
+            import types
 
-        # Build a config-like object with the same intrinsics the Viewer uses.
-        rc, vc = config.renderer, config.viewer
-        fov_y = math.radians(vc.fov_y_deg)
-        fy = rc.height / (2.0 * math.tan(fov_y / 2.0))
-        cam_cfg = types.SimpleNamespace(
-            fx=fy,
-            fy=fy,
-            cx=rc.width / 2.0,
-            cy=rc.height / 2.0,
-            image_width=rc.width,
-            image_height=rc.height,
-        )
-        camera_info_pub = CameraInfoPublisher(
-            dp, cam_cfg, topic_name=args.topic_camera_info, frame_id=args.frame_id
-        )
+            from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
+
+            image_pub = ImagePublisher(
+                dp,
+                topic_name=args.topic_image,
+                frame_id=args.frame_id,
+                compress_format=args.compress_format,
+            )
+
+            # Build a config-like object with the same intrinsics the Viewer uses.
+            rc, vc = config.renderer, config.viewer
+            fov_y = math.radians(vc.fov_y_deg)
+            fy = rc.height / (2.0 * math.tan(fov_y / 2.0))
+            cam_cfg = types.SimpleNamespace(
+                fx=fy,
+                fy=fy,
+                cx=rc.width / 2.0,
+                cy=rc.height / 2.0,
+                image_width=rc.width,
+                image_height=rc.height,
+            )
+            camera_info_pub = CameraInfoPublisher(
+                dp,
+                cam_cfg,
+                topic_name=args.topic_camera_info,
+                frame_id=args.frame_id,
+            )
+        else:
+            from splatsim.cyclonedds import PointCloud2Publisher
+
+            pointcloud_pub = PointCloud2Publisher(
+                dp,
+                topic_name=lidar_cfg.pointcloud_topic,
+                frame_id=lidar_cfg.frame_id,
+            )
 
     from splatsim.scene import Scene, print_progress
 
@@ -600,8 +629,8 @@ def main() -> None:
     )
 
     lidar_renderer = None
-    if args.lidar is not None:
-        lidar_renderer = _build_lidar_renderer(config, args.lidar, device)
+    if lidar_cfg is not None:
+        lidar_renderer = _build_lidar_renderer(lidar_cfg, device)
 
     viewer = Viewer(
         renderer,
@@ -614,15 +643,16 @@ def main() -> None:
         image_publisher=image_pub,
         camera_info_publisher=camera_info_pub,
         lidar_renderer=lidar_renderer,
+        pointcloud_publisher=pointcloud_pub,
+        lidar_drop_threshold=lidar_cfg.drop_threshold if lidar_cfg is not None else 0.5,
+        lidar_alpha_threshold=(
+            lidar_cfg.alpha_threshold if lidar_cfg is not None else 0.1
+        ),
     )
     viewer.run()
 
 
-def _build_lidar_renderer(
-    config, lidar_name: str, device: torch.device
-) -> LidarRenderer:
-    from splatsim.lidar_renderer import LidarRenderer, build_lidar_sensors_from_config
-
+def _find_lidar_config(config, lidar_name: str) -> LidarConfig:
     lidar_cfg = next((s for s in config.lidar_sensors if s.name == lidar_name), None)
     if lidar_cfg is None:
         available = ", ".join(sorted(s.name for s in config.lidar_sensors)) or "<none>"
@@ -630,6 +660,14 @@ def _build_lidar_renderer(
             f"Error: LiDAR sensor '{lidar_name}' not found in scene. "
             f"Available sensors: {available}"
         )
+    return lidar_cfg
+
+
+def _build_lidar_renderer(
+    lidar_cfg: LidarConfig, device: torch.device
+) -> LidarRenderer:
+    from splatsim.lidar_renderer import LidarRenderer, build_lidar_sensors_from_config
+
     specs = build_lidar_sensors_from_config([lidar_cfg])
     return LidarRenderer(
         specs[0],
