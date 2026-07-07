@@ -15,6 +15,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QImage, QKeyEvent, QPainter, QPixmap
 from PyQt5.QtWidgets import QApplication, QLabel, QMainWindow
 
+from splatsim.cyclonedds.msg_types import Time
 from splatsim.renderer import Renderer
 
 if TYPE_CHECKING:
@@ -24,6 +25,16 @@ if TYPE_CHECKING:
     from splatsim.dataclass import LidarConfig
     from splatsim.lidar_renderer import LidarRenderer
     from splatsim.scene import Scene
+
+
+def _wall_clock_stamp() -> Time:
+    """Wall-clock timestamp for the standalone viewer.
+
+    Callers running under a sim clock (e.g. CARLA co-sim) must build their
+    own ``Time`` from the sim time source instead of calling this.
+    """
+    sec, nanosec = divmod(time.time_ns(), 10**9)
+    return Time(sec=sec, nanosec=nanosec)
 
 
 # When a LiDAR panorama is shown instead of a camera image, the window is
@@ -304,10 +315,11 @@ class Viewer(QMainWindow):
         image_np = np.ascontiguousarray(image_np)
 
         if self._image_pub is not None:
+            stamp = _wall_clock_stamp()
             bgr_np = np.ascontiguousarray(image_np[:, :, ::-1])
-            self._image_pub.publish(bgr_np)
+            self._image_pub.publish(bgr_np, stamp=stamp)
             if self._camera_info_pub is not None:
-                self._camera_info_pub.publish()
+                self._camera_info_pub.publish(stamp=stamp)
 
         return image_np
 
@@ -326,6 +338,7 @@ class Viewer(QMainWindow):
                 self._pointcloud_pub.publish(
                     point_cloud["xyz"],
                     point_cloud["intensity"],
+                    stamp=_wall_clock_stamp(),
                 )
         return _lidar_panorama_to_rgb(
             panorama,

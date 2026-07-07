@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 from cyclonedds.pub import DataWriter
 from cyclonedds.topic import Topic
 from numpy.typing import NDArray
 
-from splatsim.cyclonedds._util import _now, _to_dds_topic
+from splatsim.cyclonedds._util import to_dds_topic
 from splatsim.cyclonedds.msg_types import (
     Header,
     PointCloud2,
@@ -59,7 +59,7 @@ class PointCloud2Publisher:
         frame_id: str = "splatsim_lidar",
     ) -> None:
         self._frame_id = frame_id
-        topic = Topic(participant, _to_dds_topic(topic_name), PointCloud2)
+        topic = Topic(participant, to_dds_topic(topic_name), PointCloud2)
         self._writer = DataWriter(participant, topic)
 
     def publish(
@@ -67,16 +67,17 @@ class PointCloud2Publisher:
         xyz: NDArray[np.float32],
         intensity: NDArray[np.float32],
         *,
-        stamp: Optional[Time] = None,
+        stamp: Time,
     ) -> None:
         """Publish one point cloud frame.
 
         Args:
             xyz: (N, 3) float32 coordinates in the sensor frame.
             intensity: (N,) float32 in [0, 1].
-            stamp: Optional ROS 2 timestamp. Defaults to wall-clock now.
+            stamp: ROS 2 timestamp for the frame; callers must supply the clock
+                that matches the rest of the graph (sim time under CARLA co-sim,
+                wall clock only for standalone dev viewers).
         """
-        stamp = stamp if stamp is not None else _now()
         msg = _make_pointcloud2_message(
             xyz,
             intensity,

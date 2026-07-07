@@ -9,7 +9,7 @@ from cyclonedds.pub import DataWriter
 from cyclonedds.topic import Topic
 from numpy.typing import NDArray
 
-from splatsim.cyclonedds._util import _now, _to_dds_topic
+from splatsim.cyclonedds._util import to_dds_topic
 from splatsim.cyclonedds.msg_types import CompressedImage, Header, Image, Time
 
 if TYPE_CHECKING:
@@ -56,15 +56,15 @@ class ImagePublisher:
             self._cv2 = cv2
             if not topic_name.endswith("/compressed"):
                 topic_name = topic_name.rstrip("/") + "/compressed"
-            topic = Topic(participant, _to_dds_topic(topic_name), CompressedImage)
+            topic = Topic(participant, to_dds_topic(topic_name), CompressedImage)
         else:
-            topic = Topic(participant, _to_dds_topic(topic_name), Image)
+            topic = Topic(participant, to_dds_topic(topic_name), Image)
         self._writer = DataWriter(participant, topic)
 
     def publish(
         self,
         image: Optional[NDArray[np.uint8]],
-        stamp: Optional[Time] = None,
+        stamp: Time,
     ) -> None:
         """Publish a single image frame.
 
@@ -73,14 +73,12 @@ class ImagePublisher:
         image:
             ``H x W x 3`` BGR ``uint8`` array, or *None* to skip.
         stamp:
-            Timestamp for the message header.  When *None*, the current
-            wall-clock time is used.
+            Timestamp for the message header. Callers must supply the clock
+            that matches the rest of the graph (sim time under CARLA co-sim,
+            wall clock only for standalone dev viewers).
         """
         if image is None:
             return
-
-        if stamp is None:
-            stamp = _now()
 
         if self._compress_format:
             self._publish_compressed(image, stamp)

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from cyclonedds.pub import DataWriter
 from cyclonedds.topic import Topic
 
-from splatsim.cyclonedds._util import _now, _to_dds_topic
+from splatsim.cyclonedds._util import to_dds_topic
 from splatsim.cyclonedds.msg_types import CameraInfo, Header, RegionOfInterest, Time
 
 if TYPE_CHECKING:
@@ -59,7 +59,7 @@ class CameraInfoPublisher:
     ) -> None:
         self._frame_id = frame_id
 
-        topic = Topic(participant, _to_dds_topic(topic_name), CameraInfo)
+        topic = Topic(participant, to_dds_topic(topic_name), CameraInfo)
         self._writer = DataWriter(participant, topic)
 
         # Precompute static intrinsic fields from config.
@@ -119,18 +119,16 @@ class CameraInfoPublisher:
             do_rectify=False,
         )
 
-    def publish(self, stamp: Optional[Time] = None) -> None:
+    def publish(self, stamp: Time) -> None:
         """Publish a ``CameraInfo`` message.
 
         Parameters
         ----------
         stamp:
-            Timestamp for the message header.  When *None*, the current
-            wall-clock time is used.
+            Timestamp for the message header. Callers must supply the clock
+            that matches the rest of the graph (sim time under CARLA co-sim,
+            wall clock only for standalone dev viewers).
         """
-        if stamp is None:
-            stamp = _now()
-
         msg = CameraInfo(
             header=Header(stamp=stamp, frame_id=self._frame_id),
             height=self._height,
