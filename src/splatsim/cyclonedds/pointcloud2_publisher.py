@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -10,6 +9,7 @@ from cyclonedds.pub import DataWriter
 from cyclonedds.topic import Topic
 from numpy.typing import NDArray
 
+from splatsim.cyclonedds._util import _now, _to_dds_topic
 from splatsim.cyclonedds.msg_types import (
     Header,
     PointCloud2,
@@ -24,13 +24,22 @@ if TYPE_CHECKING:
 # sensor_msgs/PointField datatype constants.
 _PF_FLOAT32 = 7
 
-# Point layout: contiguous packed x, y, z, intensity (all float32) = 16 bytes.
-_POINT_STEP = 16
-_FIELDS: tuple[PointField, ...] = (
+# Byte size of each PointField datatype code we support. Extend this map when
+# adding non-float32 fields to _POINT_FIELDS.
+_DTYPE_SIZE: dict[int, int] = {_PF_FLOAT32: 4}
+
+# Point layout: contiguous packed x, y, z, intensity (all float32).
+_POINT_FIELDS: tuple[PointField, ...] = (
     PointField(name="x", offset=0, datatype=_PF_FLOAT32, count=1),
     PointField(name="y", offset=4, datatype=_PF_FLOAT32, count=1),
     PointField(name="z", offset=8, datatype=_PF_FLOAT32, count=1),
     PointField(name="intensity", offset=12, datatype=_PF_FLOAT32, count=1),
+)
+
+# Derive point_step from the field layout so extending _POINT_FIELDS stays
+# consistent without editing a magic number.
+_POINT_STEP: int = max(
+    f.offset + _DTYPE_SIZE[f.datatype] * f.count for f in _POINT_FIELDS
 )
 
 
@@ -102,19 +111,12 @@ def _make_pointcloud2_message(
         header=Header(stamp=stamp, frame_id=frame_id),
         height=1,
         width=n,
-        fields=list(_FIELDS),
+        fields=list(_POINT_FIELDS),
         is_bigendian=False,
         point_step=_POINT_STEP,
         row_step=_POINT_STEP * n,
         data=packed.tobytes(),
-        is_dense=True,
+        # This builder does not scan for NaN/Inf, so we cannot honestly claim
+        # density. Consumers must handle invalid returns.
+        is_dense=False,
     )
-
-
-def _to_dds_topic(ros_topic: str) -> str:
-    return "rt/" + ros_topic.lstrip("/")
-
-
-def _now() -> Time:
-    sec, nanosec = divmod(time.time_ns(), 10**9)
-    return Time(sec=sec, nanosec=nanosec)

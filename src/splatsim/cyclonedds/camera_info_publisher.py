@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, Optional, Protocol
 
 from cyclonedds.pub import DataWriter
 from cyclonedds.topic import Topic
 
+from splatsim.cyclonedds._util import _now, _to_dds_topic
 from splatsim.cyclonedds.msg_types import CameraInfo, Header, RegionOfInterest, Time
 
 if TYPE_CHECKING:
@@ -145,14 +145,3 @@ class CameraInfoPublisher:
             roi=self._roi,
         )
         self._writer.write(msg)
-
-
-def _to_dds_topic(ros_topic: str) -> str:
-    """Convert a ROS 2 topic name to the DDS wire name (``rt/`` prefix)."""
-    return "rt/" + ros_topic.lstrip("/")
-
-
-def _now() -> Time:
-    """Return the current wall-clock time as a ROS 2 ``Time``."""
-    sec, nanosec = divmod(time.time_ns(), 10**9)
-    return Time(sec=sec, nanosec=nanosec)

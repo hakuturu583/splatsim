@@ -4,6 +4,7 @@ import argparse
 import math
 import sys
 import time
+import types
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -549,8 +550,6 @@ def main() -> None:
 
         dp = DomainParticipant()
         if lidar_cfg is None:
-            import types
-
             from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
 
             image_pub = ImagePublisher(
