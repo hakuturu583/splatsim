@@ -211,6 +211,9 @@ class SceneConfig:
                     frame_id=lidar.get("frame_id", "splatsim_lidar"),
                     drop_threshold=lidar.get("drop_threshold", 0.5),
                     alpha_threshold=lidar.get("alpha_threshold", 0.1),
+                    communication=lidar.get("communication", "dds"),
+                    hils_host=lidar.get("hils_host", "127.0.0.1"),
+                    hils_port=lidar.get("hils_port", 2368),
                 )
             )
 

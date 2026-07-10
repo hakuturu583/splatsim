@@ -731,6 +731,52 @@ class LidarRenderer:
             "intensity": intensity_valid.detach().cpu().numpy().astype(np.float32),
         }
 
+    def panorama_to_range_image(
+        self,
+        panorama: dict[str, torch.Tensor],
+        *,
+        drop_threshold: float = 0.5,
+        alpha_threshold: float = 0.1,
+    ) -> dict[str, np.ndarray]:
+        """Convert a rendered panorama into a dense structured range image.
+
+        Unlike :meth:`panorama_to_point_cloud` (which drops invalid cells and
+        returns a sparse cloud), this keeps the full ``(H, W)`` grid so it can
+        be encoded directly into per-channel / per-azimuth LiDAR packets. The
+        same validity gate is applied, exposed as a boolean mask; invalid
+        cells keep their raw distance but should be treated as "no return".
+
+        Args:
+            panorama: Output of :meth:`render`.
+            drop_threshold: sigmoid(raydrop_logit) above this drops the sample.
+            alpha_threshold: Minimum alpha coverage to keep a sample.
+
+        Returns:
+            ``{"distance", "intensity", "valid", "azimuths", "elevations"}``.
+            ``distance`` / ``intensity`` / ``valid`` are ``(H, W)`` arrays
+            (``float32`` / ``float32`` / ``bool``); ``azimuths`` is ``(W,)``
+            and ``elevations`` is ``(H,)`` in radians (both ``float32``).
+        """
+        distance = panorama["distance"]
+        intensity = panorama["intensity"]
+        alpha = panorama["alpha"]
+        raydrop = torch.sigmoid(panorama["raydrop_logit"])
+
+        valid = (
+            (alpha > alpha_threshold)
+            & (raydrop < drop_threshold)
+            & (distance > self.min_range_m)
+            & (distance < self.max_range_m)
+        )
+
+        return {
+            "distance": distance.detach().cpu().numpy().astype(np.float32),
+            "intensity": intensity.detach().cpu().numpy().astype(np.float32),
+            "valid": valid.detach().cpu().numpy().astype(bool),
+            "azimuths": self._azimuths.detach().cpu().numpy().astype(np.float32),
+            "elevations": self._elevs.detach().cpu().numpy().astype(np.float32),
+        }
+
 
 __all__ = [
     "DEFAULT_RAYDROP_LOGIT",

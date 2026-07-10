@@ -21,3 +21,12 @@ class LidarConfig:
     frame_id: str = "splatsim_lidar"
     drop_threshold: float = 0.5
     alpha_threshold: float = 0.1
+    # Transport for the rendered LiDAR data.
+    #   "dds"  -> publish a sensor_msgs/PointCloud2 over CycloneDDS (default).
+    #   "hils" -> emit raw Hesai UDP data packets that mimic the physical
+    #             sensor (hardware-in-the-loop simulation). ``sensor_type``
+    #             selects the wire format (OT128 / XT32).
+    communication: str = "dds"
+    # HILS UDP destination (only used when ``communication == "hils"``).
+    hils_host: str = "127.0.0.1"
+    hils_port: int = 2368

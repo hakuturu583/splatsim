@@ -37,6 +37,8 @@ from splatsim.scene import Scene
 if TYPE_CHECKING:
     from cyclonedds.domain import DomainParticipant
 
+    from splatsim.hils import HesaiHilsPublisher
+
     from autoware_carla_scenario.actions import TickTiming
     from autoware_carla_scenario.conditions.base import BaseCondition
     from autoware_carla_scenario.coordinate import (
@@ -343,8 +345,27 @@ class SplatSimScenario(BaseScenario):
         )
         self.register_post_tick(action)
 
+        # Choose the transport per sensor: "hils" streams raw Hesai UDP
+        # packets that mimic the physical sensor; "dds" (default) publishes a
+        # decoded PointCloud2 over CycloneDDS.
         pointcloud_pub: PointCloud2Publisher | None = None
-        if dds_participant is not None:
+        hils_pub: "HesaiHilsPublisher | None" = None
+        if config.communication == "hils":
+            from splatsim.hils import HesaiHilsPublisher  # noqa: PLC0415
+
+            hils_pub = HesaiHilsPublisher(
+                config.sensor_type,
+                host=config.hils_host,
+                port=config.hils_port,
+            )
+            logger.info(
+                "LiDAR %s: HILS transport -> %s UDP packets to %s:%d",
+                config.name,
+                config.sensor_type,
+                config.hils_host,
+                config.hils_port,
+            )
+        elif dds_participant is not None:
             pointcloud_pub = PointCloud2Publisher(
                 dds_participant,
                 topic_name=pointcloud_topic,
@@ -355,6 +376,8 @@ class SplatSimScenario(BaseScenario):
             _LidarEntry(
                 action=action,
                 pointcloud_pub=pointcloud_pub,
+                hils_pub=hils_pub,
+                spin_hz=config.fps,
             )
         )
         return action
@@ -404,6 +427,21 @@ class SplatSimScenario(BaseScenario):
             if sensor is None:
                 continue
             assert isinstance(sensor, SplatSimLidarSensor)  # noqa: S101
+
+            if entry.hils_pub is not None:
+                # HILS: emit raw Hesai UDP packets from the dense range image.
+                range_image = sensor.get_range_image()
+                if range_image is None:
+                    continue
+                entry.hils_pub.publish(
+                    distance_m=range_image["distance"],
+                    intensity=range_image["intensity"],
+                    valid=range_image["valid"],
+                    azimuth_rad=range_image["azimuths"],
+                    spin_hz=entry.spin_hz,
+                    epoch_s=stamp.sec + stamp.nanosec * 1e-9,
+                )
+                continue
 
             point_cloud = sensor.get_point_cloud()
             if point_cloud is None or entry.pointcloud_pub is None:
@@ -480,18 +518,26 @@ class _CameraEntry:
 
 
 class _LidarEntry:
-    """Bookkeeping for one attached SplatSim LiDAR + its publisher."""
+    """Bookkeeping for one attached SplatSim LiDAR + its publisher.
 
-    __slots__ = ("action", "pointcloud_pub")
+    Exactly one of ``pointcloud_pub`` (DDS) / ``hils_pub`` (raw Hesai UDP)
+    is set, selected by the sensor's ``communication`` mode.
+    """
+
+    __slots__ = ("action", "hils_pub", "pointcloud_pub", "spin_hz")
 
     def __init__(
         self,
         *,
         action: AttachSplatSimLidarAction,
         pointcloud_pub: PointCloud2Publisher | None,
+        hils_pub: "HesaiHilsPublisher | None" = None,
+        spin_hz: float = 10.0,
     ) -> None:
         self.action = action
         self.pointcloud_pub = pointcloud_pub
+        self.hils_pub = hils_pub
+        self.spin_hz = spin_hz
 
 
 def _carla_timestamp_to_ros(ts: carla.Timestamp) -> Time:

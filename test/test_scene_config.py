@@ -55,3 +55,33 @@ def test_scene_config_loads_lidar_sensors(tmp_path) -> None:
     assert specs[0].n_columns == 1024
     assert specs[0].n_rows_uniform == 128
     assert specs[0].s2b[2, 3] == 1.9
+    # Communication defaults to DDS when not specified.
+    assert lidar.communication == "dds"
+    assert lidar.hils_host == "127.0.0.1"
+    assert lidar.hils_port == 2368
+
+
+def test_scene_config_loads_hils_lidar(tmp_path) -> None:
+    scene_yaml = tmp_path / "scene.yaml"
+    scene_yaml.write_text(
+        dedent(
+            """
+            background_tileset: iteration_30000/tileset.json
+
+            lidar_sensors:
+              - name: top
+                sensor_type: XT32
+                n_rows: 32
+                communication: hils
+                hils_host: 192.168.1.201
+                hils_port: 2368
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = SceneConfig.from_yaml(scene_yaml)
+    lidar = cfg.lidar_sensors[0]
+    assert lidar.communication == "hils"
+    assert lidar.hils_host == "192.168.1.201"
+    assert lidar.hils_port == 2368

@@ -27,6 +27,9 @@ class SplatSimLidarSensorConfig(LidarSensorConfig):
     device: str = "cuda"
     drop_threshold: float = 0.5
     alpha_threshold: float = 0.1
+    communication: str = "dds"
+    hils_host: str = "127.0.0.1"
+    hils_port: int = 2368
 
     @classmethod
     def from_scene_config(cls, config: LidarConfig) -> SplatSimLidarSensorConfig:
@@ -47,6 +50,9 @@ class SplatSimLidarSensorConfig(LidarSensorConfig):
             yaw=config.rotation[2],
             drop_threshold=config.drop_threshold,
             alpha_threshold=config.alpha_threshold,
+            communication=config.communication,
+            hils_host=config.hils_host,
+            hils_port=config.hils_port,
         )
 
 
@@ -113,6 +119,27 @@ class SplatSimLidarSensor(LidarSensorBase):
         point_cloud[:, :3] = xyz
         point_cloud[:, 3] = intensity
         return point_cloud
+
+    def get_range_image(self) -> Optional[dict[str, NDArray]]:
+        """Render the latest scan as a dense structured range image.
+
+        Used by the HILS transport to build raw Hesai UDP packets. Returns
+        ``None`` if the sensor is not attached yet, otherwise the dict from
+        :meth:`LidarRenderer.panorama_to_range_image` with keys
+        ``distance`` / ``intensity`` / ``valid`` (``(H, W)``) and
+        ``azimuths`` (``(W,)``) / ``elevations`` (``(H,)``).
+        """
+        if self._actor is None:
+            return None
+
+        base_to_world = self._compute_base_to_world()
+        with torch.no_grad():
+            panorama = self._renderer.render(base_to_world, scene=self._scene)
+            return self._renderer.panorama_to_range_image(
+                panorama,
+                drop_threshold=self._splatsim_config.drop_threshold,
+                alpha_threshold=self._splatsim_config.alpha_threshold,
+            )
 
     def _compute_base_to_world(self) -> torch.Tensor:
         """Build base_link-to-tile-local transform for the attached CARLA actor."""
