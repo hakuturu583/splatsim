@@ -271,6 +271,27 @@ def main() -> None:
         f"+elev     (+radc + elev-FOV cull):        {dt_elev:8.2f} ms  ({dt_legacy / dt_elev:.2f}x)"
     )
 
+    # Head-to-head with the fused CUDA cull disabled, so the "+elev CUDA"
+    # improvement (vs the pytorch fallback) is visible independent of
+    # gsplat/panorama overhead.
+    from splatsim import lidar_renderer as _lr
+
+    _lr._USE_CUDA_CULL = False
+    try:
+        dt_default_py, _ = timed(render_default, iters=args.iters)
+        dt_elev_py, _ = timed(render_elev, iters=args.iters)
+    finally:
+        _lr._USE_CUDA_CULL = True
+    print("\nWithout fused CUDA cull (pytorch fallback):")
+    print(
+        f"  Default (pytorch cull):                 {dt_default_py:8.2f} ms"
+        f"  ({dt_default_py / dt_default:.2f}x vs CUDA)"
+    )
+    print(
+        f"  +elev   (pytorch cull):                 {dt_elev_py:8.2f} ms"
+        f"  ({dt_elev_py / dt_elev:.2f}x vs CUDA)"
+    )
+
     print("\nOutput sanity:")
     for label, d in (
         ("legacy", out_legacy),
