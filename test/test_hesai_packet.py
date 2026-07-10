@@ -14,6 +14,7 @@ from splatsim.hils.hesai_packet import (
     FACTORY_INFO,
     RETURN_MODE_STRONGEST,
     SOP,
+    build_frame_array,
     packet_size,
 )
 
@@ -204,6 +205,30 @@ def test_publisher_sends_over_udp() -> None:
     assert dec["timestamp_us"] == 500_000  # 0.5 s sub-second part
     pub.close()
     recv.close()
+
+
+@pytest.mark.parametrize("sensor_type", ["XT32", "OT128"])
+def test_frame_array_rows_match_packets(sensor_type: str) -> None:
+    """The vectorized byte grid is byte-identical to the list-of-bytes form."""
+    model = get_model(sensor_type)
+    n_az = model.blocks_per_packet * 4 + 1  # exercises the pad row
+    distance_m, intensity, valid, az = _make_frame(model, n_az)
+    kwargs = dict(
+        distance_m=distance_m,
+        intensity=intensity,
+        valid=valid,
+        azimuth_rad=az,
+        motor_speed_rpm=600,
+        timestamp_us=99,
+        date_time=(125, 7, 10, 1, 2, 3),
+        seq_start=3,
+    )
+    buf = build_frame_array(model, **kwargs)
+    packets = build_packets(model, **kwargs)
+    assert buf.shape == (len(packets), packet_size(model))
+    assert buf.dtype == np.uint8
+    for k, pkt in enumerate(packets):
+        assert buf[k].tobytes() == pkt
 
 
 def test_unsupported_sensor_raises() -> None:

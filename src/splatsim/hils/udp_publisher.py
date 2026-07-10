@@ -18,7 +18,7 @@ from numpy.typing import NDArray
 from splatsim.hils.hesai_packet import (
     RETURN_MODE_STRONGEST,
     HesaiModel,
-    build_packets,
+    build_frame_array,
     get_model,
 )
 
@@ -98,7 +98,7 @@ class HesaiHilsPublisher:
     def start_epoch_s(self) -> float:
         return self._start_epoch_s
 
-    def build(
+    def build_array(
         self,
         *,
         distance_m: NDArray[np.floating],
@@ -107,14 +107,15 @@ class HesaiHilsPublisher:
         azimuth_rad: NDArray[np.floating],
         spin_hz: float,
         sim_time_s: float = 0.0,
-    ) -> list[bytes]:
-        """Encode one range-image frame into packets (without sending).
+    ) -> NDArray[np.uint8]:
+        """Encode one frame into a ``(n_packets, packet_size)`` byte grid.
 
         ``sim_time_s`` is the simulation-internal elapsed time (seconds); the
-        packet date-time is ``start_epoch_s + sim_time_s``.
+        packet date-time is ``start_epoch_s + sim_time_s``. Each row is a
+        ready-to-send packet. Advances the UDP sequence counter.
         """
         date_time, micros = _utc_date_time(self._start_epoch_s + sim_time_s)
-        packets = build_packets(
+        buf = build_frame_array(
             self._model,
             distance_m=distance_m,
             intensity=intensity,
@@ -126,8 +127,31 @@ class HesaiHilsPublisher:
             return_mode=self._return_mode,
             seq_start=self._sequence,
         )
-        self._sequence = (self._sequence + len(packets)) & 0xFFFFFFFF
-        return packets
+        self._sequence = (self._sequence + buf.shape[0]) & 0xFFFFFFFF
+        return buf
+
+    def build(
+        self,
+        *,
+        distance_m: NDArray[np.floating],
+        intensity: NDArray[np.floating],
+        valid: NDArray[np.bool_],
+        azimuth_rad: NDArray[np.floating],
+        spin_hz: float,
+        sim_time_s: float = 0.0,
+    ) -> list[bytes]:
+        """Encode one range-image frame into packets (without sending)."""
+        return [
+            row.tobytes()
+            for row in self.build_array(
+                distance_m=distance_m,
+                intensity=intensity,
+                valid=valid,
+                azimuth_rad=azimuth_rad,
+                spin_hz=spin_hz,
+                sim_time_s=sim_time_s,
+            )
+        ]
 
     def publish(
         self,
@@ -141,9 +165,11 @@ class HesaiHilsPublisher:
     ) -> int:
         """Encode a range-image frame and send every packet over UDP.
 
-        Args mirror :meth:`build`. Returns the number of packets sent.
+        Sends each packet straight from its row in the encoded byte grid (via
+        the buffer protocol — no per-packet ``bytes`` copy). Returns the
+        number of packets sent.
         """
-        packets = self.build(
+        buf = self.build_array(
             distance_m=distance_m,
             intensity=intensity,
             valid=valid,
@@ -151,9 +177,11 @@ class HesaiHilsPublisher:
             spin_hz=spin_hz,
             sim_time_s=sim_time_s,
         )
-        for pkt in packets:
-            self._sock.sendto(pkt, self._addr)
-        return len(packets)
+        addr = self._addr
+        sendto = self._sock.sendto
+        for row in buf:
+            sendto(row, addr)
+        return buf.shape[0]
 
     def close(self) -> None:
         self._sock.close()

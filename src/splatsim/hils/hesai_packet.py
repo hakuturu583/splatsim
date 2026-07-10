@@ -143,9 +143,10 @@ def _encode_distance(
     Distances stay within float32 integer-exact range (max ~30000 units),
     so no float64 widening is needed.
     """
-    raw = np.clip(np.rint(range_m / distance_unit_m), 0, _UINT16_MAX)
-    out = raw.astype(np.uint16)
-    out[~valid] = 0
+    out = np.clip(np.rint(range_m / distance_unit_m), 0, _UINT16_MAX).astype(np.uint16)
+    # Zero the no-return cells with a multiply (bool viewed as 0/1) — an order
+    # of magnitude cheaper than boolean fancy-indexing ``out[~valid] = 0``.
+    out *= valid.view(np.uint8)
     return out
 
 
@@ -254,7 +255,7 @@ def _encode_body(
     return body
 
 
-def build_packets(
+def build_frame_array(
     model: HesaiModel,
     *,
     distance_m: NDArray[np.floating],  # (channels, n_azimuth)
@@ -266,26 +267,20 @@ def build_packets(
     date_time: tuple[int, int, int, int, int, int],
     return_mode: int = RETURN_MODE_STRONGEST,
     seq_start: int = 0,
-) -> list[bytes]:
-    """Encode a full range image into a list of UDP data packets.
+) -> NDArray[np.uint8]:
+    """Encode a full range image into a ``(n_packets, packet_size)`` byte grid.
 
     The range image is a ``(channels, n_azimuth)`` grid where column ``a`` is
     one firing at ``azimuth_rad[a]`` and row ``c`` is beam channel ``c``.
     Columns are grouped into packets of ``model.blocks_per_packet`` blocks.
 
-    Args:
-        distance_m: Per-cell range in metres.
-        intensity: Per-cell intensity in ``[0, 1]``.
-        valid: Per-cell return mask; ``False`` -> encoded as no-return (0).
-        azimuth_rad: Azimuth of each column (radians).
-        motor_speed_rpm: Spin rate written into the tail.
-        timestamp_us: Base microsecond timestamp for the frame (tail).
-        date_time: UTC ``(year-1900, month, day, hour, minute, second)``.
-        return_mode: Return-mode byte (default single strongest).
-        seq_start: First UDP sequence number (incremented per packet).
+    Fully vectorized: the header and tail are written once and broadcast across
+    every packet row; only the per-packet UDP sequence counter varies. The
+    returned array is C-contiguous, so each row is a ready-to-send packet
+    (``row.tobytes()`` or ``socket.sendto(row, ...)``) — no per-packet Python
+    assembly.
 
-    Returns:
-        A list of packet payloads (``bytes``), in azimuth order.
+    Args mirror :func:`build_packets`.
     """
     if distance_m.shape != intensity.shape or distance_m.shape != valid.shape:
         raise ValueError(
@@ -310,21 +305,76 @@ def build_packets(
     )
 
     body = _encode_body(model, az_u16, fine_u8, dist_u16, refl_u8)
-    header = _header(model)
     bpp = model.blocks_per_packet
-    packets: list[bytes] = []
-    for i, start in enumerate(range(0, body.shape[0], bpp)):
-        blocks = body[start : start + bpp].tobytes()
-        tail = _tail(
-            model,
-            motor_speed_rpm=motor_speed_rpm,
-            timestamp_us=timestamp_us,
-            return_mode=return_mode,
-            date_time=date_time,
-            udp_sequence=(seq_start + i) & 0xFFFFFFFF,
-        )
-        packets.append(header + blocks + tail)
-    return packets
+    body_bytes = bpp * model.block_size
+    n_packets = body.shape[0] // bpp
+    psize = model.packet_size
+    tail_off = _HEADER_SIZE + body_bytes
+
+    buf = np.empty((n_packets, psize), dtype=np.uint8)
+    buf[:, :_HEADER_SIZE] = np.frombuffer(_header(model), dtype=np.uint8)
+    buf[:, _HEADER_SIZE:tail_off] = body.reshape(n_packets, body_bytes)
+    tail = _tail(
+        model,
+        motor_speed_rpm=motor_speed_rpm,
+        timestamp_us=timestamp_us,
+        return_mode=return_mode,
+        date_time=date_time,
+        udp_sequence=0,
+    )
+    buf[:, tail_off:] = np.frombuffer(tail, dtype=np.uint8)
+    # Overwrite the per-packet UDP sequence (last 4 bytes, little-endian u32).
+    seqs = ((seq_start + np.arange(n_packets)) & 0xFFFFFFFF).astype("<u4")
+    buf[:, psize - 4 :] = seqs.view(np.uint8).reshape(n_packets, 4)
+    return buf
+
+
+def build_packets(
+    model: HesaiModel,
+    *,
+    distance_m: NDArray[np.floating],  # (channels, n_azimuth)
+    intensity: NDArray[np.floating],  # (channels, n_azimuth)
+    valid: NDArray[np.bool_],  # (channels, n_azimuth)
+    azimuth_rad: NDArray[np.floating],  # (n_azimuth,)
+    motor_speed_rpm: int,
+    timestamp_us: int,
+    date_time: tuple[int, int, int, int, int, int],
+    return_mode: int = RETURN_MODE_STRONGEST,
+    seq_start: int = 0,
+) -> list[bytes]:
+    """Encode a range image into a list of UDP packet payloads (``bytes``).
+
+    Thin ``bytes`` wrapper over :func:`build_frame_array` for callers that
+    want individual payloads (tests, non-socket use). The hot UDP path should
+    prefer :func:`build_frame_array` and send rows directly.
+
+    Args:
+        distance_m: Per-cell range in metres.
+        intensity: Per-cell intensity in ``[0, 1]``.
+        valid: Per-cell return mask; ``False`` -> encoded as no-return (0).
+        azimuth_rad: Azimuth of each column (radians).
+        motor_speed_rpm: Spin rate written into the tail.
+        timestamp_us: Base microsecond timestamp for the frame (tail).
+        date_time: UTC ``(year-1900, month, day, hour, minute, second)``.
+        return_mode: Return-mode byte (default single strongest).
+        seq_start: First UDP sequence number (incremented per packet).
+
+    Returns:
+        A list of packet payloads (``bytes``), in azimuth order.
+    """
+    buf = build_frame_array(
+        model,
+        distance_m=distance_m,
+        intensity=intensity,
+        valid=valid,
+        azimuth_rad=azimuth_rad,
+        motor_speed_rpm=motor_speed_rpm,
+        timestamp_us=timestamp_us,
+        date_time=date_time,
+        return_mode=return_mode,
+        seq_start=seq_start,
+    )
+    return [row.tobytes() for row in buf]
 
 
 __all__ = [
@@ -335,6 +385,7 @@ __all__ = [
     "RETURN_MODE_STRONGEST",
     "SOP",
     "HesaiModel",
+    "build_frame_array",
     "build_packets",
     "get_model",
     "packet_size",
