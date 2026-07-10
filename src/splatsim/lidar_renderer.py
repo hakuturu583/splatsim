@@ -419,6 +419,41 @@ def build_lidar_sensors_from_config(cfg_sensors) -> list[LidarSensorSpec]:
 
 # ── Rendering ───────────────────────────────────────────────────────
 
+# Default raydrop_logit for Gaussians without a learned attribute.
+# sigmoid(-6.0) ≈ 0.0025 → very low drop probability.
+DEFAULT_RAYDROP_LOGIT: float = -6.0
+
+
+@lru_cache(maxsize=32)
+def _lidar_intrinsics(h: int, w: int, device_str: str) -> torch.Tensor:
+    """Cached (1, 3, 3) intrinsics for gsplat's lidar path.
+
+    gsplat's ``camera_model='lidar'`` ignores the K matrix (it uses the
+    precomputed angle-to-column mapping from ``lidar_coeffs``), so a
+    fixed placeholder is fine and needs to be built only once.
+    """
+    focal = float(w)
+    return torch.tensor(
+        [[focal, 0.0, w / 2.0], [0.0, focal, h / 2.0], [0.0, 0.0, 1.0]],
+        dtype=torch.float32,
+        device=torch.device(device_str),
+    ).unsqueeze(0)
+
+
+def _rigid_inverse_4x4(m: torch.Tensor) -> torch.Tensor:
+    """Inverse of a rigid 4×4 transform ``[R | t; 0 0 0 1]``.
+
+    Uses ``R^T`` and ``-R^T @ t`` — dtype-stable, allocation-cheap, and
+    numerically better than ``torch.linalg.inv`` on rigid inputs.
+    """
+    r = m[:3, :3]
+    t = m[:3, 3]
+    inv = torch.eye(4, dtype=m.dtype, device=m.device)
+    r_t = r.transpose(-1, -2)
+    inv[:3, :3] = r_t
+    inv[:3, 3] = -(r_t @ t)
+    return inv
+
 
 def render_lidar_panorama(
     *,
@@ -430,6 +465,14 @@ def render_lidar_panorama(
     raydrop_logit: torch.Tensor,  # (N,) raw lidar_raydrop_logit
     sensor_to_world: torch.Tensor,  # (4, 4) on the same device
     lidar_spec: LidarSensorSpec,
+    min_range_m: float = 0.3,
+    max_range_m: float | None = 120.0,
+    packed: bool = False,
+    radius_clip: float = 0.0,
+    frustum_cull: bool = True,
+    cull_scale_sigmas: float = 3.0,
+    with_ut: bool = True,
+    with_eval3d: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Run gsplat's lidar raster once for one sensor at one frame.
 
@@ -441,25 +484,80 @@ def render_lidar_panorama(
     alpha-weighted expected hit distance from the sensor origin (so it
     matches the canonical LiDAR "range" reading); the value is 0 where
     no Gaussians intersect that bin.
+
+    Acceleration knobs
+    ------------------
+    ``min_range_m``/``max_range_m`` gate what gsplat needs to touch.
+    They are also forwarded to gsplat as ``near_plane``/``far_plane``
+    so Gaussians outside the sensor's usable shell are dropped inside
+    the projection kernel. ``max_range_m=None`` disables the far cut.
+
+    ``packed`` toggles gsplat's packed rasterization path. gsplat
+    currently disallows packed whenever ``with_ut`` or ``with_eval3d``
+    is on, and the ``RGB-Ed`` hit-distance render mode we use requires
+    ``with_eval3d=True``. As a result ``packed=True`` is not usable
+    with the default output and it stays off by default.
+
+    ``radius_clip`` drops Gaussians whose projected 2D radius is below
+    the given pixel count; useful for skipping sub-pixel dust.
+
+    ``frustum_cull`` runs a cheap Python-side spherical-shell test
+    (``|means - sensor_pos| ± sigmas * max(scale)``) that trims the
+    input tensors before they reach gsplat. This is the biggest
+    single-source win for driving-scale scenes, where most Gaussians
+    live far outside the sensor's usable range.
+
+    ``with_ut``/``with_eval3d`` toggle gsplat's unscented-transform
+    projection and 3D-evaluated blending. Both default to True (the
+    correct choice under the spherical lidar camera model). Turn them
+    off in exchange for ``packed=True`` when speed matters more than
+    covariance fidelity.
     """
     import gsplat
 
     device = means.device
+
+    if frustum_cull and means.shape[0] > 0:
+        sensor_pos = sensor_to_world[:3, 3].to(device=device, dtype=means.dtype)
+        delta = means - sensor_pos
+        dist = torch.linalg.vector_norm(delta, dim=-1)
+        # NaN scales would poison the mask and silently drop every Gaussian;
+        # treat them as zero-margin so an unlabeled bad splat is at worst
+        # missed for its own extent, not for every neighbour.
+        max_scale = torch.nan_to_num(scales.amax(dim=-1), nan=0.0)
+        margin = cull_scale_sigmas * max_scale
+        keep = dist + margin >= float(min_range_m)
+        if max_range_m is not None:
+            keep = keep & (dist - margin <= float(max_range_m))
+        # Index once, unconditionally: sharing the index buffer across the
+        # six tensors avoids six independent mask scans, and skipping the
+        # `keep.all()` short-circuit avoids a device→host sync per frame.
+        idx = keep.nonzero(as_tuple=False).squeeze(-1)
+        means = means.index_select(0, idx)
+        quats = quats.index_select(0, idx)
+        scales = scales.index_select(0, idx)
+        opacities = opacities.index_select(0, idx)
+        intensity_sig = intensity_sig.index_select(0, idx)
+        raydrop_logit = raydrop_logit.index_select(0, idx)
+
     coeffs = lidar_spec.coeffs(device)
+    H, W = coeffs.n_rows, coeffs.n_columns
+
+    if means.shape[0] == 0:
+        zero = torch.zeros((H, W), dtype=torch.float32, device=device)
+        return {
+            "alpha": zero.clone(),
+            "distance": zero.clone(),
+            "intensity": zero.clone(),
+            "raydrop_logit": torch.full_like(zero, DEFAULT_RAYDROP_LOGIT),
+        }
+
     # gsplat rasterization expects (..., C, 4, 4) view matrices. Use
     # world_to_sensor (= inv(sensor_to_world)) for the single "camera".
-    world_to_sensor = torch.linalg.inv(sensor_to_world).to(
-        device=device, dtype=torch.float32
-    )
-    viewmats = world_to_sensor.unsqueeze(0)  # (C=1, 4, 4)
+    sensor_to_world_f32 = sensor_to_world.to(device=device, dtype=torch.float32)
+    viewmats = _rigid_inverse_4x4(sensor_to_world_f32).unsqueeze(0)  # (C=1, 4, 4)
 
-    H, W = coeffs.n_rows, coeffs.n_columns
-    focal = float(W)
-    Ks = torch.tensor(
-        [[focal, 0.0, W / 2.0], [0.0, focal, H / 2.0], [0.0, 0.0, 1.0]],
-        dtype=torch.float32,
-        device=device,
-    ).unsqueeze(0)
+    Ks = _lidar_intrinsics(int(H), int(W), str(device))
 
     # Pack (intensity_sig, raydrop_logit) into a 2-channel ``colors``.
     # render_mode='RGB-Ed' returns (intensity, raydrop_logit, distance)
@@ -468,7 +566,9 @@ def render_lidar_panorama(
         [intensity_sig.float(), raydrop_logit.float()], dim=-1
     ).unsqueeze(0)  # (C=1, N, 2)
     quats_n = torch.nn.functional.normalize(quats.float(), p=2, dim=-1)
-    render_colors, render_alphas, _meta = gsplat.rasterization(
+
+    # gsplat requires global_z_order=True when with_ut is off.
+    rast_kwargs: dict = dict(
         means=means.float(),
         quats=quats_n,
         scales=scales.float(),
@@ -480,12 +580,18 @@ def render_lidar_panorama(
         height=H,
         camera_model="lidar",
         lidar_coeffs=coeffs,
-        with_ut=True,
-        with_eval3d=True,
-        global_z_order=False,
+        with_ut=bool(with_ut),
+        with_eval3d=bool(with_eval3d),
+        global_z_order=not bool(with_ut),
         render_mode="RGB-Ed",
-        packed=False,
+        packed=bool(packed),
+        radius_clip=float(radius_clip),
+        near_plane=float(min_range_m),
     )
+    if max_range_m is not None:
+        rast_kwargs["far_plane"] = float(max_range_m)
+
+    render_colors, render_alphas, _meta = gsplat.rasterization(**rast_kwargs)
     rc = render_colors[0]  # (H, W, 3) = intensity, raydrop_logit, distance
     alpha = render_alphas[0, ..., 0]  # (H, W)
     return {
@@ -497,10 +603,6 @@ def render_lidar_panorama(
 
 
 # ── splatsim integration wrapper ────────────────────────────────────
-
-# Default raydrop_logit for Gaussians without a learned attribute.
-# sigmoid(-6.0) ≈ 0.0025 → very low drop probability.
-DEFAULT_RAYDROP_LOGIT: float = -6.0
 
 # Luminance weights for SH-derived intensity fallback (Rec. 709).
 _LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)
@@ -602,15 +704,32 @@ class LidarRenderer:
         *,
         device: torch.device | str,
         min_range_m: float = 0.3,
-        max_range_m: float = 120.0,
+        max_range_m: float | None = 120.0,
+        packed: bool = False,
+        radius_clip: float = 0.0,
+        frustum_cull: bool = True,
+        cull_scale_sigmas: float = 3.0,
+        with_ut: bool = True,
+        with_eval3d: bool = True,
     ) -> None:
         self.sensor_spec = sensor_spec
         self.device = torch.device(device)
         self.min_range_m = float(min_range_m)
-        self.max_range_m = float(max_range_m)
+        self.max_range_m = float(max_range_m) if max_range_m is not None else None
+        self.packed = bool(packed)
+        self.radius_clip = float(radius_clip)
+        self.frustum_cull = bool(frustum_cull)
+        self.cull_scale_sigmas = float(cull_scale_sigmas)
+        self.with_ut = bool(with_ut)
+        self.with_eval3d = bool(with_eval3d)
         # Precompute the (H,) elevation table once (used by point-cloud conv).
         self._elevs = _sensor_row_elevations(sensor_spec).to(self.device)
         self._azimuths = _sensor_column_azimuths(sensor_spec).to(self.device)
+        # Cache the sensor→base extrinsic on-device — it's fixed for the
+        # life of the renderer, so no need to rebuild it every frame.
+        self._s2b_t = torch.from_numpy(sensor_spec.s2b.astype(np.float32)).to(
+            self.device
+        )
         # Prime the coeffs cache so the first render skips tile-assign cost.
         _ = sensor_spec.coeffs(self.device)
 
@@ -639,10 +758,7 @@ class LidarRenderer:
             (H, W) float32 tensor. ``H`` = sensor row count,
             ``W`` = ``sensor_spec.n_columns``.
         """
-        s2b_t = torch.from_numpy(self.sensor_spec.s2b.astype(np.float32)).to(
-            self.device
-        )
-        sensor_to_world = base_to_world.to(self.device) @ s2b_t
+        sensor_to_world = base_to_world.to(self.device) @ self._s2b_t
         cam_pos = sensor_to_world[:3, 3].detach()
 
         tensor_list = scene.collect_tensors(cam_pos)
@@ -683,6 +799,14 @@ class LidarRenderer:
             raydrop_logit=raydrop_logit,
             sensor_to_world=sensor_to_world,
             lidar_spec=self.sensor_spec,
+            min_range_m=self.min_range_m,
+            max_range_m=self.max_range_m,
+            packed=self.packed,
+            radius_clip=self.radius_clip,
+            frustum_cull=self.frustum_cull,
+            cull_scale_sigmas=self.cull_scale_sigmas,
+            with_ut=self.with_ut,
+            with_eval3d=self.with_eval3d,
         )
 
     def panorama_to_point_cloud(
