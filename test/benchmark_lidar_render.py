@@ -35,6 +35,7 @@ def make_driving_scene(
     n: int,
     *,
     in_range_frac: float = 0.05,
+    vertical_out_frac: float = 0.0,
     device: torch.device,
     seed: int = 0,
 ) -> dict[str, torch.Tensor]:
@@ -46,25 +47,37 @@ def make_driving_scene(
     - Out-of-range Gaussians live in a 1km × 1km × 20m slab far outside
       the sensor's 120m range. They represent the rest of the map that
       shouldn't touch the panorama.
+    - ``vertical_out_frac`` reroutes a fraction of the out-of-range pile
+      into a "tall-column" band that is *radially* inside the 120m shell
+      but perched high above the LiDAR's vertical FOV (rooftop / sky /
+      overhead-sign geometry). These stress the elev-FOV cull.
 
     Gaussians have random unit quats and moderate scales (0.05–0.3 m).
     """
     g = torch.Generator(device=device).manual_seed(seed)
     n_in = max(1, int(round(n * in_range_frac)))
     n_out = n - n_in
+    n_vert = max(0, int(round(n_out * vertical_out_frac)))
+    n_far = n_out - n_vert
 
     # In-range slab (horizontal, near-sensor).
     xy_in = (torch.rand((n_in, 2), generator=g, device=device) * 2.0 - 1.0) * 80.0
     z_in = (torch.rand((n_in, 1), generator=g, device=device) * 2.0 - 1.0) * 2.0
     in_range = torch.cat([xy_in, z_in], dim=1)
 
-    # Out-of-range slab (kilometre-wide, thin).
-    xy_out = (torch.rand((n_out, 2), generator=g, device=device) * 2.0 - 1.0) * 500.0
-    z_out = (torch.rand((n_out, 1), generator=g, device=device) * 2.0 - 1.0) * 10.0
-    out_range = torch.cat([xy_out, z_out], dim=1)
+    # Out-of-range slab (kilometre-wide, thin) — far radially.
+    xy_far = (torch.rand((n_far, 2), generator=g, device=device) * 2.0 - 1.0) * 500.0
+    z_far = (torch.rand((n_far, 1), generator=g, device=device) * 2.0 - 1.0) * 10.0
+    far_range = torch.cat([xy_far, z_far], dim=1)
 
-    means = torch.cat([in_range, out_range], dim=0)
-    perm = torch.randperm(n, generator=g, device=device)
+    # Vertical-out band: within 100m horizontally, but z in [+30, +80] so the
+    # entire mass sits above OT128's ~+15° elevation ceiling.
+    xy_vert = (torch.rand((n_vert, 2), generator=g, device=device) * 2.0 - 1.0) * 60.0
+    z_vert = torch.rand((n_vert, 1), generator=g, device=device) * 50.0 + 30.0
+    vert_range = torch.cat([xy_vert, z_vert], dim=1)
+
+    means = torch.cat([in_range, far_range, vert_range], dim=0)
+    perm = torch.randperm(means.shape[0], generator=g, device=device)
     means = means[perm].contiguous()
 
     quats = _random_unit_quats(n, device=device, g=g)
@@ -130,6 +143,16 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=500_000)
     ap.add_argument("--iters", type=int, default=8)
     ap.add_argument("--in-range-frac", type=float, default=0.05)
+    ap.add_argument(
+        "--vertical-out-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of out-of-range Gaussians to route into a tall-column band "
+            "(radially inside the shell but above the LiDAR's vertical FOV). "
+            "Used to stress the elevation-FOV cull."
+        ),
+    )
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -137,7 +160,12 @@ def main() -> None:
         raise SystemExit("Requires CUDA (gsplat lidar path is CUDA-only)")
 
     spec, sensor_to_world = make_sensor(device)
-    scene = make_driving_scene(args.n, in_range_frac=args.in_range_frac, device=device)
+    scene = make_driving_scene(
+        args.n,
+        in_range_frac=args.in_range_frac,
+        vertical_out_frac=args.vertical_out_frac,
+        device=device,
+    )
 
     means = scene["means"]
     quats = scene["quats"]
@@ -177,6 +205,7 @@ def main() -> None:
             max_range_m=120.0,
             packed=False,
             frustum_cull=True,
+            elev_fov_cull=False,
             radius_clip=0.0,
         )
 
@@ -194,12 +223,34 @@ def main() -> None:
             max_range_m=120.0,
             packed=False,
             frustum_cull=True,
+            elev_fov_cull=False,
+            radius_clip=1.0,
+        )
+
+    def render_elev():
+        return render_lidar_panorama(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            intensity_sig=intensity_sig,
+            raydrop_logit=raydrop_logit,
+            sensor_to_world=sensor_to_world,
+            lidar_spec=spec,
+            min_range_m=0.3,
+            max_range_m=120.0,
+            packed=False,
+            frustum_cull=True,
+            elev_fov_cull=True,
             radius_clip=1.0,
         )
 
     n_in = int(round(args.n * args.in_range_frac))
+    n_out_total = args.n - n_in
+    n_vert = int(round(n_out_total * args.vertical_out_frac))
+    n_far = n_out_total - n_vert
     print(
-        f"Scene: N={args.n} ({n_in} in-range, {args.n - n_in} out-of-range),"
+        f"Scene: N={args.n} ({n_in} in-range, {n_far} far-out, {n_vert} vert-out),"
         f" OT128 128x2048 panorama"
     )
     print(f"Device: {device}, iters={args.iters}\n")
@@ -207,13 +258,17 @@ def main() -> None:
     dt_legacy, out_legacy = timed(render_legacy, iters=args.iters)
     dt_default, out_default = timed(render_default, iters=args.iters)
     dt_radc, out_radc = timed(render_radc, iters=args.iters)
+    dt_elev, out_elev = timed(render_elev, iters=args.iters)
 
-    print(f"Legacy    (no far, no cull, no clip):    {dt_legacy:8.2f} ms  1.00x")
+    print(f"Legacy    (no far, no cull, no clip):     {dt_legacy:8.2f} ms  1.00x")
     print(
-        f"Default   (far_plane + shell cull):      {dt_default:8.2f} ms  ({dt_legacy / dt_default:.2f}x)"
+        f"Default   (far_plane + shell cull):       {dt_default:8.2f} ms  ({dt_legacy / dt_default:.2f}x)"
     )
     print(
-        f"+radc     (default + radius_clip=1px):   {dt_radc:8.2f} ms  ({dt_legacy / dt_radc:.2f}x)"
+        f"+radc     (default + radius_clip=1px):    {dt_radc:8.2f} ms  ({dt_legacy / dt_radc:.2f}x)"
+    )
+    print(
+        f"+elev     (+radc + elev-FOV cull):        {dt_elev:8.2f} ms  ({dt_legacy / dt_elev:.2f}x)"
     )
 
     print("\nOutput sanity:")
@@ -221,13 +276,14 @@ def main() -> None:
         ("legacy", out_legacy),
         ("default", out_default),
         ("+radc", out_radc),
+        ("+elev", out_elev),
     ):
         print("  " + output_stats(label, d))
 
-    print("\nCorrectness (default vs. +radc — both share the shell cull):")
+    print("\nCorrectness (+radc vs. +elev — elev cull should be a superset drop):")
     for k in ("alpha", "distance", "intensity", "raydrop_logit"):
-        da = out_default[k].detach()
-        db = out_radc[k].detach()
+        da = out_radc[k].detach()
+        db = out_elev[k].detach()
         # Ignore pixels with pathological magnitudes (gsplat sometimes emits
         # >1e6 outliers for degenerate synthetic Gaussians — this is a kernel
         # artifact, unrelated to our optimizations).
