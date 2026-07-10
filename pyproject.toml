@@ -102,6 +102,12 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = ["splatsim", "scenarios"]
 
+# `.claude/` is Claude Code's local scratch space (worktrees, memory, cached
+# artefacts). It contains full copies of the repo from other branches whose
+# tree state we don't want ty to type-check when it walks the project.
+[tool.ty.src]
+exclude = [".claude/"]
+
 # ROS 2 launch files depend on packages (launch, launch_ros, ament_index_python)
 # that are not installable via pip and unavailable in the uv-managed virtualenv.
 [[tool.ty.overrides]]

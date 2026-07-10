@@ -471,6 +471,7 @@ def render_lidar_panorama(
     radius_clip: float = 0.0,
     frustum_cull: bool = True,
     cull_scale_sigmas: float = 3.0,
+    elev_fov_cull: bool = True,
     with_ut: bool = True,
     with_eval3d: bool = True,
 ) -> dict[str, torch.Tensor]:
@@ -507,6 +508,13 @@ def render_lidar_panorama(
     single-source win for driving-scale scenes, where most Gaussians
     live far outside the sensor's usable range.
 
+    ``elev_fov_cull`` layers a splatAD-style vertical-FOV test on top
+    of the radial shell (sensor-frame elevation ± ``sigmas * scale /
+    dist``). Gaussians whose entire angular extent falls above or
+    below the sensor's row-elevation range can never touch a ray, so
+    dropping them shrinks what gsplat needs to project. Cheap
+    (one 3×N matmul + an ``atan2``) and orthogonal to the radial cull.
+
     ``with_ut``/``with_eval3d`` toggle gsplat's unscented-transform
     projection and 3D-evaluated blending. Both default to True (the
     correct choice under the spherical lidar camera model). Turn them
@@ -529,6 +537,29 @@ def render_lidar_panorama(
         keep = dist + margin >= float(min_range_m)
         if max_range_m is not None:
             keep = keep & (dist - margin <= float(max_range_m))
+        if elev_fov_cull:
+            # z_s = component of delta along the sensor's up-axis (column 2
+            # of the sensor→world rotation gives that axis in world frame).
+            # This is the only sensor-frame coord we need for elevation
+            # cull, so we skip the full delta→sensor rotation and just do a
+            # single N×3·3×1 dot product.
+            up_world = sensor_to_world[:3, 2].to(device=device, dtype=means.dtype)
+            z_s = delta @ up_world
+            # Linear-in-margin bound: sin(elev_g) ≷ sin(elev_bound ± ang_margin)
+            # with ang_margin ≈ margin/dist yields, after multiplying by dist:
+            #   z_s + margin·cos(elev_min) ≥ dist·sin(elev_min)   (below-FOV cut)
+            #   z_s - margin·cos(elev_max) ≤ dist·sin(elev_max)   (above-FOV cut)
+            # Uses the first-order Taylor of sin(θ+δ) around the FOV edge;
+            # residual is second-order and biased toward *keeping* extra
+            # Gaussians (never drops one that the exact atan2 test keeps).
+            sin_min, cos_min, sin_max, cos_max = _lidar_elev_fov_sincos(
+                lidar_spec.sensor_type,
+                lidar_spec.el_lo_rad,
+                lidar_spec.el_hi_rad,
+                lidar_spec.n_rows_uniform,
+            )
+            keep = keep & (z_s + margin * float(cos_min) >= dist * float(sin_min))
+            keep = keep & (z_s - margin * float(cos_max) <= dist * float(sin_max))
         # Index once, unconditionally: sharing the index buffer across the
         # six tensors avoids six independent mask scans, and skipping the
         # `keep.all()` short-circuit avoids a device→host sync per frame.
@@ -641,6 +672,41 @@ def _sensor_column_azimuths(spec: LidarSensorSpec) -> torch.Tensor:
     )
 
 
+@lru_cache(maxsize=32)
+def _lidar_elev_fov_rad(
+    sensor_type: str,
+    el_lo_rad: float,
+    el_hi_rad: float,
+    n_rows_uniform: int,
+) -> tuple[float, float]:
+    """Return ``(elev_min, elev_max)`` in radians for a sensor spec.
+
+    Uses the same table / linspace logic as :func:`_sensor_row_elevations`
+    but exposes the extrema as plain Python floats so callers can drop
+    Gaussians outside the sensor's vertical FOV without paying a device
+    → host sync every frame.
+    """
+    if sensor_type in _TABLES_RAD:
+        tab = _TABLES_RAD[sensor_type]
+        return (float(min(tab)), float(max(tab)))
+    # Uniform-spec fallback mirrors ``_build_lidar_coeffs`` (linspace hi→lo
+    # with a 1e-6 rad nudge on both endpoints).
+    return (float(el_lo_rad) - 1e-6, float(el_hi_rad) - 1e-6)
+
+
+@lru_cache(maxsize=32)
+def _lidar_elev_fov_sincos(
+    sensor_type: str,
+    el_lo_rad: float,
+    el_hi_rad: float,
+    n_rows_uniform: int,
+) -> tuple[float, float, float, float]:
+    """Return ``(sin_min, cos_min, sin_max, cos_max)`` for the sensor's
+    vertical FOV. Cached so per-frame elev-cull avoids the trig cost."""
+    lo, hi = _lidar_elev_fov_rad(sensor_type, el_lo_rad, el_hi_rad, n_rows_uniform)
+    return (math.sin(lo), math.cos(lo), math.sin(hi), math.cos(hi))
+
+
 def _sh_dc_to_luminance(colors: torch.Tensor, sh_degree: int) -> torch.Tensor:
     """Return (N,) luminance in [0, 1] from a colors tensor.
 
@@ -709,6 +775,7 @@ class LidarRenderer:
         radius_clip: float = 0.0,
         frustum_cull: bool = True,
         cull_scale_sigmas: float = 3.0,
+        elev_fov_cull: bool = True,
         with_ut: bool = True,
         with_eval3d: bool = True,
     ) -> None:
@@ -720,6 +787,7 @@ class LidarRenderer:
         self.radius_clip = float(radius_clip)
         self.frustum_cull = bool(frustum_cull)
         self.cull_scale_sigmas = float(cull_scale_sigmas)
+        self.elev_fov_cull = bool(elev_fov_cull)
         self.with_ut = bool(with_ut)
         self.with_eval3d = bool(with_eval3d)
         # Precompute the (H,) elevation table once (used by point-cloud conv).
@@ -805,6 +873,7 @@ class LidarRenderer:
             radius_clip=self.radius_clip,
             frustum_cull=self.frustum_cull,
             cull_scale_sigmas=self.cull_scale_sigmas,
+            elev_fov_cull=self.elev_fov_cull,
             with_ut=self.with_ut,
             with_eval3d=self.with_eval3d,
         )
