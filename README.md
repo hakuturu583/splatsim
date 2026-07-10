@@ -76,6 +76,39 @@ splatsim-viewer scene.yaml --lidar top --dds
 spawn-scenario
 ```
 
+## LiDAR transport (DDS vs. HILS)
+
+Each LiDAR sensor in a scene renders a point cloud that can be delivered two ways,
+selected per sensor with the `communication` field:
+
+- `dds` (default): publishes a `sensor_msgs/PointCloud2` over CycloneDDS on
+  `pointcloud_topic`.
+- `hils`: hardware-in-the-loop mode. Emits raw Hesai UDP data packets that mimic
+  the physical sensor's wire format, so an unmodified LiDAR driver (e.g. Autoware
+  `nebula`) can consume them. The `sensor_type` selects the packet format;
+  currently supported models are **OT128** (Pandar OT128) and **XT32**
+  (PandarXT-32).
+
+```yaml
+lidar_sensors:
+  - name: top
+    sensor_type: XT32        # OT128 | XT32
+    communication: hils      # dds (default) | hils
+    hils_host: 192.168.1.201 # UDP destination (unicast or broadcast)
+    hils_port: 2368          # Hesai point-cloud port
+    # hils_start_epoch: 1700000000  # optional: Unix time that sim-time 0
+    #                               # maps to; omit to start "now".
+```
+
+Packet timestamps use the **simulation clock**: the date-time/timestamp written
+into each packet is `hils_start_epoch + <simulation elapsed time>`. When
+`hils_start_epoch` is omitted it defaults to the wall-clock time at which the
+sensor is created (simulation starts "now").
+
+Packets are encoded with `torch` directly from the rendered range image, so when
+the renderer runs on CUDA the entire encode stays on the GPU and only the packed
+byte buffer crosses to the host (once per frame) for the UDP send.
+
 ## Development
 
 ```bash

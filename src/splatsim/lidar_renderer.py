@@ -809,6 +809,25 @@ class LidarRenderer:
             with_eval3d=self.with_eval3d,
         )
 
+    def _validity_mask(
+        self,
+        panorama: dict[str, torch.Tensor],
+        *,
+        drop_threshold: float,
+        alpha_threshold: float,
+    ) -> torch.Tensor:
+        """Per-cell return mask shared by the point-cloud / range-image paths.
+
+        A cell is a valid return when it has enough alpha coverage, a low
+        enough raydrop probability, and an in-range distance.
+        """
+        return (
+            (panorama["alpha"] > alpha_threshold)
+            & (torch.sigmoid(panorama["raydrop_logit"]) < drop_threshold)
+            & (panorama["distance"] > self.min_range_m)
+            & (panorama["distance"] < self.max_range_m)
+        )
+
     def panorama_to_point_cloud(
         self,
         panorama: dict[str, torch.Tensor],
@@ -829,14 +848,8 @@ class LidarRenderer:
         """
         distance = panorama["distance"]
         intensity = panorama["intensity"]
-        alpha = panorama["alpha"]
-        raydrop = torch.sigmoid(panorama["raydrop_logit"])
-
-        valid = (
-            (alpha > alpha_threshold)
-            & (raydrop < drop_threshold)
-            & (distance > self.min_range_m)
-            & (distance < self.max_range_m)
+        valid = self._validity_mask(
+            panorama, drop_threshold=drop_threshold, alpha_threshold=alpha_threshold
         )
 
         el_grid = self._elevs[:, None].expand(-1, self.n_columns)  # (H, W)
@@ -853,6 +866,48 @@ class LidarRenderer:
         return {
             "xyz": xyz.detach().cpu().numpy().astype(np.float32),
             "intensity": intensity_valid.detach().cpu().numpy().astype(np.float32),
+        }
+
+    def panorama_to_range_image(
+        self,
+        panorama: dict[str, torch.Tensor],
+        *,
+        drop_threshold: float = 0.5,
+        alpha_threshold: float = 0.1,
+    ) -> dict[str, torch.Tensor]:
+        """Convert a rendered panorama into a dense structured range image.
+
+        Unlike :meth:`panorama_to_point_cloud` (which drops invalid cells and
+        returns a sparse cloud), this keeps the full ``(H, W)`` grid so it can
+        be encoded directly into per-channel / per-azimuth LiDAR packets. The
+        same validity gate is applied, exposed as a boolean mask; invalid
+        cells keep their raw distance but should be treated as "no return".
+
+        Everything is returned **on the render device** (no host transfer) so a
+        GPU consumer — e.g. :func:`splatsim.hils.build_frame_tensor` — can
+        encode packets without a per-frame round-trip of the grids.
+
+        Args:
+            panorama: Output of :meth:`render`.
+            drop_threshold: sigmoid(raydrop_logit) above this drops the sample.
+            alpha_threshold: Minimum alpha coverage to keep a sample.
+
+        Returns:
+            ``{"distance", "intensity", "valid", "azimuths", "elevations"}`` —
+            device tensors. ``distance`` / ``intensity`` / ``valid`` are
+            ``(H, W)`` (``float32`` / ``float32`` / ``bool``); ``azimuths`` is
+            ``(W,)`` and ``elevations`` is ``(H,)`` in radians.
+        """
+        valid = self._validity_mask(
+            panorama, drop_threshold=drop_threshold, alpha_threshold=alpha_threshold
+        )
+
+        return {
+            "distance": panorama["distance"].detach(),
+            "intensity": panorama["intensity"].detach(),
+            "valid": valid.detach(),
+            "azimuths": self._azimuths,
+            "elevations": self._elevs,
         }
 
 

@@ -9,6 +9,9 @@ supported-markers = [
     "sys_platform == 'linux'",
 ]
 
+[manifest]
+build-constraints = [{ name = "torch", specifier = "<2.5", index = "https://download.pytorch.org/whl/cu124" }]
+
 [[package]]
 name = "3dgs-io"
 version = "0.3.0"
