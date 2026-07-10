@@ -43,7 +43,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --extra dds --no-dev
 
 # Pre-compile gsplat CUDA kernels (JIT) so the runtime image does not need nvcc.
-RUN uv run python -c "from gsplat.cuda._backend import _C; assert _C is not None, 'gsplat CUDA JIT compilation failed'"
+# `mkdir -p` guarantees the extensions dir exists even when gsplat's wheel
+# already includes a pre-compiled `.so` (in which case `_backend.py` imports it
+# directly and never triggers JIT, leaving `TORCH_EXTENSIONS_DIR` uncreated
+# and breaking the later COPY to the runtime stage).
+RUN mkdir -p "${TORCH_EXTENSIONS_DIR}" \
+ && uv run python -c "from gsplat.cuda._backend import _C; assert _C is not None, 'gsplat CUDA JIT compilation failed'"
 
 # Patch gsplat _backend.py so it can load the pre-compiled .so without nvcc.
 # The upstream code gates on cuda_toolkit_available() which requires nvcc even
