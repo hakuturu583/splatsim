@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import time
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from cyclonedds.pub import DataWriter
 from cyclonedds.topic import Topic
 
+from splatsim.cyclonedds._util import to_dds_topic
 from splatsim.cyclonedds.msg_types import CameraInfo, Header, RegionOfInterest, Time
 
 if TYPE_CHECKING:
@@ -59,7 +59,7 @@ class CameraInfoPublisher:
     ) -> None:
         self._frame_id = frame_id
 
-        topic = Topic(participant, _to_dds_topic(topic_name), CameraInfo)
+        topic = Topic(participant, to_dds_topic(topic_name), CameraInfo)
         self._writer = DataWriter(participant, topic)
 
         # Precompute static intrinsic fields from config.
@@ -119,18 +119,16 @@ class CameraInfoPublisher:
             do_rectify=False,
         )
 
-    def publish(self, stamp: Optional[Time] = None) -> None:
+    def publish(self, stamp: Time) -> None:
         """Publish a ``CameraInfo`` message.
 
         Parameters
         ----------
         stamp:
-            Timestamp for the message header.  When *None*, the current
-            wall-clock time is used.
+            Timestamp for the message header. Callers must supply the clock
+            that matches the rest of the graph (sim time under CARLA co-sim,
+            wall clock only for standalone dev viewers).
         """
-        if stamp is None:
-            stamp = _now()
-
         msg = CameraInfo(
             header=Header(stamp=stamp, frame_id=self._frame_id),
             height=self._height,
@@ -145,14 +143,3 @@ class CameraInfoPublisher:
             roi=self._roi,
         )
         self._writer.write(msg)
-
-
-def _to_dds_topic(ros_topic: str) -> str:
-    """Convert a ROS 2 topic name to the DDS wire name (``rt/`` prefix)."""
-    return "rt/" + ros_topic.lstrip("/")
-
-
-def _now() -> Time:
-    """Return the current wall-clock time as a ROS 2 ``Time``."""
-    sec, nanosec = divmod(time.time_ns(), 10**9)
-    return Time(sec=sec, nanosec=nanosec)

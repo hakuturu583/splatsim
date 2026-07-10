@@ -69,6 +69,9 @@ docker buildx build \
 # Launch the viewer
 splatsim-viewer
 
+# Render a configured LiDAR and publish sensor_msgs/PointCloud2 via DDS
+splatsim-viewer scene.yaml --lidar top --dds
+
 # Run a scenario
 spawn-scenario
 ```
