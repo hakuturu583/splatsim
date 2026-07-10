@@ -15,13 +15,12 @@ from splatsim.hils.hesai_packet import (
     RETURN_MODE_STRONGEST,
     SOP,
     build_frame_array,
-    packet_size,
 )
 
 
 def _decode_packet(model, payload: bytes) -> dict:
     """Minimal decoder mirroring the encoder, for round-trip verification."""
-    assert len(payload) == packet_size(model)
+    assert len(payload) == model.packet_size
     assert payload[:2] == SOP
     laser_num = payload[6]
     block_num = payload[7]
@@ -104,11 +103,11 @@ def test_packet_size_and_count(sensor_type: str) -> None:
     expected_count = math.ceil(n_az / model.blocks_per_packet)
     assert len(packets) == expected_count
     for pkt in packets:
-        assert len(pkt) == packet_size(model)
+        assert len(pkt) == model.packet_size
 
 
 def test_xt32_packet_size_is_1080() -> None:
-    assert packet_size(get_model("XT32")) == 1080
+    assert get_model("XT32").packet_size == 1080
 
 
 @pytest.mark.parametrize("sensor_type", ["XT32", "OT128"])
@@ -225,7 +224,7 @@ def test_frame_array_rows_match_packets(sensor_type: str) -> None:
     )
     buf = build_frame_array(model, **kwargs)
     packets = build_packets(model, **kwargs)
-    assert buf.shape == (len(packets), packet_size(model))
+    assert buf.shape == (len(packets), model.packet_size)
     assert buf.dtype == np.uint8
     for k, pkt in enumerate(packets):
         assert buf[k].tobytes() == pkt

@@ -215,11 +215,6 @@ def _tail(
     )
 
 
-def packet_size(model: HesaiModel) -> int:
-    """Total UDP payload size for one packet of ``model``."""
-    return model.packet_size
-
-
 def _encode_body(
     model: HesaiModel,
     az_u16: NDArray[np.uint16],  # (n_az,)
@@ -237,7 +232,7 @@ def _encode_body(
     channels = model.channels
     n_az = az_u16.shape[0]
     bpp = model.blocks_per_packet
-    n_pad = -(-n_az // bpp) * bpp  # round up to a whole number of packets
+    n_pad = ((n_az + bpp - 1) // bpp) * bpp  # round up to a whole packet count
 
     body = np.zeros((n_pad, model.block_size), dtype=np.uint8)
     body[:n_az, 0] = az_u16 & 0xFF
@@ -388,5 +383,4 @@ __all__ = [
     "build_frame_array",
     "build_packets",
     "get_model",
-    "packet_size",
 ]

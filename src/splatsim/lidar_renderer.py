@@ -778,14 +778,27 @@ class LidarRenderer:
             panorama, drop_threshold=drop_threshold, alpha_threshold=alpha_threshold
         )
 
-        return {
-            "distance": panorama["distance"].detach().cpu().numpy().astype(np.float32),
-            "intensity": panorama["intensity"]
+        # Coalesce distance/intensity/valid into a single device→host copy: one
+        # CUDA sync per frame instead of three. ``valid`` rides along as a float
+        # channel and is re-cast to bool host-side.
+        stacked = (
+            torch.stack(
+                [
+                    panorama["distance"].float(),
+                    panorama["intensity"].float(),
+                    valid.float(),
+                ],
+                dim=0,
+            )
             .detach()
             .cpu()
             .numpy()
-            .astype(np.float32),
-            "valid": valid.detach().cpu().numpy().astype(bool),
+        )
+
+        return {
+            "distance": stacked[0],
+            "intensity": stacked[1],
+            "valid": stacked[2] != 0.0,
             "azimuths": self._azimuths_np,
             "elevations": self._elevs_np,
         }

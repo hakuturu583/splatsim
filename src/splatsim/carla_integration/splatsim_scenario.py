@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
@@ -117,6 +118,11 @@ class SplatSimScenario(BaseScenario):
         # Registered camera actions and their publishers.
         self._camera_entries: list[_CameraEntry] = []
         self._lidar_entries: list[_LidarEntry] = []
+
+        # Simulation-wide default epoch for HILS packet timestamps, resolved
+        # once (on the first HILS sensor without an explicit ``hils_start_epoch``)
+        # so every such sensor stamps the same wall-clock for a given sim tick.
+        self._hils_start_epoch_default: float | None = None
 
         # Capture the ego entity reference when ScenarioRunner calls
         # ego_type().  This happens before setup(), so ego_entity is
@@ -353,11 +359,19 @@ class SplatSimScenario(BaseScenario):
         if config.communication == "hils":
             from splatsim.hils import HesaiHilsPublisher  # noqa: PLC0415
 
+            # Per-sensor override wins; otherwise share one sim-wide "now" epoch
+            # across all HILS sensors so their packet clocks stay aligned.
+            start_epoch = config.hils_start_epoch
+            if start_epoch is None:
+                if self._hils_start_epoch_default is None:
+                    self._hils_start_epoch_default = time.time()
+                start_epoch = self._hils_start_epoch_default
+
             hils_pub = HesaiHilsPublisher(
                 config.sensor_type,
                 host=config.hils_host,
                 port=config.hils_port,
-                start_epoch_s=config.hils_start_epoch,
+                start_epoch_s=start_epoch,
             )
             logger.info(
                 "LiDAR %s: HILS transport -> %s UDP packets to %s:%d",

@@ -130,29 +130,6 @@ class HesaiHilsPublisher:
         self._sequence = (self._sequence + buf.shape[0]) & 0xFFFFFFFF
         return buf
 
-    def build(
-        self,
-        *,
-        distance_m: NDArray[np.floating],
-        intensity: NDArray[np.floating],
-        valid: NDArray[np.bool_],
-        azimuth_rad: NDArray[np.floating],
-        spin_hz: float,
-        sim_time_s: float = 0.0,
-    ) -> list[bytes]:
-        """Encode one range-image frame into packets (without sending)."""
-        return [
-            row.tobytes()
-            for row in self.build_array(
-                distance_m=distance_m,
-                intensity=intensity,
-                valid=valid,
-                azimuth_rad=azimuth_rad,
-                spin_hz=spin_hz,
-                sim_time_s=sim_time_s,
-            )
-        ]
-
     def publish(
         self,
         *,
