@@ -611,6 +611,10 @@ class LidarRenderer:
         # Precompute the (H,) elevation table once (used by point-cloud conv).
         self._elevs = _sensor_row_elevations(sensor_spec).to(self.device)
         self._azimuths = _sensor_column_azimuths(sensor_spec).to(self.device)
+        # Host-side copies of the invariant angle tables so the range-image
+        # path doesn't re-sync them off the GPU every frame.
+        self._elevs_np = self._elevs.cpu().numpy().astype(np.float32)
+        self._azimuths_np = self._azimuths.cpu().numpy().astype(np.float32)
         # Prime the coeffs cache so the first render skips tile-assign cost.
         _ = sensor_spec.coeffs(self.device)
 
@@ -685,6 +689,25 @@ class LidarRenderer:
             lidar_spec=self.sensor_spec,
         )
 
+    def _validity_mask(
+        self,
+        panorama: dict[str, torch.Tensor],
+        *,
+        drop_threshold: float,
+        alpha_threshold: float,
+    ) -> torch.Tensor:
+        """Per-cell return mask shared by the point-cloud / range-image paths.
+
+        A cell is a valid return when it has enough alpha coverage, a low
+        enough raydrop probability, and an in-range distance.
+        """
+        return (
+            (panorama["alpha"] > alpha_threshold)
+            & (torch.sigmoid(panorama["raydrop_logit"]) < drop_threshold)
+            & (panorama["distance"] > self.min_range_m)
+            & (panorama["distance"] < self.max_range_m)
+        )
+
     def panorama_to_point_cloud(
         self,
         panorama: dict[str, torch.Tensor],
@@ -705,14 +728,8 @@ class LidarRenderer:
         """
         distance = panorama["distance"]
         intensity = panorama["intensity"]
-        alpha = panorama["alpha"]
-        raydrop = torch.sigmoid(panorama["raydrop_logit"])
-
-        valid = (
-            (alpha > alpha_threshold)
-            & (raydrop < drop_threshold)
-            & (distance > self.min_range_m)
-            & (distance < self.max_range_m)
+        valid = self._validity_mask(
+            panorama, drop_threshold=drop_threshold, alpha_threshold=alpha_threshold
         )
 
         el_grid = self._elevs[:, None].expand(-1, self.n_columns)  # (H, W)
@@ -757,24 +774,20 @@ class LidarRenderer:
             (``float32`` / ``float32`` / ``bool``); ``azimuths`` is ``(W,)``
             and ``elevations`` is ``(H,)`` in radians (both ``float32``).
         """
-        distance = panorama["distance"]
-        intensity = panorama["intensity"]
-        alpha = panorama["alpha"]
-        raydrop = torch.sigmoid(panorama["raydrop_logit"])
-
-        valid = (
-            (alpha > alpha_threshold)
-            & (raydrop < drop_threshold)
-            & (distance > self.min_range_m)
-            & (distance < self.max_range_m)
+        valid = self._validity_mask(
+            panorama, drop_threshold=drop_threshold, alpha_threshold=alpha_threshold
         )
 
         return {
-            "distance": distance.detach().cpu().numpy().astype(np.float32),
-            "intensity": intensity.detach().cpu().numpy().astype(np.float32),
+            "distance": panorama["distance"].detach().cpu().numpy().astype(np.float32),
+            "intensity": panorama["intensity"]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32),
             "valid": valid.detach().cpu().numpy().astype(bool),
-            "azimuths": self._azimuths.detach().cpu().numpy().astype(np.float32),
-            "elevations": self._elevs.detach().cpu().numpy().astype(np.float32),
+            "azimuths": self._azimuths_np,
+            "elevations": self._elevs_np,
         }
 
 

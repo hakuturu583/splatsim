@@ -30,6 +30,7 @@ class SplatSimLidarSensorConfig(LidarSensorConfig):
     communication: str = "dds"
     hils_host: str = "127.0.0.1"
     hils_port: int = 2368
+    hils_start_epoch: float | None = None
 
     @classmethod
     def from_scene_config(cls, config: LidarConfig) -> SplatSimLidarSensorConfig:
@@ -53,6 +54,7 @@ class SplatSimLidarSensorConfig(LidarSensorConfig):
             communication=config.communication,
             hils_host=config.hils_host,
             hils_port=config.hils_port,
+            hils_start_epoch=config.hils_start_epoch,
         )
 
 

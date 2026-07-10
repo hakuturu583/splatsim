@@ -214,6 +214,7 @@ class SceneConfig:
                     communication=lidar.get("communication", "dds"),
                     hils_host=lidar.get("hils_host", "127.0.0.1"),
                     hils_port=lidar.get("hils_port", 2368),
+                    hils_start_epoch=lidar.get("hils_start_epoch"),
                 )
             )
 

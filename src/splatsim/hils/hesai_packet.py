@@ -58,6 +58,13 @@ RETURN_MODE_DUAL: int = 0x39
 _UINT16_MAX = 0xFFFF
 
 
+# Fixed tail bytes besides the reserved prefix:
+#   motor_speed(2) + timestamp(4) + return_mode(1) + factory(1)
+#   + date_time(6) + udp_sequence(4) = 18.
+_TAIL_FIXED = 18
+_HEADER_SIZE = 12
+
+
 @dataclass(frozen=True)
 class HesaiModel:
     """Static wire parameters for a supported Hesai LiDAR."""
@@ -69,15 +76,21 @@ class HesaiModel:
     protocol_major: int
     protocol_minor: int
     layout: str  # "xt" | "e4x" — selects block/tail encoders
-    data_port: int = 2368
+    tail_reserved: int  # reserved bytes at the start of the tail
+    has_fine_azimuth: bool  # per-block fractional-azimuth byte (E4X)
 
     @property
     def block_size(self) -> int:
-        if self.layout == "e4x":
-            # azimuth(2) + fine_azimuth(1) + channels * unit(4)
-            return 3 + self.channels * 4
-        # xt: azimuth(2) + channels * unit(4)
-        return 2 + self.channels * 4
+        # azimuth(2) [+ fine_azimuth(1)] + channels * unit(4)
+        return 2 + (1 if self.has_fine_azimuth else 0) + self.channels * 4
+
+    @property
+    def tail_size(self) -> int:
+        return self.tail_reserved + _TAIL_FIXED
+
+    @property
+    def packet_size(self) -> int:
+        return _HEADER_SIZE + self.block_size * self.blocks_per_packet + self.tail_size
 
 
 # Registry keyed by the ``sensor_type`` string used across splatsim.
@@ -90,6 +103,8 @@ MODELS: dict[str, HesaiModel] = {
         protocol_major=0x06,
         protocol_minor=0x01,
         layout="xt",
+        tail_reserved=10,
+        has_fine_azimuth=False,
     ),
     "OT128": HesaiModel(
         name="OT128",
@@ -99,12 +114,10 @@ MODELS: dict[str, HesaiModel] = {
         protocol_major=0x06,
         protocol_minor=0x01,
         layout="e4x",
+        tail_reserved=18,
+        has_fine_azimuth=True,
     ),
 }
-
-
-def is_supported(sensor_type: str) -> bool:
-    return sensor_type in MODELS
 
 
 def get_model(sensor_type: str) -> HesaiModel:
@@ -125,34 +138,33 @@ def _encode_distance(
     valid: NDArray[np.bool_],
     distance_unit_m: float,
 ) -> NDArray[np.uint16]:
-    """Range (m) -> uint16 distance in sensor units; 0 where invalid."""
-    raw = np.rint(np.asarray(range_m, dtype=np.float64) / distance_unit_m)
-    raw = np.clip(raw, 0, _UINT16_MAX)
+    """Range (m) -> uint16 distance in sensor units; 0 where invalid.
+
+    Distances stay within float32 integer-exact range (max ~30000 units),
+    so no float64 widening is needed.
+    """
+    raw = np.clip(np.rint(range_m / distance_unit_m), 0, _UINT16_MAX)
     out = raw.astype(np.uint16)
     out[~valid] = 0
     return out
 
 
-def _encode_reflectivity(
-    intensity: NDArray[np.floating],
-) -> NDArray[np.uint8]:
+def _encode_reflectivity(intensity: NDArray[np.floating]) -> NDArray[np.uint8]:
     """Intensity in [0, 1] -> uint8 reflectivity in [0, 255]."""
-    r = np.rint(np.clip(np.asarray(intensity, dtype=np.float64), 0.0, 1.0) * 255.0)
-    return r.astype(np.uint8)
+    return np.rint(np.clip(intensity, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
 def _encode_azimuth(azimuth_rad: NDArray[np.floating]) -> NDArray[np.uint16]:
     """Azimuth (rad) -> uint16 in units of 0.01°, wrapped to [0, 36000)."""
-    deg = np.degrees(np.asarray(azimuth_rad, dtype=np.float64)) % 360.0
-    return np.rint(deg * 100.0).astype(np.int64).astype(np.uint16)
+    deg = np.degrees(azimuth_rad) % 360.0
+    return np.rint(deg * 100.0).astype(np.uint16)
 
 
 def _fine_azimuth(azimuth_rad: NDArray[np.floating]) -> NDArray[np.uint8]:
     """Fractional azimuth byte for E4X (1/256 of the 0.01° coarse unit)."""
-    deg = np.degrees(np.asarray(azimuth_rad, dtype=np.float64)) % 360.0
-    hundredths = deg * 100.0
+    hundredths = (np.degrees(azimuth_rad) % 360.0) * 100.0
     frac = hundredths - np.floor(hundredths)
-    return np.rint(frac * 256.0).astype(np.int64).clip(0, 255).astype(np.uint8)
+    return np.clip(np.rint(frac * 256.0), 0, 255).astype(np.uint8)
 
 
 def _header(model: HesaiModel) -> bytes:
@@ -191,12 +203,8 @@ def _tail(
     """
     yy, mo, dd, hh, mi, ss = date_time
     dt = struct.pack("<6B", yy & 0xFF, mo, dd, hh, mi, ss)
-    if model.layout == "e4x":
-        reserved = b"\x00" * 18
-    else:  # xt
-        reserved = b"\x00" * 10
     return (
-        reserved
+        b"\x00" * model.tail_reserved
         + struct.pack("<H", motor_speed_rpm & _UINT16_MAX)
         + struct.pack("<I", timestamp_us & 0xFFFFFFFF)
         + struct.pack("<B", return_mode & 0xFF)
@@ -206,48 +214,44 @@ def _tail(
     )
 
 
-def _block(
-    model: HesaiModel,
-    azimuth_u16: int,
-    fine_az: int,
-    distances: NDArray[np.uint16],
-    reflectivities: NDArray[np.uint8],
-) -> bytes:
-    """One data block: azimuth (+ fine byte for E4X) followed by units."""
-    if model.layout == "e4x":
-        head = struct.pack("<HB", azimuth_u16, fine_az)
-        # Unit: distance(2) + reflectivity(1) + confidence(1).
-        units = np.zeros((model.channels, 4), dtype=np.uint8)
-        units[:, 0] = distances & 0xFF
-        units[:, 1] = (distances >> 8) & 0xFF
-        units[:, 2] = reflectivities
-        units[:, 3] = 0  # confidence
-    else:  # xt
-        head = struct.pack("<H", azimuth_u16)
-        # Unit: distance(2) + reflectivity(1) + reserved(1).
-        units = np.zeros((model.channels, 4), dtype=np.uint8)
-        units[:, 0] = distances & 0xFF
-        units[:, 1] = (distances >> 8) & 0xFF
-        units[:, 2] = reflectivities
-        units[:, 3] = 0  # reserved
-    return head + units.tobytes()
-
-
 def packet_size(model: HesaiModel) -> int:
     """Total UDP payload size for one packet of ``model``."""
-    header = 12
-    body = model.block_size * model.blocks_per_packet
-    tail = len(
-        _tail(
-            model,
-            motor_speed_rpm=0,
-            timestamp_us=0,
-            return_mode=RETURN_MODE_STRONGEST,
-            date_time=(0, 0, 0, 0, 0, 0),
-            udp_sequence=0,
-        )
-    )
-    return header + body + tail
+    return model.packet_size
+
+
+def _encode_body(
+    model: HesaiModel,
+    az_u16: NDArray[np.uint16],  # (n_az,)
+    fine_u8: NDArray[np.uint8],  # (n_az,)
+    dist_u16: NDArray[np.uint16],  # (channels, n_az)
+    refl_u8: NDArray[np.uint8],  # (channels, n_az)
+) -> NDArray[np.uint8]:
+    """Pack the whole scan into a ``(n_az_padded, block_size)`` byte grid.
+
+    One row per firing (block). ``n_az`` is padded up to a multiple of
+    ``blocks_per_packet`` with zeroed rows so packets are a fixed size; each
+    packet is then a contiguous ``blocks_per_packet``-row slice. Fully
+    vectorized — no per-block Python allocation.
+    """
+    channels = model.channels
+    n_az = az_u16.shape[0]
+    bpp = model.blocks_per_packet
+    n_pad = -(-n_az // bpp) * bpp  # round up to a whole number of packets
+
+    body = np.zeros((n_pad, model.block_size), dtype=np.uint8)
+    body[:n_az, 0] = az_u16 & 0xFF
+    body[:n_az, 1] = (az_u16 >> 8) & 0xFF
+    unit_off = 2
+    if model.has_fine_azimuth:
+        body[:n_az, 2] = fine_u8
+        unit_off = 3
+
+    # Units: distance_lo(1) + distance_hi(1) + reflectivity(1) + reserved(1).
+    units = body[:n_az, unit_off : unit_off + channels * 4].reshape(n_az, channels, 4)
+    units[..., 0] = (dist_u16 & 0xFF).T
+    units[..., 1] = (dist_u16 >> 8).T
+    units[..., 2] = refl_u8.T
+    return body
 
 
 def build_packets(
@@ -301,48 +305,25 @@ def build_packets(
     az_u16 = _encode_azimuth(azimuth_rad)
     fine_u8 = (
         _fine_azimuth(azimuth_rad)
-        if model.layout == "e4x"
+        if model.has_fine_azimuth
         else np.zeros(n_az, dtype=np.uint8)
     )
 
+    body = _encode_body(model, az_u16, fine_u8, dist_u16, refl_u8)
     header = _header(model)
     bpp = model.blocks_per_packet
     packets: list[bytes] = []
-    seq = seq_start
-    for start in range(0, n_az, bpp):
-        cols = range(start, min(start + bpp, n_az))
-        blocks = bytearray()
-        n_blocks = 0
-        for a in cols:
-            blocks += _block(
-                model,
-                int(az_u16[a]),
-                int(fine_u8[a]),
-                dist_u16[:, a],
-                refl_u8[:, a],
-            )
-            n_blocks += 1
-        # Pad a short final group up to a full packet with empty blocks so
-        # every packet has the sensor's fixed size.
-        if n_blocks < bpp:
-            empty = _block(
-                model,
-                0,
-                0,
-                np.zeros(model.channels, dtype=np.uint16),
-                np.zeros(model.channels, dtype=np.uint8),
-            )
-            blocks += empty * (bpp - n_blocks)
+    for i, start in enumerate(range(0, body.shape[0], bpp)):
+        blocks = body[start : start + bpp].tobytes()
         tail = _tail(
             model,
             motor_speed_rpm=motor_speed_rpm,
             timestamp_us=timestamp_us,
             return_mode=return_mode,
             date_time=date_time,
-            udp_sequence=seq,
+            udp_sequence=(seq_start + i) & 0xFFFFFFFF,
         )
-        packets.append(bytes(header + blocks + tail))
-        seq += 1
+        packets.append(header + blocks + tail)
     return packets
 
 
@@ -356,6 +337,5 @@ __all__ = [
     "HesaiModel",
     "build_packets",
     "get_model",
-    "is_supported",
     "packet_size",
 ]

@@ -85,3 +85,4 @@ def test_scene_config_loads_hils_lidar(tmp_path) -> None:
     assert lidar.communication == "hils"
     assert lidar.hils_host == "192.168.1.201"
     assert lidar.hils_port == 2368
+    assert lidar.hils_start_epoch is None  # defaults to "now" at runtime

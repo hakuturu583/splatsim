@@ -30,3 +30,6 @@ class LidarConfig:
     # HILS UDP destination (only used when ``communication == "hils"``).
     hils_host: str = "127.0.0.1"
     hils_port: int = 2368
+    # Wall-clock (Unix) time that simulation time 0 maps to, stamped into the
+    # HILS packet date-time. ``None`` -> "now" when the sensor is created.
+    hils_start_epoch: float | None = None

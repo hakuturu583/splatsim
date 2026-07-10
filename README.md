@@ -93,7 +93,14 @@ lidar_sensors:
     communication: hils      # dds (default) | hils
     hils_host: 192.168.1.201 # UDP destination (unicast or broadcast)
     hils_port: 2368          # Hesai point-cloud port
+    # hils_start_epoch: 1700000000  # optional: Unix time that sim-time 0
+    #                               # maps to; omit to start "now".
 ```
+
+Packet timestamps use the **simulation clock**: the date-time/timestamp written
+into each packet is `hils_start_epoch + <simulation elapsed time>`. When
+`hils_start_epoch` is omitted it defaults to the wall-clock time at which the
+sensor is created (simulation starts "now").
 
 ## Development
 

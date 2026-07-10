@@ -9,11 +9,12 @@ import struct
 import numpy as np
 import pytest
 
-from splatsim.hils import HesaiHilsPublisher, build_packets, get_model, packet_size
+from splatsim.hils import HesaiHilsPublisher, build_packets, get_model
 from splatsim.hils.hesai_packet import (
     FACTORY_INFO,
     RETURN_MODE_STRONGEST,
     SOP,
+    packet_size,
 )
 
 
@@ -179,7 +180,10 @@ def test_publisher_sends_over_udp() -> None:
     recv.settimeout(2.0)
     host, port = recv.getsockname()
 
-    pub = HesaiHilsPublisher("XT32", host=host, port=port)
+    # Pin the sim start epoch so the packet date-time is deterministic.
+    pub = HesaiHilsPublisher(
+        "XT32", host=host, port=port, start_epoch_s=1_700_000_000.0
+    )
     model = pub.model
     n_az = model.blocks_per_packet
     distance_m, intensity, valid, az = _make_frame(model, n_az)
@@ -190,7 +194,7 @@ def test_publisher_sends_over_udp() -> None:
         valid=valid,
         azimuth_rad=az,
         spin_hz=10.0,
-        epoch_s=1_700_000_000.5,
+        sim_time_s=0.5,  # start_epoch + 0.5 s -> 500_000 us sub-second
     )
     assert n_sent == 1
 

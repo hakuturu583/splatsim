@@ -357,6 +357,7 @@ class SplatSimScenario(BaseScenario):
                 config.sensor_type,
                 host=config.hils_host,
                 port=config.hils_port,
+                start_epoch_s=config.hils_start_epoch,
             )
             logger.info(
                 "LiDAR %s: HILS transport -> %s UDP packets to %s:%d",
@@ -439,7 +440,8 @@ class SplatSimScenario(BaseScenario):
                     valid=range_image["valid"],
                     azimuth_rad=range_image["azimuths"],
                     spin_hz=entry.spin_hz,
-                    epoch_s=stamp.sec + stamp.nanosec * 1e-9,
+                    # CARLA stamp is simulation-elapsed time (episode start = 0).
+                    sim_time_s=stamp.sec + stamp.nanosec * 1e-9,
                 )
                 continue
 

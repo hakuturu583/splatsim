@@ -56,6 +56,12 @@ class HesaiHilsPublisher:
         Destination IP (unicast or broadcast) for the UDP packets.
     port:
         Destination UDP port (physical Hesai default is ``2368``).
+    start_epoch_s:
+        Wall-clock (Unix) time that simulation time ``0`` maps to. Packet
+        timestamps are ``start_epoch_s + sim_time_s`` so the wire clock is
+        the simulation's internal clock. Defaults to ``time.time()`` at
+        construction (i.e. the sim starts "now"); pass an explicit value to
+        pin the sensor's date-time to a fixed epoch.
     return_mode:
         Return-mode byte written into every packet tail.
     """
@@ -66,10 +72,14 @@ class HesaiHilsPublisher:
         *,
         host: str = "127.0.0.1",
         port: int = 2368,
+        start_epoch_s: Optional[float] = None,
         return_mode: int = RETURN_MODE_STRONGEST,
     ) -> None:
         self._model: HesaiModel = get_model(sensor_type)
         self._addr = (host, int(port))
+        self._start_epoch_s = (
+            time.time() if start_epoch_s is None else float(start_epoch_s)
+        )
         self._return_mode = return_mode
         self._sequence = 0
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -84,6 +94,10 @@ class HesaiHilsPublisher:
     def address(self) -> tuple[str, int]:
         return self._addr
 
+    @property
+    def start_epoch_s(self) -> float:
+        return self._start_epoch_s
+
     def build(
         self,
         *,
@@ -92,12 +106,14 @@ class HesaiHilsPublisher:
         valid: NDArray[np.bool_],
         azimuth_rad: NDArray[np.floating],
         spin_hz: float,
-        epoch_s: Optional[float] = None,
+        sim_time_s: float = 0.0,
     ) -> list[bytes]:
-        """Encode one range-image frame into packets (without sending)."""
-        if epoch_s is None:
-            epoch_s = time.time()
-        date_time, micros = _utc_date_time(epoch_s)
+        """Encode one range-image frame into packets (without sending).
+
+        ``sim_time_s`` is the simulation-internal elapsed time (seconds); the
+        packet date-time is ``start_epoch_s + sim_time_s``.
+        """
+        date_time, micros = _utc_date_time(self._start_epoch_s + sim_time_s)
         packets = build_packets(
             self._model,
             distance_m=distance_m,
@@ -121,7 +137,7 @@ class HesaiHilsPublisher:
         valid: NDArray[np.bool_],
         azimuth_rad: NDArray[np.floating],
         spin_hz: float,
-        epoch_s: Optional[float] = None,
+        sim_time_s: float = 0.0,
     ) -> int:
         """Encode a range-image frame and send every packet over UDP.
 
@@ -133,7 +149,7 @@ class HesaiHilsPublisher:
             valid=valid,
             azimuth_rad=azimuth_rad,
             spin_hz=spin_hz,
-            epoch_s=epoch_s,
+            sim_time_s=sim_time_s,
         )
         for pkt in packets:
             self._sock.sendto(pkt, self._addr)
