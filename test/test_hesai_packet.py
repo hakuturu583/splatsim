@@ -237,7 +237,8 @@ def test_frame_tensor_rows_match_packets(sensor_type: str) -> None:
     model = get_model(sensor_type)
     n_az = model.blocks_per_packet * 4 + 1  # exercises the pad row
     distance_m, intensity, valid, az = _make_frame(model, n_az)
-    kwargs = dict(
+    buf = build_frame_tensor(
+        model,
         distance_m=distance_m,
         intensity=intensity,
         valid=valid,
@@ -247,8 +248,17 @@ def test_frame_tensor_rows_match_packets(sensor_type: str) -> None:
         date_time=(125, 7, 10, 1, 2, 3),
         seq_start=3,
     )
-    buf = build_frame_tensor(model, **kwargs)
-    packets = build_packets(model, **kwargs)
+    packets = build_packets(
+        model,
+        distance_m=distance_m,
+        intensity=intensity,
+        valid=valid,
+        azimuth_rad=az,
+        motor_speed_rpm=600,
+        timestamp_us=99,
+        date_time=(125, 7, 10, 1, 2, 3),
+        seq_start=3,
+    )
     assert tuple(buf.shape) == (len(packets), model.packet_size)
     assert buf.dtype == torch.uint8
     rows = buf.cpu().numpy()

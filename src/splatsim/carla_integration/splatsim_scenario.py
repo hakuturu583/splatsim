@@ -337,7 +337,9 @@ class SplatSimScenario(BaseScenario):
         if timing is None:
             timing = _TickTiming.POST_TICK
 
-        config = sensor_config or self._lidar_sensor_config
+        config = (
+            sensor_config or self._lidar_sensor_config or SplatSimLidarSensorConfig()
+        )
 
         action = AttachSplatSimLidarAction(
             entity_name,
