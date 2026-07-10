@@ -611,10 +611,6 @@ class LidarRenderer:
         # Precompute the (H,) elevation table once (used by point-cloud conv).
         self._elevs = _sensor_row_elevations(sensor_spec).to(self.device)
         self._azimuths = _sensor_column_azimuths(sensor_spec).to(self.device)
-        # Host-side copies of the invariant angle tables so the range-image
-        # path doesn't re-sync them off the GPU every frame.
-        self._elevs_np = self._elevs.cpu().numpy().astype(np.float32)
-        self._azimuths_np = self._azimuths.cpu().numpy().astype(np.float32)
         # Prime the coeffs cache so the first render skips tile-assign cost.
         _ = sensor_spec.coeffs(self.device)
 
@@ -754,7 +750,7 @@ class LidarRenderer:
         *,
         drop_threshold: float = 0.5,
         alpha_threshold: float = 0.1,
-    ) -> dict[str, np.ndarray]:
+    ) -> dict[str, torch.Tensor]:
         """Convert a rendered panorama into a dense structured range image.
 
         Unlike :meth:`panorama_to_point_cloud` (which drops invalid cells and
@@ -763,44 +759,31 @@ class LidarRenderer:
         same validity gate is applied, exposed as a boolean mask; invalid
         cells keep their raw distance but should be treated as "no return".
 
+        Everything is returned **on the render device** (no host transfer) so a
+        GPU consumer — e.g. :func:`splatsim.hils.build_frame_tensor` — can
+        encode packets without a per-frame round-trip of the grids.
+
         Args:
             panorama: Output of :meth:`render`.
             drop_threshold: sigmoid(raydrop_logit) above this drops the sample.
             alpha_threshold: Minimum alpha coverage to keep a sample.
 
         Returns:
-            ``{"distance", "intensity", "valid", "azimuths", "elevations"}``.
-            ``distance`` / ``intensity`` / ``valid`` are ``(H, W)`` arrays
-            (``float32`` / ``float32`` / ``bool``); ``azimuths`` is ``(W,)``
-            and ``elevations`` is ``(H,)`` in radians (both ``float32``).
+            ``{"distance", "intensity", "valid", "azimuths", "elevations"}`` —
+            device tensors. ``distance`` / ``intensity`` / ``valid`` are
+            ``(H, W)`` (``float32`` / ``float32`` / ``bool``); ``azimuths`` is
+            ``(W,)`` and ``elevations`` is ``(H,)`` in radians.
         """
         valid = self._validity_mask(
             panorama, drop_threshold=drop_threshold, alpha_threshold=alpha_threshold
         )
 
-        # Coalesce distance/intensity/valid into a single device→host copy: one
-        # CUDA sync per frame instead of three. ``valid`` rides along as a float
-        # channel and is re-cast to bool host-side.
-        stacked = (
-            torch.stack(
-                [
-                    panorama["distance"].float(),
-                    panorama["intensity"].float(),
-                    valid.float(),
-                ],
-                dim=0,
-            )
-            .detach()
-            .cpu()
-            .numpy()
-        )
-
         return {
-            "distance": stacked[0],
-            "intensity": stacked[1],
-            "valid": stacked[2] != 0.0,
-            "azimuths": self._azimuths_np,
-            "elevations": self._elevs_np,
+            "distance": panorama["distance"].detach(),
+            "intensity": panorama["intensity"].detach(),
+            "valid": valid.detach(),
+            "azimuths": self._azimuths,
+            "elevations": self._elevs,
         }
 
 

@@ -1,4 +1,10 @@
-"""Round-trip and wire-format tests for the Hesai HILS packet encoders."""
+"""Round-trip and wire-format tests for the Hesai HILS packet encoders.
+
+Encoding runs on ``torch`` tensors (CPU here; CUDA in production). Distance and
+reflectivity are exact; azimuth may differ from an ideal fixed-point reference
+by at most 1 LSB (±0.01°) at floating-point tie points, so azimuth is checked
+with a ±1 tolerance.
+"""
 
 from __future__ import annotations
 
@@ -8,13 +14,14 @@ import struct
 
 import numpy as np
 import pytest
+import torch
 
 from splatsim.hils import HesaiHilsPublisher, build_packets, get_model
 from splatsim.hils.hesai_packet import (
     FACTORY_INFO,
     RETURN_MODE_STRONGEST,
     SOP,
-    build_frame_array,
+    build_frame_tensor,
 )
 
 
@@ -73,7 +80,14 @@ def _decode_packet(model, payload: bytes) -> dict:
     }
 
 
+def _azimuth_close(actual: int, expected: int, tol: int = 1) -> bool:
+    """True if two 0.01°-unit azimuths are within ``tol`` LSB (circular)."""
+    diff = abs(int(actual) - int(expected)) % 36000
+    return min(diff, 36000 - diff) <= tol
+
+
 def _make_frame(model, n_az: int):
+    """Build a deterministic range image as CPU torch tensors."""
     channels = model.channels
     rng = np.arange(channels * n_az, dtype=np.float64).reshape(channels, n_az)
     # Distances as exact multiples of the distance unit so quantization is lossless.
@@ -82,7 +96,12 @@ def _make_frame(model, n_az: int):
     valid = np.ones((channels, n_az), dtype=bool)
     valid[0, 0] = False  # one no-return cell
     azimuth_rad = np.linspace(math.pi, -math.pi, n_az, endpoint=False)
-    return distance_m, intensity, valid, azimuth_rad
+    return (
+        torch.from_numpy(distance_m.astype(np.float32)),
+        torch.from_numpy(intensity),
+        torch.from_numpy(valid),
+        torch.from_numpy(azimuth_rad.astype(np.float32)),
+    )
 
 
 @pytest.mark.parametrize("sensor_type", ["XT32", "OT128"])
@@ -138,19 +157,25 @@ def test_round_trip_values(sensor_type: str) -> None:
     assert dec["date_time"] == (125, 7, 10, 1, 2, 3)
     assert dec["seq"] == 5
 
+    distance_np = distance_m.numpy()
+    intensity_np = intensity.numpy()
+    valid_np = valid.numpy()
+    az_np = az.numpy()
     for a, (az_u16, _fine, dist, refl) in enumerate(dec["blocks"]):
-        # Azimuth round-trips within one 0.01deg unit.
-        expected_az = round((math.degrees(az[a]) % 360.0) * 100.0) % 36000
-        assert az_u16 == expected_az
+        # Azimuth round-trips within one 0.01deg unit (torch.round tie-breaking).
+        expected_az = round((math.degrees(az_np[a]) % 360.0) * 100.0) % 36000
+        assert _azimuth_close(az_u16, expected_az)
         # Distances round-trip to metres (chosen as exact unit multiples).
         decoded_m = dist.astype(np.float64) * model.distance_unit_m
         for c in range(model.channels):
-            if valid[c, a]:
-                assert decoded_m[c] == pytest.approx(distance_m[c, a], abs=1e-6)
+            if valid_np[c, a]:
+                assert decoded_m[c] == pytest.approx(distance_np[c, a], abs=1e-4)
             else:
                 assert dist[c] == 0  # no-return
         # Reflectivity round-trips to the nearest 1/255.
-        expected_refl = np.rint(np.clip(intensity[:, a], 0, 1) * 255).astype(np.uint8)
+        expected_refl = np.rint(np.clip(intensity_np[:, a], 0, 1) * 255).astype(
+            np.uint8
+        )
         assert np.array_equal(refl, expected_refl)
 
 
@@ -158,7 +183,7 @@ def test_invalid_cells_are_no_return() -> None:
     model = get_model("XT32")
     n_az = model.blocks_per_packet
     distance_m, intensity, valid, az = _make_frame(model, n_az)
-    valid[:] = False  # everything drops
+    valid = torch.zeros_like(valid)  # everything drops
     packets = build_packets(
         model,
         distance_m=distance_m,
@@ -207,8 +232,8 @@ def test_publisher_sends_over_udp() -> None:
 
 
 @pytest.mark.parametrize("sensor_type", ["XT32", "OT128"])
-def test_frame_array_rows_match_packets(sensor_type: str) -> None:
-    """The vectorized byte grid is byte-identical to the list-of-bytes form."""
+def test_frame_tensor_rows_match_packets(sensor_type: str) -> None:
+    """The encoded byte grid's rows equal the list-of-bytes form."""
     model = get_model(sensor_type)
     n_az = model.blocks_per_packet * 4 + 1  # exercises the pad row
     distance_m, intensity, valid, az = _make_frame(model, n_az)
@@ -222,12 +247,13 @@ def test_frame_array_rows_match_packets(sensor_type: str) -> None:
         date_time=(125, 7, 10, 1, 2, 3),
         seq_start=3,
     )
-    buf = build_frame_array(model, **kwargs)
+    buf = build_frame_tensor(model, **kwargs)
     packets = build_packets(model, **kwargs)
-    assert buf.shape == (len(packets), model.packet_size)
-    assert buf.dtype == np.uint8
+    assert tuple(buf.shape) == (len(packets), model.packet_size)
+    assert buf.dtype == torch.uint8
+    rows = buf.cpu().numpy()
     for k, pkt in enumerate(packets):
-        assert buf[k].tobytes() == pkt
+        assert rows[k].tobytes() == pkt
 
 
 def test_unsupported_sensor_raises() -> None:

@@ -2,25 +2,28 @@
 
 Wraps :mod:`splatsim.hils.hesai_packet` with a UDP socket so a rendered
 range image can be streamed to a real LiDAR driver as if it came from the
-physical sensor. Pure standard-library networking — no DDS/CARLA/torch
-dependency — so it works in the core (headless) install.
+physical sensor. The range image is encoded with ``torch`` (on the GPU when
+the tensors are CUDA); only the final packed byte buffer is moved to the host,
+once, for the UDP send.
 """
 
 from __future__ import annotations
 
 import socket
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-import numpy as np
-from numpy.typing import NDArray
+import torch
 
 from splatsim.hils.hesai_packet import (
     RETURN_MODE_STRONGEST,
     HesaiModel,
-    build_frame_array,
+    build_frame_tensor,
     get_model,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 def _utc_date_time(epoch_s: float) -> tuple[tuple[int, int, int, int, int, int], int]:
@@ -101,21 +104,23 @@ class HesaiHilsPublisher:
     def build_array(
         self,
         *,
-        distance_m: NDArray[np.floating],
-        intensity: NDArray[np.floating],
-        valid: NDArray[np.bool_],
-        azimuth_rad: NDArray[np.floating],
+        distance_m: torch.Tensor,
+        intensity: torch.Tensor,
+        valid: torch.Tensor,
+        azimuth_rad: torch.Tensor,
         spin_hz: float,
         sim_time_s: float = 0.0,
-    ) -> NDArray[np.uint8]:
-        """Encode one frame into a ``(n_packets, packet_size)`` byte grid.
+    ) -> "np.ndarray":
+        """Encode one frame into a host-side ``(n_packets, packet_size)`` grid.
 
-        ``sim_time_s`` is the simulation-internal elapsed time (seconds); the
-        packet date-time is ``start_epoch_s + sim_time_s``. Each row is a
-        ready-to-send packet. Advances the UDP sequence counter.
+        Inputs are ``torch`` tensors (CUDA -> encoded on the GPU). The single
+        device->host copy happens here; each returned row is a ready-to-send
+        packet. ``sim_time_s`` is the simulation-internal elapsed time
+        (seconds); the packet date-time is ``start_epoch_s + sim_time_s``.
+        Advances the UDP sequence counter.
         """
         date_time, micros = _utc_date_time(self._start_epoch_s + sim_time_s)
-        buf = build_frame_array(
+        buf = build_frame_tensor(
             self._model,
             distance_m=distance_m,
             intensity=intensity,
@@ -128,21 +133,21 @@ class HesaiHilsPublisher:
             seq_start=self._sequence,
         )
         self._sequence = (self._sequence + buf.shape[0]) & 0xFFFFFFFF
-        return buf
+        return buf.cpu().numpy()
 
     def publish(
         self,
         *,
-        distance_m: NDArray[np.floating],
-        intensity: NDArray[np.floating],
-        valid: NDArray[np.bool_],
-        azimuth_rad: NDArray[np.floating],
+        distance_m: torch.Tensor,
+        intensity: torch.Tensor,
+        valid: torch.Tensor,
+        azimuth_rad: torch.Tensor,
         spin_hz: float,
         sim_time_s: float = 0.0,
     ) -> int:
         """Encode a range-image frame and send every packet over UDP.
 
-        Sends each packet straight from its row in the encoded byte grid (via
+        Sends each packet straight from its row in the host-side byte grid (via
         the buffer protocol — no per-packet ``bytes`` copy). Returns the
         number of packets sent.
         """

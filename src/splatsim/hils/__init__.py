@@ -8,6 +8,7 @@ Selected per sensor via ``communication: hils`` in the scene config.
 from splatsim.hils.hesai_packet import (
     MODELS,
     HesaiModel,
+    build_frame_tensor,
     build_packets,
     get_model,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "MODELS",
     "HesaiHilsPublisher",
     "HesaiModel",
+    "build_frame_tensor",
     "build_packets",
     "get_model",
 ]

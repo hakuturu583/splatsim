@@ -122,14 +122,15 @@ class SplatSimLidarSensor(LidarSensorBase):
         point_cloud[:, 3] = intensity
         return point_cloud
 
-    def get_range_image(self) -> Optional[dict[str, NDArray]]:
+    def get_range_image(self) -> Optional[dict[str, torch.Tensor]]:
         """Render the latest scan as a dense structured range image.
 
         Used by the HILS transport to build raw Hesai UDP packets. Returns
         ``None`` if the sensor is not attached yet, otherwise the dict from
-        :meth:`LidarRenderer.panorama_to_range_image` with keys
-        ``distance`` / ``intensity`` / ``valid`` (``(H, W)``) and
-        ``azimuths`` (``(W,)``) / ``elevations`` (``(H,)``).
+        :meth:`LidarRenderer.panorama_to_range_image` (device tensors) with
+        keys ``distance`` / ``intensity`` / ``valid`` (``(H, W)``) and
+        ``azimuths`` (``(W,)``) / ``elevations`` (``(H,)``). Tensors stay on
+        the render device so the publisher can encode packets on the GPU.
         """
         if self._actor is None:
             return None

@@ -102,6 +102,10 @@ into each packet is `hils_start_epoch + <simulation elapsed time>`. When
 `hils_start_epoch` is omitted it defaults to the wall-clock time at which the
 sensor is created (simulation starts "now").
 
+Packets are encoded with `torch` directly from the rendered range image, so when
+the renderer runs on CUDA the entire encode stays on the GPU and only the packed
+byte buffer crosses to the host (once per frame) for the UDP send.
+
 ## Development
 
 ```bash

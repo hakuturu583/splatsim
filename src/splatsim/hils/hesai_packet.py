@@ -6,6 +6,19 @@ sensor would emit on the wire, instead of a decoded ``PointCloud2``. This
 module turns a rendered *range image* (per-channel, per-azimuth distance +
 reflectivity, with a validity mask) into that byte stream.
 
+Encoding is done with ``torch`` tensor ops so it runs on whatever device the
+range image lives on. Because the renderer produces the panorama on the GPU,
+passing CUDA tensors keeps the entire encode on-device — no per-frame host
+round-trip of the distance/intensity grids; only the final packed byte buffer
+crosses to the host (once, for the UDP send).
+
+.. note::
+
+   Encoding uses ``torch.round`` where the physical wire format is defined by
+   the sensor's fixed-point rounding. This can differ from a CPU reference by
+   at most 1 LSB on the azimuth field (±0.01°) at floating-point tie points —
+   negligible for a simulated sensor. Distance and reflectivity are exact.
+
 Supported sensors (matching :mod:`splatsim.lidar_renderer`):
 
 * ``XT32``  — Hesai PandarXT-32. 8 blocks/packet, 32 channels/block,
@@ -42,8 +55,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-import numpy as np
-from numpy.typing import NDArray
+import torch
 
 # ── Shared wire constants ────────────────────────────────────────────
 
@@ -133,39 +145,9 @@ def get_model(sensor_type: str) -> HesaiModel:
 # ── Encoding helpers ─────────────────────────────────────────────────
 
 
-def _encode_distance(
-    range_m: NDArray[np.floating],
-    valid: NDArray[np.bool_],
-    distance_unit_m: float,
-) -> NDArray[np.uint16]:
-    """Range (m) -> uint16 distance in sensor units; 0 where invalid.
-
-    Distances stay within float32 integer-exact range (max ~30000 units),
-    so no float64 widening is needed.
-    """
-    out = np.clip(np.rint(range_m / distance_unit_m), 0, _UINT16_MAX).astype(np.uint16)
-    # Zero the no-return cells with a multiply (bool viewed as 0/1) — an order
-    # of magnitude cheaper than boolean fancy-indexing ``out[~valid] = 0``.
-    out *= valid.view(np.uint8)
-    return out
-
-
-def _encode_reflectivity(intensity: NDArray[np.floating]) -> NDArray[np.uint8]:
-    """Intensity in [0, 1] -> uint8 reflectivity in [0, 255]."""
-    return np.rint(np.clip(intensity, 0.0, 1.0) * 255.0).astype(np.uint8)
-
-
-def _encode_azimuth(azimuth_rad: NDArray[np.floating]) -> NDArray[np.uint16]:
-    """Azimuth (rad) -> uint16 in units of 0.01°, wrapped to [0, 36000)."""
-    deg = np.degrees(azimuth_rad) % 360.0
-    return np.rint(deg * 100.0).astype(np.uint16)
-
-
-def _fine_azimuth(azimuth_rad: NDArray[np.floating]) -> NDArray[np.uint8]:
-    """Fractional azimuth byte for E4X (1/256 of the 0.01° coarse unit)."""
-    hundredths = (np.degrees(azimuth_rad) % 360.0) * 100.0
-    frac = hundredths - np.floor(hundredths)
-    return np.clip(np.rint(frac * 256.0), 0, 255).astype(np.uint8)
+def _const_bytes_to_tensor(data: bytes, device: torch.device) -> torch.Tensor:
+    """A small constant byte string (header/tail) as a uint8 tensor on device."""
+    return torch.frombuffer(bytearray(data), dtype=torch.uint8).to(device)
 
 
 def _header(model: HesaiModel) -> bytes:
@@ -215,133 +197,31 @@ def _tail(
     )
 
 
-def _encode_body(
-    model: HesaiModel,
-    az_u16: NDArray[np.uint16],  # (n_az,)
-    fine_u8: NDArray[np.uint8],  # (n_az,)
-    dist_u16: NDArray[np.uint16],  # (channels, n_az)
-    refl_u8: NDArray[np.uint8],  # (channels, n_az)
-) -> NDArray[np.uint8]:
-    """Pack the whole scan into a ``(n_az_padded, block_size)`` byte grid.
-
-    One row per firing (block). ``n_az`` is padded up to a multiple of
-    ``blocks_per_packet`` with zeroed rows so packets are a fixed size; each
-    packet is then a contiguous ``blocks_per_packet``-row slice. Fully
-    vectorized — no per-block Python allocation.
-    """
-    channels = model.channels
-    n_az = az_u16.shape[0]
-    bpp = model.blocks_per_packet
-    n_pad = ((n_az + bpp - 1) // bpp) * bpp  # round up to a whole packet count
-
-    body = np.zeros((n_pad, model.block_size), dtype=np.uint8)
-    body[:n_az, 0] = az_u16 & 0xFF
-    body[:n_az, 1] = (az_u16 >> 8) & 0xFF
-    unit_off = 2
-    if model.has_fine_azimuth:
-        body[:n_az, 2] = fine_u8
-        unit_off = 3
-
-    # Units: distance_lo(1) + distance_hi(1) + reflectivity(1) + reserved(1).
-    units = body[:n_az, unit_off : unit_off + channels * 4].reshape(n_az, channels, 4)
-    units[..., 0] = (dist_u16 & 0xFF).T
-    units[..., 1] = (dist_u16 >> 8).T
-    units[..., 2] = refl_u8.T
-    return body
-
-
-def build_frame_array(
+def build_frame_tensor(
     model: HesaiModel,
     *,
-    distance_m: NDArray[np.floating],  # (channels, n_azimuth)
-    intensity: NDArray[np.floating],  # (channels, n_azimuth)
-    valid: NDArray[np.bool_],  # (channels, n_azimuth)
-    azimuth_rad: NDArray[np.floating],  # (n_azimuth,)
+    distance_m: torch.Tensor,  # (channels, n_azimuth) float, metres
+    intensity: torch.Tensor,  # (channels, n_azimuth) float, [0, 1]
+    valid: torch.Tensor,  # (channels, n_azimuth) bool
+    azimuth_rad: torch.Tensor,  # (n_azimuth,) float, radians
     motor_speed_rpm: int,
     timestamp_us: int,
     date_time: tuple[int, int, int, int, int, int],
     return_mode: int = RETURN_MODE_STRONGEST,
     seq_start: int = 0,
-) -> NDArray[np.uint8]:
-    """Encode a full range image into a ``(n_packets, packet_size)`` byte grid.
+) -> torch.Tensor:
+    """Encode a range image into a ``(n_packets, packet_size)`` uint8 tensor.
 
     The range image is a ``(channels, n_azimuth)`` grid where column ``a`` is
     one firing at ``azimuth_rad[a]`` and row ``c`` is beam channel ``c``.
     Columns are grouped into packets of ``model.blocks_per_packet`` blocks.
 
-    Fully vectorized: the header and tail are written once and broadcast across
-    every packet row; only the per-packet UDP sequence counter varies. The
-    returned array is C-contiguous, so each row is a ready-to-send packet
-    (``row.tobytes()`` or ``socket.sendto(row, ...)``) — no per-packet Python
-    assembly.
-
-    Args mirror :func:`build_packets`.
-    """
-    if distance_m.shape != intensity.shape or distance_m.shape != valid.shape:
-        raise ValueError(
-            "distance_m, intensity and valid must share shape; got "
-            f"{distance_m.shape}, {intensity.shape}, {valid.shape}"
-        )
-    channels, n_az = distance_m.shape
-    if channels != model.channels:
-        raise ValueError(
-            f"{model.name} expects {model.channels} channels; got {channels}"
-        )
-    if azimuth_rad.shape[0] != n_az:
-        raise ValueError(f"azimuth_rad length {azimuth_rad.shape[0]} != columns {n_az}")
-
-    dist_u16 = _encode_distance(distance_m, valid, model.distance_unit_m)
-    refl_u8 = _encode_reflectivity(intensity)
-    az_u16 = _encode_azimuth(azimuth_rad)
-    fine_u8 = (
-        _fine_azimuth(azimuth_rad)
-        if model.has_fine_azimuth
-        else np.zeros(n_az, dtype=np.uint8)
-    )
-
-    body = _encode_body(model, az_u16, fine_u8, dist_u16, refl_u8)
-    bpp = model.blocks_per_packet
-    body_bytes = bpp * model.block_size
-    n_packets = body.shape[0] // bpp
-    psize = model.packet_size
-    tail_off = _HEADER_SIZE + body_bytes
-
-    buf = np.empty((n_packets, psize), dtype=np.uint8)
-    buf[:, :_HEADER_SIZE] = np.frombuffer(_header(model), dtype=np.uint8)
-    buf[:, _HEADER_SIZE:tail_off] = body.reshape(n_packets, body_bytes)
-    tail = _tail(
-        model,
-        motor_speed_rpm=motor_speed_rpm,
-        timestamp_us=timestamp_us,
-        return_mode=return_mode,
-        date_time=date_time,
-        udp_sequence=0,
-    )
-    buf[:, tail_off:] = np.frombuffer(tail, dtype=np.uint8)
-    # Overwrite the per-packet UDP sequence (last 4 bytes, little-endian u32).
-    seqs = ((seq_start + np.arange(n_packets)) & 0xFFFFFFFF).astype("<u4")
-    buf[:, psize - 4 :] = seqs.view(np.uint8).reshape(n_packets, 4)
-    return buf
-
-
-def build_packets(
-    model: HesaiModel,
-    *,
-    distance_m: NDArray[np.floating],  # (channels, n_azimuth)
-    intensity: NDArray[np.floating],  # (channels, n_azimuth)
-    valid: NDArray[np.bool_],  # (channels, n_azimuth)
-    azimuth_rad: NDArray[np.floating],  # (n_azimuth,)
-    motor_speed_rpm: int,
-    timestamp_us: int,
-    date_time: tuple[int, int, int, int, int, int],
-    return_mode: int = RETURN_MODE_STRONGEST,
-    seq_start: int = 0,
-) -> list[bytes]:
-    """Encode a range image into a list of UDP packet payloads (``bytes``).
-
-    Thin ``bytes`` wrapper over :func:`build_frame_array` for callers that
-    want individual payloads (tests, non-socket use). The hot UDP path should
-    prefer :func:`build_frame_array` and send rows directly.
+    All arithmetic runs with ``torch`` on the input tensors' device, so CUDA
+    inputs are encoded on the GPU and the result stays on the GPU until the
+    caller moves it to the host. The buffer is row-contiguous, so each row is a
+    ready-to-send packet once on the host (``row.tobytes()`` /
+    ``socket.sendto(row, ...)``). The header and tail are written once and
+    broadcast across every packet row; only the per-packet UDP sequence varies.
 
     Args:
         distance_m: Per-cell range in metres.
@@ -353,11 +233,104 @@ def build_packets(
         date_time: UTC ``(year-1900, month, day, hour, minute, second)``.
         return_mode: Return-mode byte (default single strongest).
         seq_start: First UDP sequence number (incremented per packet).
-
-    Returns:
-        A list of packet payloads (``bytes``), in azimuth order.
     """
-    buf = build_frame_array(
+    if distance_m.shape != intensity.shape or distance_m.shape != valid.shape:
+        raise ValueError(
+            "distance_m, intensity and valid must share shape; got "
+            f"{tuple(distance_m.shape)}, {tuple(intensity.shape)}, "
+            f"{tuple(valid.shape)}"
+        )
+    channels, n_az = distance_m.shape
+    if channels != model.channels:
+        raise ValueError(
+            f"{model.name} expects {model.channels} channels; got {channels}"
+        )
+    if azimuth_rad.shape[0] != n_az:
+        raise ValueError(f"azimuth_rad length {azimuth_rad.shape[0]} != columns {n_az}")
+
+    device = distance_m.device
+    bpp = model.blocks_per_packet
+    n_pad = ((n_az + bpp - 1) // bpp) * bpp  # round up to a whole packet count
+    n_packets = n_pad // bpp
+    block_size = model.block_size
+    psize = model.packet_size
+    tail_off = _HEADER_SIZE + bpp * block_size
+
+    # ── per-cell fixed-point encode (int32 intermediates: torch's uint16
+    # arithmetic is immature, so compute in int32 and narrow the byte lanes) ──
+    raw = torch.clamp(
+        torch.round(distance_m / model.distance_unit_m), 0, _UINT16_MAX
+    ).to(torch.int32)
+    raw = raw * valid.to(torch.int32)  # zero the no-return cells
+    dist_lo = (raw & 0xFF).to(torch.uint8)  # (channels, n_az)
+    dist_hi = ((raw >> 8) & 0xFF).to(torch.uint8)
+    refl = torch.clamp(
+        torch.round(torch.clamp(intensity, 0.0, 1.0) * 255.0), 0, 255
+    ).to(torch.uint8)
+
+    deg = torch.remainder(torch.rad2deg(azimuth_rad), 360.0)  # (n_az,)
+    az = torch.clamp(torch.round(deg * 100.0), 0, _UINT16_MAX).to(torch.int32)
+
+    # ── body grid (n_pad, block_size); pad rows stay zero for fixed size ──
+    body = torch.zeros((n_pad, block_size), dtype=torch.uint8, device=device)
+    body[:n_az, 0] = (az & 0xFF).to(torch.uint8)
+    body[:n_az, 1] = ((az >> 8) & 0xFF).to(torch.uint8)
+    unit_off = 2
+    if model.has_fine_azimuth:
+        frac = (deg * 100.0) - torch.floor(deg * 100.0)
+        body[:n_az, 2] = torch.clamp(torch.round(frac * 256.0), 0, 255).to(torch.uint8)
+        unit_off = 3
+
+    # Units: distance_lo(1) + distance_hi(1) + reflectivity(1) + reserved(1).
+    units = torch.zeros((n_az, channels, 4), dtype=torch.uint8, device=device)
+    units[..., 0] = dist_lo.T
+    units[..., 1] = dist_hi.T
+    units[..., 2] = refl.T
+    body[:n_az, unit_off : unit_off + channels * 4] = units.reshape(n_az, channels * 4)
+
+    # ── assemble packets ──
+    buf = torch.zeros((n_packets, psize), dtype=torch.uint8, device=device)
+    buf[:, :_HEADER_SIZE] = _const_bytes_to_tensor(_header(model), device)
+    buf[:, _HEADER_SIZE:tail_off] = body.reshape(n_packets, bpp * block_size)
+    tail = _tail(
+        model,
+        motor_speed_rpm=motor_speed_rpm,
+        timestamp_us=timestamp_us,
+        return_mode=return_mode,
+        date_time=date_time,
+        udp_sequence=0,
+    )
+    buf[:, tail_off:] = _const_bytes_to_tensor(tail, device)
+    # Per-packet UDP sequence: last 4 bytes, little-endian u32.
+    seqs = (seq_start + torch.arange(n_packets, device=device, dtype=torch.int64)) & (
+        0xFFFFFFFF
+    )
+    for b in range(4):
+        buf[:, psize - 4 + b] = ((seqs >> (8 * b)) & 0xFF).to(torch.uint8)
+    return buf
+
+
+def build_packets(
+    model: HesaiModel,
+    *,
+    distance_m: torch.Tensor,
+    intensity: torch.Tensor,
+    valid: torch.Tensor,
+    azimuth_rad: torch.Tensor,
+    motor_speed_rpm: int,
+    timestamp_us: int,
+    date_time: tuple[int, int, int, int, int, int],
+    return_mode: int = RETURN_MODE_STRONGEST,
+    seq_start: int = 0,
+) -> list[bytes]:
+    """Encode a range image into a list of UDP packet payloads (``bytes``).
+
+    Thin ``bytes`` wrapper over :func:`build_frame_tensor` for callers that
+    want individual payloads (tests, non-socket use). The hot UDP path should
+    prefer :func:`build_frame_tensor` and send its rows directly. Args mirror
+    :func:`build_frame_tensor`.
+    """
+    buf = build_frame_tensor(
         model,
         distance_m=distance_m,
         intensity=intensity,
@@ -369,7 +342,7 @@ def build_packets(
         return_mode=return_mode,
         seq_start=seq_start,
     )
-    return [row.tobytes() for row in buf]
+    return [row.tobytes() for row in buf.cpu().numpy()]
 
 
 __all__ = [
@@ -380,7 +353,7 @@ __all__ = [
     "RETURN_MODE_STRONGEST",
     "SOP",
     "HesaiModel",
-    "build_frame_array",
+    "build_frame_tensor",
     "build_packets",
     "get_model",
 ]
