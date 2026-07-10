@@ -1,6 +1,6 @@
 [project]
 name = "splatsim"
-version = "0.2.0"
+version = "0.3.1"
 description = "Add your description here"
 readme = "README.md"
 authors = [
@@ -41,6 +41,15 @@ all = [
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
+
+# gsplat compiles CUDA kernels during install and pulls `torch` unpinned as a
+# PEP 518 build dep. Without a constraint, uv's isolated build env grabs the
+# latest torch (currently 2.9.x, CUDA 13), which mismatches our CUDA 12.4
+# container's nvcc and fails with the "detected CUDA version mismatches"
+# RuntimeError from torch.utils.cpp_extension. Pin the build-time torch to
+# the 2.4 series (CUDA 12.1 on the default PyPI wheel) so the major CUDA
+# version matches the container.
+build-constraint-dependencies = ["torch<2.5"]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"
