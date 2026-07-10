@@ -2058,7 +2058,7 @@ wheels = [
 
 [[package]]
 name = "splatsim"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "3dgs-io", marker = "sys_platform == 'linux'" },
