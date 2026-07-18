@@ -50,6 +50,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN mkdir -p "${TORCH_EXTENSIONS_DIR}" \
  && uv run python -c "from gsplat.cuda._backend import _C; assert _C is not None, 'gsplat CUDA JIT compilation failed'"
 
+# Pre-compile splatsim's fused LiDAR cull kernel too (same reasoning as above:
+# the runtime image is a CUDA runtime container without nvcc, so we build the
+# `.so` here and let ``_lidar_cull_ext._load_prebuilt`` pick it up at runtime).
+RUN uv run python -c "from splatsim._lidar_cull_ext import _try_load; assert _try_load() is not None, 'splatsim CUDA cull JIT compilation failed'"
+
 # Patch gsplat _backend.py so it can load the pre-compiled .so without nvcc.
 # The upstream code gates on cuda_toolkit_available() which requires nvcc even
 # when a compiled extension already exists.  This patch adds a fallback that
