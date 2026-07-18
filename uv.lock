@@ -14,10 +14,12 @@ build-constraints = [{ name = "torch", specifier = "<2.5", index = "https://down
 
 [[package]]
 name = "3dgs-io"
-version = "0.3.0"
-source = { git = "https://github.com/autowarefoundation/3dgs_io.git?branch=feat%2Fusdz-io#f4a89a2f9499c8a71c0036045927f629f3cfef0a" }
+version = "0.10.0"
+source = { git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v0.10.0#6e113c6b23e9ee950dd58d6935e0441830d0be11" }
 dependencies = [
     { name = "numpy", marker = "sys_platform == 'linux'" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' and sys_platform == 'linux'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' and sys_platform == 'linux'" },
     { name = "spz", marker = "sys_platform == 'linux'" },
 ]
 
@@ -1465,6 +1467,16 @@ wheels = [
 ]
 
 [[package]]
+name = "ppisp"
+version = "1.2.1"
+source = { git = "https://github.com/nv-tlabs/ppisp.git?rev=df33809f7b3b20ac06de088dfc871b144b8fb54d#df33809f7b3b20ac06de088dfc871b144b8fb54d" }
+dependencies = [
+    { name = "matplotlib", marker = "sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+    { name = "torch", marker = "sys_platform == 'linux'" },
+]
+
+[[package]]
 name = "pre-commit"
 version = "4.5.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2069,6 +2081,7 @@ dependencies = [
     { name = "grpcio-tools", marker = "sys_platform == 'linux'" },
     { name = "gsplat", extra = ["lidar"], marker = "sys_platform == 'linux'" },
     { name = "packaging", marker = "sys_platform == 'linux'" },
+    { name = "ppisp", marker = "sys_platform == 'linux'" },
     { name = "protobuf", marker = "sys_platform == 'linux'" },
     { name = "pyyaml", marker = "sys_platform == 'linux'" },
     { name = "setuptools", marker = "sys_platform == 'linux'" },
@@ -2114,7 +2127,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?branch=feat%2Fusdz-io" },
+    { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v0.10.0" },
     { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=348108571cf4abec1f668ca0999753b75b8a5e4b" },
     { name = "autoware-lanelet2-to-opendrive", marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=348108571cf4abec1f668ca0999753b75b8a5e4b" },
     { name = "cyclonedds", marker = "extra == 'carla'", specifier = ">=11.0.1" },
@@ -2124,6 +2137,7 @@ requires-dist = [
     { name = "gsplat", extras = ["lidar"], git = "https://github.com/nerfstudio-project/gsplat.git?rev=4e52698e45eaaed929ed3a5065e96a688d085df6" },
     { name = "opencv-python-headless", marker = "extra == 'dds'", specifier = ">=4.0.0" },
     { name = "packaging" },
+    { name = "ppisp", git = "https://github.com/nv-tlabs/ppisp.git?rev=df33809f7b3b20ac06de088dfc871b144b8fb54d" },
     { name = "protobuf", specifier = ">=4.25.0" },
     { name = "pyproj", marker = "extra == 'carla'", specifier = ">=3.7.1" },
     { name = "pyqt5", marker = "extra == 'gui'", specifier = ">=5.15.0" },

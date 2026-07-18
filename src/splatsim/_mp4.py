@@ -85,7 +85,7 @@ def render_trajectory_mp4(
         ):
             viewmat = torch.tensor(w2c, device=renderer.device, dtype=torch.float32)
             with torch.no_grad():
-                rgb = renderer.render(viewmat, K, scene=scene)
+                rgb = renderer.render(viewmat, K, scene=scene, camera_name=cam.name)
             rgb_u8 = (rgb.clamp(0.0, 1.0) * 255).byte().cpu().numpy()
             bgr_u8 = np.ascontiguousarray(rgb_u8[:, :, ::-1])
             writer.write(bgr_u8)

@@ -106,6 +106,7 @@ class Viewer(QMainWindow):
         pointcloud_publisher: PointCloud2Publisher | None = None,
         lidar_drop_threshold: float = 0.5,
         lidar_alpha_threshold: float = 0.1,
+        camera_name: str | None = None,
     ) -> None:
         # QApplication must exist before QMainWindow.__init__
         self._app = QApplication.instance() or QApplication(sys.argv)
@@ -117,6 +118,7 @@ class Viewer(QMainWindow):
         self.move_speed = move_speed
         self.rotate_speed = rotate_speed
         self.lidar_renderer = lidar_renderer
+        self.camera_name = camera_name
 
         # Camera state (RUB: +X=right, +Y=up, -Z=forward)
         if initial_position is not None:
@@ -310,7 +312,12 @@ class Viewer(QMainWindow):
     def _render_camera_np(self) -> np.ndarray:
         viewmat = self._build_viewmat()
         with torch.no_grad():
-            image = self.renderer.render(viewmat, self._K, scene=self.scene)
+            image = self.renderer.render(
+                viewmat,
+                self._K,
+                scene=self.scene,
+                camera_name=self.camera_name,
+            )
         image_np = (image.clamp(0.0, 1.0) * 255).byte().cpu().numpy()
         image_np = np.ascontiguousarray(image_np)
 
@@ -614,6 +621,7 @@ def main() -> None:
         far_plane=rc.far_plane,
         radius_clip=rc.radius_clip,
         exposure=rc.exposure,
+        ppisp_knn_k=rc.ppisp_knn_k,
     )
 
     if args.mp4:
@@ -660,6 +668,7 @@ def main() -> None:
         lidar_alpha_threshold=(
             lidar_cfg.alpha_threshold if lidar_cfg is not None else 0.1
         ),
+        camera_name=args.camera,
     )
     viewer.run()
 

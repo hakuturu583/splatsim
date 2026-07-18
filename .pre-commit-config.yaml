@@ -20,7 +20,11 @@ repos:
     hooks:
       - id: ty
         name: ty
-        entry: uv run --all-extras ty check
+        # Use the already-provisioned environment (CI installs all extras except
+        # ppisp, whose CUDA extension cannot build without a CUDA toolkit). Without
+        # --no-sync, `uv run` would re-sync and rebuild ppisp, failing the hook in
+        # CUDA-free environments.
+        entry: uv run --no-sync ty check
         language: system
         types: [python]
         pass_filenames: false

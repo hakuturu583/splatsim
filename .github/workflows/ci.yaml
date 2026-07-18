@@ -35,7 +35,17 @@ jobs:
             python3-dev
 
       - name: Install dependencies
-        run: uv sync --dev
+        # ppisp ships a CUDA extension (ppisp_cuda) whose setup.py unconditionally
+        # constructs a torch CUDAExtension, which requires CUDA_HOME/nvcc even to
+        # resolve its build requirements. This lint-only job runs without the CUDA
+        # toolkit (BUILD_NO_CUDA=1), so skip building ppisp here. splatsim never
+        # imports it statically (it is loaded lazily via importlib at render time),
+        # so linting and type-checking are unaffected.
+        #
+        # Provision every extra (minus ppisp) up front so the `ty` pre-commit hook
+        # can run with `uv run --no-sync` against this environment instead of
+        # re-syncing and re-triggering the ppisp build.
+        run: uv sync --dev --all-extras --no-install-package ppisp
         env:
           BUILD_NO_CUDA: "1"
 

@@ -443,6 +443,25 @@ def read_rig_trajectories(usdz_path: str | Path, rig_uri: str) -> list[Any]:
     return _parse_rig_trajectories(doc)
 
 
+def load_rig_trajectories(usdz_path: str | Path) -> list[Any]:
+    """Return the rigs referenced by ``scene.json.extras.rig_trajectories``.
+
+    Returns ``[]`` when the archive has no scene metadata, no
+    ``rig_trajectories`` extra, or the referenced sidecar is missing.
+    """
+    try:
+        meta = read_scene_json(usdz_path)
+    except (OSError, KeyError, ValueError):
+        return []
+    rig_uri = meta.get("extras", {}).get("rig_trajectories")
+    if not rig_uri:
+        return []
+    try:
+        return read_rig_trajectories(usdz_path, rig_uri)
+    except (OSError, KeyError, ValueError):
+        return []
+
+
 def initial_camera_pose_from_rig_trajectories(
     rigs: list[Any],
     name: str | None = None,
