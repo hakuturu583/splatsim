@@ -23,6 +23,7 @@ from splatsim.rigid_body import RigidBody
 if TYPE_CHECKING:
     from splatsim.cyclonedds.camera_info_publisher import CameraInfoPublisher
     from splatsim.cyclonedds.image_publisher import ImagePublisher
+    from splatsim.ppisp import PpispTables
     from splatsim.viewer import Viewer
 
 
@@ -40,11 +41,13 @@ class Scene:
         background: Background | None = None,
         rigid_bodies: dict[str, RigidBody] | None = None,
         lod_manager: LodManager | None = None,
+        ppisp_tables: "PpispTables | None" = None,
     ) -> None:
         self.background = background
         self._rigid_bodies: dict[str, RigidBody] = rigid_bodies or {}
         self._lod_manager = lod_manager
         self._lod_enabled = lod_manager is not None
+        self.ppisp_tables = ppisp_tables
 
     # --- rigid body access ---------------------------------------------------
 
@@ -169,6 +172,7 @@ class Scene:
             lod_manager = LodManager(config.lod)
 
         background: Background | None = None
+        ppisp_tables: PpispTables | None = None
         if config.background_tileset is not None:
             background = Background(
                 config.background_tileset,
@@ -181,6 +185,16 @@ class Scene:
                 progress(step, total, "background")
             if background.lod_index is not None:
                 _log_lod_tiers("background", background.lod_index)
+            if config.renderer.use_ppisp:
+                from splatsim._usdz import load_rig_trajectories
+                from splatsim.ppisp import load_ppisp_tables
+
+                ppisp_tables = load_ppisp_tables(
+                    config.background_tileset,
+                    load_rig_trajectories(config.background_tileset),
+                    device=device,
+                    centroid=background.tile_local_centroid,
+                )
 
         rigid_bodies: dict[str, RigidBody] = {}
         for rb_cfg in config.rigid_bodies:
@@ -202,6 +216,7 @@ class Scene:
             background=background,
             rigid_bodies=rigid_bodies,
             lod_manager=lod_manager,
+            ppisp_tables=ppisp_tables,
         )
 
 
@@ -293,8 +308,16 @@ def load_scene(
     *,
     image_publisher: ImagePublisher | None = None,
     camera_info_publisher: CameraInfoPublisher | None = None,
+    camera_name: str | None = None,
 ) -> Viewer:
-    """Build a Viewer from a SceneConfig or a YAML file path."""
+    """Build a Viewer from a SceneConfig or a YAML file path.
+
+    ``camera_name`` selects which PPISP camera profile the Viewer emulates
+    when the scene has a PPISP payload; pass the ``name`` of one of the
+    training cameras (see ``rig_trajectories.json``). ``None`` skips
+    PPISP even when the scene has tables (falls back to the exposure
+    scalar).
+    """
     from splatsim.viewer import Viewer
 
     if not isinstance(config, SceneConfig):
@@ -313,6 +336,7 @@ def load_scene(
         far_plane=rc.far_plane,
         radius_clip=rc.radius_clip,
         exposure=rc.exposure,
+        ppisp_knn_k=rc.ppisp_knn_k,
     )
 
     vc = config.viewer
@@ -327,4 +351,5 @@ def load_scene(
         initial_yaw_deg=initial_yaw_deg,
         image_publisher=image_publisher,
         camera_info_publisher=camera_info_publisher,
+        camera_name=camera_name,
     )

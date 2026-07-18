@@ -27,6 +27,7 @@ class Renderer:
         far_plane: float = 1000.0,
         radius_clip: float = 0.0,
         exposure: float = 1.0,
+        ppisp_knn_k: int = 4,
     ) -> None:
         self.width = width
         self.height = height
@@ -34,6 +35,7 @@ class Renderer:
         self.near_plane = near_plane
         self.far_plane = far_plane
         self.exposure = float(exposure)
+        self.ppisp_knn_k = int(ppisp_knn_k)
         self._radius_clip = radius_clip
         self._bg_color = torch.tensor(
             [list(background_color)], device=device, dtype=torch.float32
@@ -45,19 +47,22 @@ class Renderer:
         K: Tensor,
         *,
         scene: Scene | None = None,
+        camera_name: str | None = None,
     ) -> Tensor:
         """Render the scene and return an [H, W, 3] float32 RGB image (0-1)."""
         tensor_list: list[GaussianTensors] = []
 
+        camera_pos: Tensor | None = None
         if scene is not None:
-            camera_pos: Tensor | None = None
-            if scene.lod_enabled:
+            if scene.lod_enabled or scene.ppisp_tables is not None:
                 # viewmat is world-to-camera: [R | t], camera_pos = -R^T @ t
                 R = viewmat[:3, :3]
                 t = viewmat[:3, 3]
                 camera_pos = -(R.T @ t)
 
-            tensor_list = scene.collect_tensors(camera_pos)
+            tensor_list = scene.collect_tensors(
+                camera_pos if scene.lod_enabled else None
+            )
 
         if not tensor_list:
             return torch.zeros(
@@ -102,6 +107,17 @@ class Renderer:
         )
 
         rgb = render_colors[0]
-        if self.exposure != 1.0:
+        tables = scene.ppisp_tables if scene is not None else None
+        if tables is not None and camera_name is not None and camera_pos is not None:
+            from splatsim.ppisp import apply_ppisp
+
+            rgb = apply_ppisp(
+                tables,
+                rgb,
+                camera_name,
+                camera_pos,
+                k=self.ppisp_knn_k,
+            )
+        elif self.exposure != 1.0:
             rgb = rgb * self.exposure
         return rgb  # [H, W, 3]

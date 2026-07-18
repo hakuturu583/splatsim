@@ -12,6 +12,7 @@ dependencies = [
     "torch==2.4.0+cu124",
     "torchvision==0.19.0+cu124",
     "3dgs-io",
+    "ppisp",
     "pyyaml>=6.0",
     "setuptools",
     "grpcio>=1.60.0",
@@ -51,6 +52,13 @@ environments = ["sys_platform == 'linux'"]
 # version matches the container.
 build-constraint-dependencies = ["torch<2.5"]
 
+# ppisp compiles a CUDA extension (`ppisp_cuda`) via
+# torch.utils.cpp_extension.CUDAExtension but does not declare torch as a
+# PEP 518 build dependency, so its isolated build env does not have torch.
+# Inject it here (the build-constraint above still pins the version).
+[tool.uv.extra-build-dependencies]
+ppisp = ["torch"]
+
 [[tool.uv.index]]
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
@@ -65,7 +73,12 @@ torchvision = [
   { index = "pytorch-cu124" },
 ]
 
-3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", branch = "feat/usdz-io" }
+3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v0.10.0" }
+
+# nv-tlabs/ppisp: physically-plausible ISP for novel-view radiance-field rendering.
+# No release tag yet; pin to the current main commit. Ships a CUDA extension
+# (`ppisp_cuda`) built via torch.utils.cpp_extension.CUDAExtension.
+ppisp = { git = "https://github.com/nv-tlabs/ppisp.git", rev = "df33809f7b3b20ac06de088dfc871b144b8fb54d" }
 
 # gsplat main pinned past PR #890 (Add LiDAR sensor support) to enable
 # camera_model="lidar" rasterization via RowOffsetStructuredSpinningLidarModelParameters.

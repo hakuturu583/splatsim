@@ -15,3 +15,5 @@ class RendererConfig:
     device: str = "cuda"
     radius_clip: float = 0.0
     exposure: float = 1.0
+    use_ppisp: bool = True
+    ppisp_knn_k: int = 4
