@@ -42,16 +42,20 @@ def _try_load() -> Any:
             return _EXT
         if _EXT_LOAD_FAILED:
             return None
-        if not torch.cuda.is_available():
-            _EXT_LOAD_FAILED = True
-            _EXT_LOAD_ERROR = RuntimeError("CUDA not available")
-            return None
         try:
-            _EXT = _load_prebuilt() or _load_via_jit()
+            # Prefer a pre-built `.so` (runtime image path — no nvcc and no
+            # live GPU needed to *import* it). Fall back to JIT only when the
+            # CUDA toolkit is present. We deliberately do NOT gate on
+            # ``torch.cuda.is_available()``: the Docker builder stage has nvcc
+            # but no GPU runtime, yet must still pre-compile the extension so
+            # the runtime image can pick it up.
+            _EXT = _load_prebuilt()
+            if _EXT is None and _can_compile():
+                _EXT = _load_via_jit()
             if _EXT is None:
                 _EXT_LOAD_FAILED = True
                 _EXT_LOAD_ERROR = RuntimeError(
-                    "no pre-built .so found and JIT path unavailable"
+                    "no pre-built .so found and CUDA toolkit unavailable for JIT"
                 )
             return _EXT
         except Exception as exc:  # noqa: BLE001 — we want any failure to fall back
@@ -61,6 +65,22 @@ def _try_load() -> Any:
 
 
 _EXT_NAME = "splatsim_lidar_cull_ext"
+
+
+def _can_compile() -> bool:
+    """Return ``True`` iff this machine can JIT-compile the CUDA extension.
+
+    Compilation needs the CUDA toolkit (``nvcc``), *not* a live GPU: the
+    Docker builder stage has nvcc but no GPU runtime and must still build
+    the ``.so``. ``CUDA_HOME`` is torch's own resolved toolkit root and is
+    ``None`` when no toolkit is found — the same signal gsplat keys off.
+    """
+    try:
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        return CUDA_HOME is not None
+    except Exception:
+        return False
 
 
 def _build_dir() -> Path:
