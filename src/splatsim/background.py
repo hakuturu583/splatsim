@@ -16,7 +16,7 @@ _merge_tileset = _3dgs_io.merge_tileset
 
 
 class Background:
-    """Loads a 3D Tileset or a scene USDZ as GPU-ready Gaussian tensors."""
+    """Loads a 3D Tileset or a v2 scene USDZ as GPU-ready Gaussian tensors."""
 
     def __init__(
         self,
@@ -29,16 +29,14 @@ class Background:
     ) -> None:
         path = Path(source_path)
         if path.suffix.lower() == ".usdz":
-            # 3dgs_io scene USDZ wraps tileset.json + chunks/*.spz; extract
-            # to a temp directory and load each SPZ tile as a tensor chunk.
-            from splatsim._usdz import extract_scene_usdz, load_spz_tileset
+            # 3dgs_io scene USDZ bundles scene.json + chunks/*.spz; load each
+            # SPZ chunk (already baked in the ENU world frame) as a tensor
+            # chunk. The scene's ecef_anchor is the ENU world→ECEF transform.
+            from splatsim._usdz import load_spz_scene
 
-            scene_dir = extract_scene_usdz(path)
-            tensors, root_tf = load_spz_tileset(
-                scene_dir / "tileset.json", device, use_sh=use_sh
-            )
-            self._ecef_rotation = root_tf[:3, :3].copy()
-            self._ecef_translation = root_tf[:3, 3].copy()
+            tensors, anchor = load_spz_scene(path, device, use_sh=use_sh)
+            self._ecef_rotation = anchor[:3, :3].copy()
+            self._ecef_translation = anchor[:3, 3].copy()
         else:
             tiles = _load_tileset(str(path), max_tiles=max_tiles)
 
@@ -121,11 +119,11 @@ class Background:
     def tile_local_centroid(self) -> Tensor:
         """Tile-local centroid subtracted from gaussian means for numerical stability.
 
-        This is ``means.mean(dim=0)`` in the *tile-local* (RUB, Y-up) frame
-        that the gaussians live in, **not** an ECEF translation. Renderers
-        that consume world-frame poses (e.g. rig trajectories) must add this
-        back to the translation column of their world-to-camera matrices to
-        line the camera up with the re-centered cloud.
+        This is ``means.mean(dim=0)`` in the coordinate frame of the loaded
+        gaussians: tile-local RUB for a 3D Tiles source, or Z-up ENU world for
+        a v2 USDZ. It is **not** an ECEF translation. Renderers that consume
+        world-frame poses must add it back to the translation column of their
+        world-to-camera matrices to align with the re-centered cloud.
 
         For the ECEF translation of the root tile, see :attr:`ecef_translation`.
         """
@@ -135,9 +133,8 @@ class Background:
     def ecef_translation(self) -> np.ndarray:
         """ECEF translation of the root tile, in meters (3,) ``float64``.
 
-        Read from the 3D Tiles root transform (or the USDZ scene's root
-        transform); never applied to the gaussians, which stay in
-        tile-local coordinates.
+        Read from the 3D Tiles root transform or the USDZ scene's
+        ``world.ecef_anchor``; never applied to the gaussians.
         """
         return self._ecef_translation
 
@@ -145,9 +142,9 @@ class Background:
     def ecef_rotation(self) -> np.ndarray:
         """ECEF rotation of the root tile, 3x3 ``float64``.
 
-        Read from the 3D Tiles root transform; never applied to the
-        gaussians. For multi-tile tilesets, the inverse is applied to the
-        merged cloud to bring it back to tile-local before re-centering.
+        Read from the 3D Tiles root transform or the USDZ scene's
+        ``world.ecef_anchor``; never applied to USDZ gaussians. For multi-tile
+        tilesets, the inverse is applied to the merged cloud before centering.
         """
         return self._ecef_rotation
 

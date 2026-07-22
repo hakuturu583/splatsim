@@ -62,7 +62,7 @@ class SceneConfig:
         by :class:`Background` when it sees the same ``.usdz`` path.
 
         If the USDZ ships a ``rig_trajectories.json`` sidecar containing
-        cameras, the first camera's intrinsics seed
+        cameras, the most forward-facing camera's intrinsics seed
         ``renderer.width/height`` and ``viewer.fov_y_deg``, and the
         composed ``RigPose × CameraExtrinsics`` at the first timestamp
         seeds ``initial_camera_world_position`` and

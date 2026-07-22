@@ -14,8 +14,8 @@ build-constraints = [{ name = "torch", specifier = "<2.5", index = "https://down
 
 [[package]]
 name = "3dgs-io"
-version = "0.10.0"
-source = { git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v0.10.0#6e113c6b23e9ee950dd58d6935e0441830d0be11" }
+version = "0.11.0"
+source = { git = "https://github.com/autowarefoundation/3dgs_io.git?branch=feat%2Fissue-39-frame-explicit-usdz#2c26fa2b675986246f241d54fefe05e2677c4264" }
 dependencies = [
     { name = "numpy", marker = "sys_platform == 'linux'" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' and sys_platform == 'linux'" },
@@ -2127,7 +2127,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v0.10.0" },
+    { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?branch=feat%2Fissue-39-frame-explicit-usdz" },
     { name = "autoware-carla-scenario", extras = ["carla-0-9-16"], marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_carla_scenario&rev=348108571cf4abec1f668ca0999753b75b8a5e4b" },
     { name = "autoware-lanelet2-to-opendrive", marker = "extra == 'carla'", git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git?subdirectory=autoware_lanelet2_to_opendrive&rev=348108571cf4abec1f668ca0999753b75b8a5e4b" },
     { name = "cyclonedds", marker = "extra == 'carla'", specifier = ">=11.0.1" },

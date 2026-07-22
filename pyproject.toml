@@ -73,7 +73,7 @@ torchvision = [
   { index = "pytorch-cu124" },
 ]
 
-3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v0.10.0" }
+3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", branch = "feat/issue-39-frame-explicit-usdz" }
 
 # nv-tlabs/ppisp: physically-plausible ISP for novel-view radiance-field rendering.
 # No release tag yet; pin to the current main commit. Ships a CUDA extension

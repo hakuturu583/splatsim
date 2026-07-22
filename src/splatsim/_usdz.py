@@ -2,10 +2,11 @@
 
 A scene USDZ archive bundles:
 
-* ``default.usda`` — USD stage referencing ``tileset.json`` and ``scene.json``.
-* ``scene.json`` — splatsim.scene/v1 metadata (world transform, render defaults, ...).
-* ``tileset.json`` — Cesium 3D Tiles document declaring ``EXT_3dgs_spz``.
-* ``chunks/chunk_NNNNNN.spz`` — Niantic SPZ binaries, one per tile.
+* ``default.usda`` — USD stage referencing ``scene.json`` and the SPZ chunks.
+* ``scene.json`` — splatsim.scene/v2 metadata (``world.ecef_anchor``, render
+  defaults, ``extras`` sidecar references, ...).
+* ``chunks/chunk_NNNNNN.spz`` — Niantic SPZ binaries whose numeric axes are
+  already baked in the scene's Z-up ENU world frame.
 
 3dgs_io only ships a writer (``save_scene_usdz``); this module is splatsim's
 reader.
@@ -13,10 +14,8 @@ reader.
 
 from __future__ import annotations
 
-import gzip
 import importlib as _importlib
 import json
-import struct
 import tempfile
 import typing
 import zipfile
@@ -33,81 +32,117 @@ if typing.TYPE_CHECKING:
     from splatsim.background import Background
 
 _3dgs_io = _importlib.import_module("3dgs_io")
-_load_spz = _3dgs_io.load_spz
-_parse_rig_trajectories = _3dgs_io.parse_alpasim_rig_trajectories
+_frame_convention = _importlib.import_module("3dgs_io.frame_convention")
+_spz_io = _importlib.import_module("3dgs_io.spz_io")
+_decode_lidar_sidecar = _3dgs_io.decode_lidar_sidecar
+_load_spz = _spz_io.load_spz_world
+_parse_rig_trajectories = _3dgs_io.parse_rig_trajectories
+_validate_frame_convention = _frame_convention.validate_frame_convention
+_validate_rigid_transform = _frame_convention.validate_rigid_transform
 
 
 def read_scene_json(usdz_path: str | Path) -> dict[str, Any]:
-    """Read ``scene.json`` out of a scene USDZ without extracting the whole archive."""
+    """Read and validate a frame-explicit v2 ``scene.json``."""
     with zipfile.ZipFile(usdz_path) as zf:
         if "scene.json" not in zf.namelist():
             raise ValueError(
                 f"{usdz_path}: missing scene.json (not a 3dgs_io scene USDZ)"
             )
-        return json.loads(zf.read("scene.json"))
+        meta = json.loads(zf.read("scene.json"))
+    if not isinstance(meta, dict):
+        raise ValueError(f"{usdz_path}: scene.json must be a JSON object")
+    if meta.get("schema") != "splatsim.scene/v2":
+        raise ValueError(f"{usdz_path}: scene.json must use splatsim.scene/v2")
+    world = meta.get("world")
+    if not isinstance(world, dict):
+        raise ValueError(f"{usdz_path}: scene.json is missing world metadata")
+    _validate_frame_convention(world.get("frame_convention"))
+    _validate_rigid_transform(world.get("ecef_anchor"), where="scene world.ecef_anchor")
+    gaussians = meta.get("gaussians")
+    if not isinstance(gaussians, dict) or gaussians.get("frame") != "world":
+        raise ValueError(f"{usdz_path}: scene gaussians must use the world frame")
+    return meta
 
 
-def extract_scene_usdz(usdz_path: str | Path) -> Path:
-    """Extract a scene USDZ to a fresh temp directory and return its path."""
-    out_dir = Path(tempfile.mkdtemp(prefix="splatsim_usdz_"))
-    with zipfile.ZipFile(usdz_path) as zf:
-        zf.extractall(out_dir)
-    return out_dir
-
-
-def load_spz_tileset(
-    tileset_path: str | Path,
+def load_spz_scene(
+    usdz_path: str | Path,
     device: torch.device,
     *,
     use_sh: bool = False,
 ) -> tuple[GaussianTensors, np.ndarray]:
-    """Load a Cesium 3D Tiles document whose children are SPZ files.
+    """Load the SPZ gaussian chunks bundled in a scene USDZ.
 
-    Returns the concatenated :class:`GaussianTensors` together with the
-    root tile's transform (row-major 4x4, ECEF→tile-local convention).
+    Returns the concatenated :class:`GaussianTensors` — baked in the scene's
+    Z-up ENU world frame, so no coordinate transform is applied — together
+    with the scene's ``ecef_anchor`` (row-major 4x4, ENU world→ECEF) read
+    from ``scene.json`` (``world.ecef_anchor``).
+
+    The embedded ``tileset.json`` is deliberately not interpreted. In the v2
+    format every SPZ chunk already contains world-frame coordinates, so the
+    chunks can be loaded directly without Cesium tile transforms.
     """
-    tileset_path = Path(tileset_path)
-    base_dir = tileset_path.parent
-    with tileset_path.open() as f:
-        tileset = json.load(f)
-
-    root = tileset["root"]
-    # 3D Tiles stores transforms column-major; flip to row-major.
-    root_transform = (
-        np.asarray(
-            root.get("transform", [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]),
-            dtype=np.float64,
-        )
-        .reshape(4, 4)
-        .T
+    usdz_path = Path(usdz_path)
+    meta = read_scene_json(usdz_path)
+    ecef_anchor = _validate_rigid_transform(
+        meta["world"]["ecef_anchor"], where="scene world.ecef_anchor"
     )
+    ext_meta = meta["gaussians"].get("ext_attributes")
+    sidecar_suffix: str | None = None
+    if ext_meta is not None:
+        if not isinstance(ext_meta, dict):
+            raise ValueError(f"{usdz_path}: gaussians.ext_attributes must be an object")
+        if ext_meta.get("extension") != "EXT_gaussian_lidar":
+            raise ValueError(
+                f"{usdz_path}: unsupported gaussian extension "
+                f"{ext_meta.get('extension')!r}"
+            )
+        sidecar_suffix = ext_meta.get("sidecar_suffix")
+        if not isinstance(sidecar_suffix, str) or not sidecar_suffix.startswith("."):
+            raise ValueError(f"{usdz_path}: invalid gaussian extension sidecar_suffix")
 
     tensor_list: list[GaussianTensors] = []
-    for child in root.get("children", []):
-        chunk_uri = child["content"]["uri"]
-        chunk_path = base_dir / chunk_uri
-        cloud = _load_spz(str(chunk_path))
-        if cloud.num_points == 0:
-            continue
-        tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
-        # SPZ stores positions as 24-bit signed fixed-point, so positions
-        # outside ±(2^24 / 2^fractionalBits / 2) wrap around. For scenes
-        # authored in large local coordinates (e.g. MGRS-relative, ~10^5 m),
-        # 3dgs_io's SPZ writer silently emits wrapped positions. Use the
-        # child tile's boundingVolume center to detect the wrap offset and
-        # restore root_local coordinates.
-        bbox_center = _child_bbox_center(child)
-        if bbox_center is not None:
-            shift = _spz_wrap_shift(chunk_path, tensors.means, bbox_center)
-            if shift is not None:
-                tensors.means = tensors.means + shift.to(tensors.means)
-        tensor_list.append(tensors)
+    with zipfile.ZipFile(usdz_path) as zf:
+        chunk_names = sorted(
+            n for n in zf.namelist() if n.startswith("chunks/") and n.endswith(".spz")
+        )
+        if not chunk_names:
+            raise ValueError(f"{usdz_path}: no SPZ chunks found under chunks/")
+        for name in chunk_names:
+            with tempfile.NamedTemporaryFile(suffix=".spz") as tmp:
+                tmp.write(zf.read(name))
+                tmp.flush()
+                cloud = _load_spz(tmp.name)
+            if cloud.num_points == 0:
+                continue
+            tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
+            if sidecar_suffix is not None:
+                sidecar_name = str(Path(name).with_suffix(sidecar_suffix))
+                if sidecar_name not in zf.namelist():
+                    raise ValueError(
+                        f"{usdz_path}: missing LiDAR sidecar {sidecar_name}"
+                    )
+                attrs = _decode_lidar_sidecar(zf.read(sidecar_name))
+                intensity = attrs.get("lidar_intensity_raw")
+                raydrop = attrs.get("lidar_raydrop_logit")
+                if intensity is None or raydrop is None:
+                    raise ValueError(
+                        f"{usdz_path}: incomplete LiDAR attributes in {sidecar_name}"
+                    )
+                if (
+                    len(intensity) != cloud.num_points
+                    or len(raydrop) != cloud.num_points
+                ):
+                    raise ValueError(
+                        f"{usdz_path}: LiDAR sidecar count does not match {name}"
+                    )
+                tensors.intensity_raw = torch.from_numpy(intensity).to(device)
+                tensors.raydrop_logit = torch.from_numpy(raydrop).to(device)
+            tensor_list.append(tensors)
 
     if not tensor_list:
-        raise ValueError(f"{tileset_path}: no SPZ chunks found")
+        raise ValueError(f"{usdz_path}: SPZ chunks contain no gaussians")
 
-    merged = _concat_tensors(tensor_list)
-    return merged, root_transform
+    return _concat_tensors(tensor_list), ecef_anchor
 
 
 def first_camera(rigs: list[Any], name: str | None = None) -> Any | None:
@@ -130,18 +165,16 @@ def first_camera(rigs: list[Any], name: str | None = None) -> Any | None:
             for cam in rig.cameras or []:
                 if fallback is None:
                     fallback = cam
-                # r_sensor_rig is rig->sensor (memory: 3dgs_io extrinsic
-                # convention). Sensor +Z expressed in rig coords is the
-                # third column of r_sensor_rig.T, i.e. the third row of
-                # r_sensor_rig. Vehicle forward is rig +X, so the X
-                # component of that vector measures forwardness.
+                # extrinsics.to_matrix() is sensor-in-rig; the camera's
+                # optical axis (sensor +Z) expressed in rig coords is its
+                # third column. Vehicle forward is rig +X, so the X
+                # component of that column measures forwardness.
                 try:
-                    r_sr = _quat_to_matrix(cam.extrinsics.rotation)
+                    forwardness = float(cam.extrinsics.to_matrix()[0, 2])
                 except Exception:
                     continue
-                fwd_x_in_rig = float(r_sr[2, 0])
-                if best is None or fwd_x_in_rig > best[0]:
-                    best = (fwd_x_in_rig, cam)
+                if best is None or forwardness > best[0]:
+                    best = (forwardness, cam)
         if best is not None and best[0] > 0.5:
             return best[1]
         return fallback
@@ -162,9 +195,9 @@ def camera_to_viewer_intrinsics(
 ) -> tuple[int | None, int | None, float | None]:
     """Approximate ``(width, height, fov_y_deg)`` from a ``3dgs_io.Camera``.
 
-    splatsim only supports a pinhole camera, so non-pinhole models
-    (``ftheta`` and similar fisheye lenses) are mapped to a best-effort
-    vertical FOV derived from the model's ``max_angle`` parameter.
+    splatsim only supports a pinhole projection, so ``fov_y_deg`` is derived
+    from ``fy`` for ``pinhole`` and ``opencv`` models. Other models (e.g.
+    ``ftheta`` fisheye) degrade gracefully to ``fov_y_deg=None``.
     """
     params = camera.camera_model.parameters or {}
     resolution = params.get("resolution")
@@ -173,35 +206,27 @@ def camera_to_viewer_intrinsics(
 
     model_type = (camera.camera_model.type or "").lower()
     fov_y_deg: float | None = None
-    if model_type == "pinhole":
+    if model_type in ("pinhole", "opencv"):
         fy = params.get("fy")
         if fy and height:
             fov_y_deg = float(np.degrees(2 * np.arctan(height / (2 * float(fy)))))
-    elif model_type == "ftheta":
-        max_angle = params.get("max_angle")
-        if max_angle is not None and width and height:
-            # max_angle is the half-cone angle (radian). Approximate the
-            # vertical FOV by scaling proportionally to the height of the
-            # image diagonal.
-            diag = float(np.hypot(width, height))
-            fov_y_deg = float(np.degrees(2 * float(max_angle) * height / diag))
 
     return width, height, fov_y_deg
 
 
 def camera_intrinsics_K(camera: Any) -> tuple[np.ndarray, int, int]:
-    """Return ``(K, width, height)`` for a pinhole rig camera.
+    """Return ``(K, width, height)`` for a pinhole/opencv rig camera.
 
     ``K`` is a 3x3 OpenCV intrinsic matrix in pixel units; ``width``/``height``
-    are the image resolution. Raises ``ValueError`` if the camera is not
-    pinhole or lacks the required parameters.
+    are the image resolution. Raises ``ValueError`` if the camera is not a
+    ``pinhole``/``opencv`` model or lacks the required parameters.
     """
     params = camera.camera_model.parameters or {}
     model_type = (camera.camera_model.type or "").lower()
-    if model_type != "pinhole":
+    if model_type not in ("pinhole", "opencv"):
         raise ValueError(
             f"camera {camera.name!r}: K-matrix render requires a pinhole "
-            f"camera, got {model_type!r}"
+            f"or opencv camera, got {model_type!r}"
         )
     resolution = params.get("resolution")
     if not resolution or len(resolution) < 2:
@@ -233,48 +258,23 @@ def iter_world_to_camera_uncentered(
     """Yield ``(timestamp, world_to_camera)`` per rig pose for one camera.
 
     ``world_to_camera`` is a 4x4 OpenCV extrinsic (``+Z`` forward) that maps
-    points in the *root-local* world frame to the camera frame. This is the
-    frame the gaussians live in *before* :class:`Background` re-centers
-    them, so this iterator is rarely what callers want directly — prefer
+    points in the ENU world frame to the camera frame. This is the frame the
+    gaussians live in *before* :class:`Background` re-centers them, so this
+    iterator is rarely what callers want directly — prefer
     :func:`iter_world_to_camera`, which compensates for the re-centering.
 
-    The composition mirrors :func:`initial_camera_pose_from_rig_trajectories`:
-    despite the ``T_sensor_rig`` field name, ``3dgs_io`` stores the rig→sensor
-    matrix in OpenCV convention, so we invert it implicitly via
-    ``R_w2c = R_rs @ R_rig.T`` and ``t_w2c = t_rs - R_w2c @ t_rig``.
+    The camera pose in world is ``rig_in_world @ sensor_in_rig`` and
+    ``world_to_camera`` is its inverse.
     """
-    available: list[str] = []
-    for rig in rigs:
-        if not rig.poses or not rig.cameras:
-            available.extend(c.name for c in rig.cameras or [])
-            continue
-        if name is None:
-            cam = rig.cameras[0]
-        else:
-            cam = next((c for c in rig.cameras if c.name == name), None)
-            if cam is None:
-                available.extend(c.name for c in rig.cameras)
-                continue
-        r_rs = _quat_to_matrix(cam.extrinsics.rotation)
-        t_rs = np.asarray(cam.extrinsics.translation, dtype=np.float64)
-        for pose in rig.poses:
-            r_rig = _quat_to_matrix(pose.rotation)
-            t_rig = np.asarray(pose.translation, dtype=np.float64)
-            r_w2c = r_rs @ r_rig.T
-            t_w2c = t_rs - r_w2c @ t_rig
-            w2c = np.eye(4, dtype=np.float64)
-            w2c[:3, :3] = r_w2c
-            w2c[:3, 3] = t_w2c
-            yield float(pose.timestamp_us), w2c
+    rig, cam = _find_rig_with_camera(rigs, name=name)
+    if rig is None or cam is None:
         return
-    if name is not None:
-        raise ValueError(
-            f"camera {name!r} not found in rig_trajectories; available: {available}"
-        )
+    for pose in rig.poses:
+        yield float(pose.timestamp_us), np.linalg.inv(_camera_in_world(pose, cam))
 
 
 def _apply_tile_local_centroid(w2c: np.ndarray, centroid: np.ndarray) -> np.ndarray:
-    """Shift a root-local OpenCV w2c so it lines up with a re-centered scene."""
+    """Shift a world-frame OpenCV w2c so it lines up with a re-centered scene."""
     w2c = w2c.copy()
     w2c[:3, 3] = w2c[:3, 3] + w2c[:3, :3] @ centroid
     return w2c
@@ -321,7 +321,7 @@ def iter_world_to_camera_interpolated_uncentered(
 ) -> Iterator[tuple[float, np.ndarray]]:
     """Yield ``(timestamp_us, world_to_camera)`` sampled uniformly at ``fps``.
 
-    Same root-local convention as :func:`iter_world_to_camera_uncentered` —
+    Same world-frame convention as :func:`iter_world_to_camera_uncentered` —
     prefer :func:`iter_world_to_camera_interpolated` for rendering against
     a :class:`Background`-loaded scene.
 
@@ -347,13 +347,12 @@ def iter_world_to_camera_interpolated_uncentered(
         [pose.rotation for pose in target_rig.poses], dtype=np.float64
     )
 
-    r_rs = _quat_to_matrix(target_cam.extrinsics.rotation)
-    t_rs = np.asarray(target_cam.extrinsics.translation, dtype=np.float64)
+    sensor_in_rig = np.asarray(target_cam.extrinsics.to_matrix(), dtype=np.float64)
 
     n_poses = timestamps.shape[0]
     if n_poses == 1:
         r_rig = _quat_to_matrix(tuple(quaternions[0]))
-        yield float(timestamps[0]), _compose_w2c(r_rs, t_rs, r_rig, translations[0])
+        yield float(timestamps[0]), _compose_w2c(sensor_in_rig, r_rig, translations[0])
         return
 
     t_first = float(timestamps[0])
@@ -374,7 +373,7 @@ def iter_world_to_camera_interpolated_uncentered(
         q = _slerp(quaternions[i], quaternions[i + 1], alpha)
         r_rig = _quat_to_matrix(tuple(q))
 
-        yield float(t), _compose_w2c(r_rs, t_rs, r_rig, t_rig)
+        yield float(t), _compose_w2c(sensor_in_rig, r_rig, t_rig)
 
 
 def _find_rig_with_camera(
@@ -382,12 +381,18 @@ def _find_rig_with_camera(
 ) -> tuple[Any | None, Any | None]:
     """Return the first ``(rig, camera)`` matching ``name`` (or the first available)."""
     available: list[str] = []
+    if name is None:
+        camera = first_camera(rigs)
+        if camera is None:
+            return None, None
+        for rig in rigs:
+            if rig.poses and any(cam is camera for cam in rig.cameras or []):
+                return rig, camera
+        return None, None
     for rig in rigs:
         if not rig.poses or not rig.cameras:
             available.extend(c.name for c in rig.cameras or [])
             continue
-        if name is None:
-            return rig, rig.cameras[0]
         cam = next((c for c in rig.cameras if c.name == name), None)
         if cam is None:
             available.extend(c.name for c in rig.cameras)
@@ -400,16 +405,35 @@ def _find_rig_with_camera(
     return None, None
 
 
+def _mat4(r: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Assemble a 4x4 rigid transform from a 3x3 rotation and a translation."""
+    m = np.eye(4, dtype=np.float64)
+    m[:3, :3] = r
+    m[:3, 3] = t
+    return m
+
+
+def _rig_in_world(pose: Any) -> np.ndarray:
+    """Return the 4x4 rig-in-world transform for a ``RigPose`` (ENU world)."""
+    return _mat4(
+        _quat_to_matrix(pose.rotation),
+        np.asarray(pose.translation, dtype=np.float64),
+    )
+
+
+def _camera_in_world(pose: Any, cam: Any) -> np.ndarray:
+    """Compose ``rig_in_world @ sensor_in_rig`` into a 4x4 camera-in-world."""
+    return _rig_in_world(pose) @ np.asarray(
+        cam.extrinsics.to_matrix(), dtype=np.float64
+    )
+
+
 def _compose_w2c(
-    r_rs: np.ndarray, t_rs: np.ndarray, r_rig: np.ndarray, t_rig: np.ndarray
+    sensor_in_rig: np.ndarray, r_rig: np.ndarray, t_rig: np.ndarray
 ) -> np.ndarray:
-    """Compose rig→sensor (OpenCV) with rig pose into a 4x4 world→camera matrix."""
-    r_w2c = r_rs @ r_rig.T
-    t_w2c = t_rs - r_w2c @ t_rig
-    w2c = np.eye(4, dtype=np.float64)
-    w2c[:3, :3] = r_w2c
-    w2c[:3, 3] = t_w2c
-    return w2c
+    """Compose a rig pose with sensor-in-rig into a 4x4 world→camera matrix."""
+    camera_in_world = _mat4(r_rig, t_rig) @ sensor_in_rig
+    return np.linalg.inv(camera_in_world)
 
 
 def _slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
@@ -468,126 +492,43 @@ def initial_camera_pose_from_rig_trajectories(
 ) -> tuple[tuple[float, float, float], float] | None:
     """Compose the first rig pose with the chosen camera's extrinsics.
 
-    If ``name`` is ``None``, picks the first camera of the first rig that has
-    any. If ``name`` is given, picks the camera whose ``name`` attribute
-    matches and uses the first pose of the rig that owns it; raises
-    ``ValueError`` if no such camera exists.
+    If ``name`` is ``None``, picks the camera whose optical axis is most
+    forward-facing in the rig. If ``name`` is given, picks the camera whose
+    ``name`` attribute matches and uses the first pose of the rig that owns
+    it; raises ``ValueError`` if no such camera exists.
 
     Returns ``(world_position, yaw_deg)`` where yaw is the rotation of the
     composed sensor-in-world transform around the +Z (up) axis; the world
-    position is in root-local frame (the same frame as the gaussians).
+    position is in the ENU world frame (the same frame as the gaussians).
     Returns ``None`` if there is no rig or no camera.
     """
-    available: list[str] = []
-    for rig in rigs:
-        if not rig.poses or not rig.cameras:
-            if name is not None:
-                available.extend(c.name for c in rig.cameras or [])
-            continue
-        if name is None:
-            cam = rig.cameras[0]
-        else:
-            cam = next((c for c in rig.cameras if c.name == name), None)
-            if cam is None:
-                available.extend(c.name for c in rig.cameras)
-                continue
-        rig_pose = rig.poses[0]
-
-        r_rig = _quat_to_matrix(rig_pose.rotation)
-        t_rig = np.asarray(rig_pose.translation, dtype=np.float64)
-        # Despite the ``T_sensor_rig`` field name, 3dgs_io rig_trajectories
-        # store the rig→sensor (OpenCV/COLMAP, +Z forward) matrix — verified
-        # empirically on Tier IV NuRec exports where the documented
-        # sensor→rig reading puts the camera 1.3m underground. Invert to
-        # get sensor pose in the rig frame.
-        r_rs = _quat_to_matrix(cam.extrinsics.rotation)
-        t_rs = np.asarray(cam.extrinsics.translation, dtype=np.float64)
-        r_sensor = r_rs.T
-        t_sensor = -r_rs.T @ t_rs
-
-        # T_sensor_world = T_rig_world @ T_sensor_rig
-        t_sensor_world = t_rig + r_rig @ t_sensor
-        r_sensor_world = r_rig @ r_sensor
-
-        # splatsim yaw rotates around +Z; at yaw=0 the camera looks along
-        # world -Y. With OpenCV extrinsics the camera looks along sensor +Z.
-        fwd_world = r_sensor_world @ np.array([0.0, 0.0, 1.0])
-        # Project to the horizontal plane for the yaw. Falls back to 0
-        # for cameras pointing nearly straight up/down (degenerate yaw).
-        horiz = float(np.hypot(fwd_world[0], fwd_world[1]))
-        if horiz < 1e-6:
-            yaw_deg = 0.0
-        else:
-            yaw_rad = float(np.arctan2(fwd_world[0], -fwd_world[1]))
-            yaw_deg = float(np.degrees(yaw_rad))
-
-        position = (
-            float(t_sensor_world[0]),
-            float(t_sensor_world[1]),
-            float(t_sensor_world[2]),
-        )
-        return position, yaw_deg
-    if name is not None:
-        raise ValueError(
-            f"camera {name!r} not found in rig_trajectories; available: {available}"
-        )
-    return None
-
-
-def _child_bbox_center(child: dict[str, Any]) -> np.ndarray | None:
-    """Read the 3D Tiles ``boundingVolume.box`` center for a tile child."""
-    box = child.get("boundingVolume", {}).get("box")
-    if not box or len(box) < 3:
+    rig, cam = _find_rig_with_camera(rigs, name=name)
+    if rig is None or cam is None:
         return None
-    return np.asarray(box[:3], dtype=np.float64)
 
+    # sensor_in_world = rig_in_world @ sensor_in_rig
+    camera_in_world = _camera_in_world(rig.poses[0], cam)
+    r_sensor_world = camera_in_world[:3, :3]
+    t_sensor_world = camera_in_world[:3, 3]
 
-def _spz_wrap_shift(
-    chunk_path: Path,
-    means: torch.Tensor,
-    bbox_center: np.ndarray,
-) -> torch.Tensor | None:
-    """Compute the per-axis integer-wrap correction for an SPZ chunk.
+    # splatsim yaw rotates around +Z; at yaw=0 the camera looks along
+    # world -Y. With OpenCV extrinsics the camera looks along sensor +Z.
+    fwd_world = r_sensor_world @ np.array([0.0, 0.0, 1.0])
+    # Project to the horizontal plane for the yaw. Falls back to 0
+    # for cameras pointing nearly straight up/down (degenerate yaw).
+    horiz = float(np.hypot(fwd_world[0], fwd_world[1]))
+    if horiz < 1e-6:
+        yaw_deg = 0.0
+    else:
+        yaw_rad = float(np.arctan2(fwd_world[0], -fwd_world[1]))
+        yaw_deg = float(np.degrees(yaw_rad))
 
-    Niantic SPZ stores positions as ``int24`` scaled by ``2^fractionalBits``,
-    so any coordinate outside ``±(2^23 / 2^fractionalBits) m`` wraps back
-    into range when encoded. Returns the ``(dx, dy, dz)`` shift in meters
-    that maps the centered cloud to the child tile's bbox center, snapped
-    to integer multiples of the wrap period.
-    """
-    fractional_bits = _read_spz_fractional_bits(chunk_path)
-    if fractional_bits is None:
-        return None
-    wrap_period = 2.0 ** (24 - fractional_bits)  # meters, e.g. 4096 at fb=12
-    centroid = means.mean(dim=0).detach().cpu().numpy().astype(np.float64)
-    raw_delta = bbox_center - centroid
-    k = np.round(raw_delta / wrap_period)
-    shift = k * wrap_period
-    if not np.any(k):
-        return None
-    return torch.from_numpy(shift)
-
-
-def _read_spz_fractional_bits(chunk_path: Path) -> int | None:
-    """Return ``fractionalBits`` from an SPZ file header, or ``None`` on miss.
-
-    SPZ v3 layout: magic (4) + version (4) + num_points (4) + sh_degree (1)
-    + fractionalBits (1) + flags (1) + reserved (1). Files are gzipped.
-    """
-    with chunk_path.open("rb") as f:
-        head = f.read(16)
-    if len(head) < 16:
-        return None
-    if head[:2] == b"\x1f\x8b":
-        # gzip — only need the first ~16 bytes; decompress a small prefix.
-        with gzip.open(chunk_path, "rb") as f:
-            head = f.read(16)
-        if len(head) < 16:
-            return None
-    magic = struct.unpack("<I", head[:4])[0]
-    if magic != 0x5053474E:  # b"NGSP" little-endian
-        return None
-    return head[13]
+    position = (
+        float(t_sensor_world[0]),
+        float(t_sensor_world[1]),
+        float(t_sensor_world[2]),
+    )
+    return position, yaw_deg
 
 
 def _quat_to_matrix(q: tuple[float, float, float, float]) -> np.ndarray:
