@@ -490,7 +490,10 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         sec, nanosec = divmod(render_time_ns, 1_000_000_000)
         stamp = Time(sec=sec, nanosec=nanosec)
         self._pointcloud_pub.publish(
-            point_cloud["xyz"], point_cloud["intensity"], stamp=stamp
+            point_cloud["xyz"],
+            point_cloud["intensity"],
+            channel=point_cloud["channel"],
+            stamp=stamp,
         )
         t_publish = time.monotonic()
 
