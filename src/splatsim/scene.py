@@ -97,12 +97,19 @@ class Scene:
         return self._lod_manager
 
     def collect_tensors(
-        self, camera_position: Tensor | None = None
+        self,
+        camera_position: Tensor | None = None,
+        *,
+        include_background: bool = True,
     ) -> list[GaussianTensors]:
         """Collect Gaussian tensors from all sources, applying LOD if enabled.
 
         Args:
             camera_position: [3] float32 GPU tensor, or None to skip LOD.
+            include_background: If ``False``, omit the background Gaussians
+                from the returned list. LiDAR rendering sets this to ``False``
+                by default because the background is trained for RGB
+                appearance only and its geometry is not reliable.
         """
         result: list[GaussianTensors] = []
         can_filter = (
@@ -111,7 +118,7 @@ class Scene:
             and camera_position is not None
         )
 
-        if self.background is not None:
+        if include_background and self.background is not None:
             if can_filter and self.background.lod_index is not None:
                 assert self._lod_manager is not None  # noqa: S101
                 assert camera_position is not None  # noqa: S101

@@ -893,12 +893,19 @@ class LidarRenderer:
         base_to_world: torch.Tensor,
         *,
         scene: "Scene",
+        include_background: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Render one LiDAR panorama.
 
         Args:
             base_to_world: (4, 4) float32 tensor. Ego/base pose in world.
             scene: The splatsim Scene providing Gaussians.
+            include_background: Whether to include the scene background
+                Gaussians when tracing LiDAR rays. Defaults to ``False``
+                because the background is trained for RGB appearance only
+                and its geometry is not reliable — LiDAR rays should hit
+                rigid bodies. Set to ``True`` to restore pre-0.6 behavior
+                (breaking change).
 
         Returns:
             ``{"alpha", "distance", "intensity", "raydrop_logit"}`` — each an
@@ -908,7 +915,9 @@ class LidarRenderer:
         sensor_to_world = base_to_world.to(self.device) @ self._s2b_t
         cam_pos = sensor_to_world[:3, 3].detach()
 
-        tensor_list = scene.collect_tensors(cam_pos)
+        tensor_list = scene.collect_tensors(
+            cam_pos, include_background=include_background
+        )
         if not tensor_list:
             zero = torch.zeros(
                 (self.n_rows, self.n_columns), dtype=torch.float32, device=self.device

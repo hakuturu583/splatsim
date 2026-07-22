@@ -109,6 +109,13 @@ Packets are encoded with `torch` directly from the rendered range image, so when
 the renderer runs on CUDA the entire encode stays on the GPU and only the packed
 byte buffer crosses to the host (once per frame) for the UDP send.
 
+> **Breaking change (0.6):** LiDAR rendering now **excludes the scene background
+> Gaussians by default**. The background is trained for RGB appearance only and
+> its geometry is not reliable, so LiDAR rays should hit rigid bodies rather than
+> the background shell. To restore the previous behavior, pass
+> `include_background=True` to `LidarRenderer.render`. The RGB renderer is
+> unaffected and continues to include the background.
+
 ## Development
 
 ```bash
