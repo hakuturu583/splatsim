@@ -39,6 +39,32 @@ def build_viewmat_from_pose(
     return viewmat
 
 
+def build_base_to_world_from_pose(
+    position: tuple[float, float, float],
+    rotation_wxyz: tuple[float, float, float, float],
+    device: torch.device,
+) -> Tensor:
+    """Build a 4x4 base_link→world transform from a tile-local base pose.
+
+    Unlike :func:`build_viewmat_from_pose` (camera path, which *inverts* the
+    pose into a world-to-camera view matrix), the LiDAR renderer consumes the
+    base pose directly: it composes ``sensor_to_world = base_to_world @ s2b``
+    internally. So no inversion happens here.
+
+    - *position* is the base_link origin ``(x, y, z)`` in tile-local coords.
+    - *rotation_wxyz* is a ``(w, x, y, z)`` quaternion for the base_link→world
+      rotation. base_link follows the ROS convention (X=forward, Y=left,
+      Z=up), matching the frame the sensor→base extrinsic is expressed in.
+    """
+    q = torch.tensor(rotation_wxyz, device=device, dtype=torch.float32)
+    R_b2w = quat_to_rotation_matrix(q)  # [3, 3]
+
+    base_to_world = torch.eye(4, device=device, dtype=torch.float32)
+    base_to_world[:3, :3] = R_b2w
+    base_to_world[:3, 3] = torch.tensor(position, device=device, dtype=torch.float32)
+    return base_to_world
+
+
 def build_intrinsics(
     fx: float,
     fy: float,
