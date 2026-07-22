@@ -34,7 +34,7 @@ if typing.TYPE_CHECKING:
 
 _3dgs_io = _importlib.import_module("3dgs_io")
 _load_spz = _3dgs_io.load_spz
-_parse_rig_trajectories = _3dgs_io.parse_rig_trajectories
+_parse_rig_trajectories = _3dgs_io.parse_alpasim_rig_trajectories
 
 
 def read_scene_json(usdz_path: str | Path) -> dict[str, Any]:
