@@ -16,7 +16,15 @@ class LidarConfig:
     min_range_m: float = 0.3
     max_range_m: float = 120.0
     position: tuple[float, float, float] = (0.0, 0.0, 1.8)
-    rotation: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Sensor orientation. Either RPY degrees ``(roll, pitch, yaw)`` (length 3)
+    # or a unit quaternion ``(w, x, y, z)`` (length 4); the length selects the
+    # format. Scene USDZ imports store the calibrated quaternion here.
+    rotation: tuple[float, ...] = (0.0, 0.0, 0.0)
+    # Explicit per-beam elevation table in degrees, ordered top→bottom. When
+    # set it overrides the built-in ``sensor_type`` table and the uniform
+    # fallback. Scene USDZ imports populate this from the rig's measured
+    # LiDAR calibration (``lidar_model.parameters.elevation_deg``).
+    elevation_deg: tuple[float, ...] | None = None
     pointcloud_topic: str = "/splatsim/lidar/pointcloud"
     frame_id: str = "splatsim_lidar"
     drop_threshold: float = 0.5

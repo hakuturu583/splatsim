@@ -306,6 +306,11 @@ class LidarSensorSpec:
     el_lo_rad: float = math.radians(-25.0)
     el_hi_rad: float = math.radians(15.0)
     n_rows_uniform: int = 128
+    # Explicit per-beam elevation table (radians, strictly descending /
+    # top→bottom). When non-empty it overrides both ``sensor_type`` and the
+    # uniform fallback. Kept as a tuple so it stays hashable for the
+    # ``_build_lidar_coeffs`` LRU cache key.
+    row_elevations_rad: tuple[float, ...] = ()
 
     def coeffs(self, device: torch.device):
         """Build the gsplat ``...ParametersExt`` once per device."""
@@ -316,6 +321,7 @@ class LidarSensorSpec:
             self.el_lo_rad,
             self.el_hi_rad,
             self.n_rows_uniform,
+            self.row_elevations_rad,
             str(device),
         )
 
@@ -328,6 +334,7 @@ def _build_lidar_coeffs(
     el_lo_rad: float,
     el_hi_rad: float,
     n_rows_uniform: int,
+    row_elevations_rad: tuple[float, ...],
     device_str: str,
 ):
     """gsplat lidar params + cached preprocessing. Memoised per device."""
@@ -340,7 +347,14 @@ def _build_lidar_coeffs(
     import gsplat
 
     device = torch.device(device_str)
-    if sensor_type in _TABLES_RAD:
+    if row_elevations_rad:
+        # Explicit calibrated table (e.g. from a scene USDZ). Already sorted
+        # strictly descending by the caller, matching the panorama's
+        # row 0 = top-elevation convention used by the named tables below.
+        elevs = torch.tensor(
+            row_elevations_rad, dtype=torch.float32, device=device
+        )
+    elif sensor_type in _TABLES_RAD:
         elevs = torch.tensor(
             _TABLES_RAD[sensor_type], dtype=torch.float32, device=device
         )
@@ -406,6 +420,16 @@ def build_lidar_sensors_from_config(cfg_sensors) -> list[LidarSensorSpec]:
                 f"LiDAR sensor {getattr(s, 'name', '<unnamed>')}: "
                 "rotation must be quaternion [w,x,y,z] or RPY [roll,pitch,yaw]"
             )
+        elevation_deg = getattr(s, "elevation_deg", None)
+        if elevation_deg:
+            # Sort strictly descending (top→bottom) so the panorama's row 0
+            # is the highest beam regardless of the source table's order.
+            row_elevations_rad = tuple(
+                math.radians(v)
+                for v in sorted((float(d) for d in elevation_deg), reverse=True)
+            )
+        else:
+            row_elevations_rad = ()
         out.append(
             LidarSensorSpec(
                 name=str(s.name),
@@ -414,6 +438,7 @@ def build_lidar_sensors_from_config(cfg_sensors) -> list[LidarSensorSpec]:
                 n_columns=int(getattr(s, "n_columns", 2048)),
                 spinning_frequency_hz=float(getattr(s, "fps", 10.0)),
                 n_rows_uniform=int(getattr(s, "n_rows", 128)),
+                row_elevations_rad=row_elevations_rad,
             )
         )
     return out

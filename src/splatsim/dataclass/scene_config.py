@@ -12,6 +12,48 @@ from splatsim.dataclass.rigid_body_config import RigidBodyConfig
 from splatsim.dataclass.viewer_config import ViewerConfig
 
 
+def _lidar_sensors_from_rigs(rigs) -> list[LidarConfig]:
+    """Build :class:`LidarConfig` entries from a scene USDZ's rig calibrations.
+
+    3dgs_io stores each LiDAR pose as sensor-in-rig: ``translation`` is the
+    mount position in the ego/base frame directly (no inversion needed), and
+    ``rotation`` is an ``xyzw`` unit quaternion — reordered here to the
+    ``wxyz`` form :func:`build_lidar_sensors_from_config` expects. The
+    intrinsics (row/column counts, spin rate, range, and the per-beam
+    ``elevation_deg`` table) live in the free-form ``lidar_model.parameters``.
+    """
+    sensors: list[LidarConfig] = []
+    for rig in rigs:
+        for cal in getattr(rig, "lidars", None) or []:
+            ext = cal.extrinsics
+            tx, ty, tz = (float(v) for v in ext.translation)
+            qx, qy, qz, qw = (float(v) for v in ext.rotation)  # xyzw
+            model = getattr(cal, "lidar_model", None)
+            params = dict(model.parameters) if model is not None else {}
+            elevation = params.get("elevation_deg")
+            sensors.append(
+                LidarConfig(
+                    name=cal.name,
+                    # Geometry is driven by the explicit elevation table below,
+                    # so no built-in named table (OT128/XT32) is assumed here.
+                    sensor_type="",
+                    n_rows=int(params.get("n_rows", 128)),
+                    n_columns=int(params.get("n_columns", 2048)),
+                    fps=float(params.get("fps", 10.0)),
+                    min_range_m=float(params.get("min_range_m", 0.3)),
+                    max_range_m=float(params.get("max_range_m", 120.0)),
+                    position=(tx, ty, tz),
+                    rotation=(qw, qx, qy, qz),
+                    elevation_deg=(
+                        tuple(float(e) for e in elevation) if elevation else None
+                    ),
+                    pointcloud_topic=f"/sensing/lidar/{cal.name}/pointcloud",
+                    frame_id=cal.name,
+                )
+            )
+    return sensors
+
+
 @dataclass
 class SceneConfig:
     """Top-level scene configuration loaded from YAML."""
@@ -92,6 +134,7 @@ class SceneConfig:
         viewer = ViewerConfig()
         initial_pos: tuple[float, float, float] | None = None
         initial_yaw: float | None = None
+        lidar_sensors: list[LidarConfig] = []
 
         rig_uri = meta.get("extras", {}).get("rig_trajectories")
         if rig_uri:
@@ -109,11 +152,13 @@ class SceneConfig:
             if pose is not None:
                 initial_pos, initial_yaw = pose
 
+            lidar_sensors = _lidar_sensors_from_rigs(rigs)
+
         return SceneConfig(
             background_tileset=str(path),
             use_sh=True,
             rigid_bodies=[],
-            lidar_sensors=[],
+            lidar_sensors=lidar_sensors,
             renderer=renderer,
             viewer=viewer,
             lod=LodConfig(),
