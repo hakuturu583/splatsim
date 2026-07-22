@@ -282,9 +282,9 @@ class Viewer(QMainWindow):
 
         rot_speed = self.rotate_speed * dt
         if Qt.Key.Key_Left in self._keys_pressed:
-            self._yaw -= rot_speed
-        if Qt.Key.Key_Right in self._keys_pressed:
             self._yaw += rot_speed
+        if Qt.Key.Key_Right in self._keys_pressed:
+            self._yaw -= rot_speed
 
     def _build_base_to_world(self) -> torch.Tensor:
         """Build the 4x4 base_link->world transform for LiDAR rendering.
