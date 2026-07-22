@@ -13,6 +13,7 @@ import torch
 
 from splatsim import _usdz
 from splatsim._conversions import GaussianTensors
+from splatsim.dataclass import SceneConfig
 from splatsim._usdz import (
     initial_camera_pose_from_rig_trajectories,
     iter_world_to_camera_uncentered,
@@ -118,6 +119,18 @@ def test_read_scene_json_accepts_frame_explicit_v2(tmp_path) -> None:
         zf.writestr("scene.json", json.dumps(scene))
 
     assert read_scene_json(usdz_path) == scene
+
+
+def test_usdz_scene_config_matches_reference_radius_clip(tmp_path) -> None:
+    usdz_path = tmp_path / "scene.usdz"
+    scene = _scene_doc()
+    scene["extras"].pop("rig_trajectories")
+    with zipfile.ZipFile(usdz_path, "w") as zf:
+        zf.writestr("scene.json", json.dumps(scene))
+
+    config = SceneConfig.from_usdz(usdz_path)
+
+    assert config.renderer.radius_clip == 1.0
 
 
 def test_load_spz_scene_reads_chunks_without_interpreting_tileset(

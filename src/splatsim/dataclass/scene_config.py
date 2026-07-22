@@ -82,8 +82,12 @@ class SceneConfig:
         rd = meta.get("render_defaults", {})
         renderer = RendererConfig(
             near_plane=rd.get("near_plane", RendererConfig.near_plane),
-            far_plane=rd.get("far_plane", RendererConfig.far_plane),
-            exposure=rd.get("exposure", RendererConfig.exposure),
+            far_plane=rd.get("far_plane", 60.0),
+            exposure=rd.get("exposure", 1.0),
+            # Match gaussian_factory's RGB reference render: discard
+            # sub-pixel splats instead of accumulating their low-contribution
+            # tails. USDZ scenes do not currently serialize this option.
+            radius_clip=1.0,
         )
         viewer = ViewerConfig()
         initial_pos: tuple[float, float, float] | None = None
