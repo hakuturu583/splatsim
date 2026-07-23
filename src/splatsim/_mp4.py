@@ -35,9 +35,9 @@ def render_trajectory_mp4(
     """Render ``scene`` along the rig camera's GT trajectory to an MP4 file.
 
     The trajectory and intrinsics come from the USDZ's ``rig_trajectories``
-    sidecar. ``camera_name`` selects which rig camera (defaults to the first
-    one); it must match the camera used to seed ``renderer.width``/``height``
-    so that resolutions agree.
+    sidecar. ``camera_name`` selects which rig camera (defaults to the most
+    forward-facing one); it must match the camera used to seed
+    ``renderer.width``/``height`` so that resolutions agree.
 
     Returns the number of frames written.
     """
