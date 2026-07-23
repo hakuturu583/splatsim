@@ -1,5 +1,5 @@
 <launch>
-  <arg name="scene_yaml" />
+  <arg name="scene_source" />
   <arg name="dds" default="true"/>
   <arg name="image_topic" default="/splatsim/image_raw"/>
   <arg name="camera_info_topic" default="/splatsim/camera_info"/>
@@ -8,7 +8,7 @@
   <arg name="use_lidar" default="false"
        description="Render a LiDAR panorama instead of the RGB camera view."/>
   <arg name="lidar_name" default=""
-       description="Name of the LiDAR sensor (from scene YAML lidar_sensors) to render when use_lidar is true."/>
+       description="Name of the LiDAR sensor (from the scene USDZ rig calibrations) to render when use_lidar is true."/>
 
   <!-- The trailing "dds_flag" is set to the CLI flag when $(var dds) is true,
        or empty otherwise. This lets each use_lidar branch collapse to one node. -->
@@ -16,10 +16,10 @@
   <let name="dds_flag" value="" unless="$(var dds)"/>
 
   <node pkg="splatsim" exec="splatsim-viewer" name="splatsim_viewer" output="screen"
-        args="$(var scene_yaml) --lidar $(var lidar_name) $(var dds_flag)"
+        args="$(var scene_source) --lidar $(var lidar_name) $(var dds_flag)"
         if="$(var use_lidar)"/>
 
   <node pkg="splatsim" exec="splatsim-viewer" name="splatsim_viewer" output="screen"
-        args="$(var scene_yaml) $(var dds_flag) --topic-image $(var image_topic) --topic-camera-info $(var camera_info_topic) --frame-id $(var frame_id) --compress-format $(var compress_format)"
+        args="$(var scene_source) $(var dds_flag) --topic-image $(var image_topic) --topic-camera-info $(var camera_info_topic) --frame-id $(var frame_id) --compress-format $(var compress_format)"
         unless="$(var use_lidar)"/>
 </launch>

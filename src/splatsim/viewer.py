@@ -443,12 +443,12 @@ class Viewer(QMainWindow):
 
 
 def main() -> None:
-    """Entry point: ``uv run viewer scene.yaml``."""
+    """Entry point: ``uv run viewer scene.usdz``."""
     parser = argparse.ArgumentParser(description="splatsim interactive viewer")
     parser.add_argument(
         "scene_source",
         type=Path,
-        help="Path to a scene YAML file or a scene USDZ archive",
+        help="Path to a scene USDZ archive",
     )
     parser.add_argument(
         "--camera",

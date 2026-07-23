@@ -151,14 +151,14 @@ class Scene:
         device: torch.device | None = None,
         progress: Callable[[int, int, str], None] | None = None,
     ) -> Scene:
-        """Build a Scene from a SceneConfig or YAML path.
+        """Build a Scene from a SceneConfig or a scene USDZ path.
 
         Args:
             progress: Optional callback ``(step, total, label)`` invoked
                 after each major loading stage completes.
         """
         if not isinstance(config, SceneConfig):
-            config = SceneConfig.from_yaml(config)
+            config = SceneConfig.from_source(config)
 
         if device is None:
             device = torch.device(config.renderer.device)
@@ -310,7 +310,7 @@ def load_scene(
     camera_info_publisher: CameraInfoPublisher | None = None,
     camera_name: str | None = None,
 ) -> Viewer:
-    """Build a Viewer from a SceneConfig or a YAML file path.
+    """Build a Viewer from a SceneConfig or a scene USDZ path.
 
     ``camera_name`` selects which PPISP camera profile the Viewer emulates
     when the scene has a PPISP payload; pass the ``name`` of one of the
@@ -321,7 +321,7 @@ def load_scene(
     from splatsim.viewer import Viewer
 
     if not isinstance(config, SceneConfig):
-        config = SceneConfig.from_yaml(config)
+        config = SceneConfig.from_source(config)
 
     device = torch.device(config.renderer.device)
     scene = Scene.from_config(config, device=device, progress=print_progress)
