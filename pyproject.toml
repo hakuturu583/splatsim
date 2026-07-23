@@ -74,9 +74,9 @@ torchvision = [
 ]
 
 # 3dgs_io v1.0.0: first tagged release. Includes the frame-explicit v2 scene
-# USDZ work (issue #39) previously tracked via the feat branch, and still ships
-# the 3D Tiles reader (load_tileset/merge_tileset) used by Background for
-# tileset.json sources.
+# USDZ work (issue #39) previously tracked via the feat branch. Only the scene
+# USDZ readers (load_spz, decode_lidar_sidecar, parse_rig_trajectories, ...) are
+# used; splatsim no longer loads 3D Tiles tilesets.
 3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v1.0.0" }
 
 # nv-tlabs/ppisp: physically-plausible ISP for novel-view radiance-field rendering.
@@ -107,7 +107,6 @@ dev = [
 splatsim-viewer = "splatsim.viewer:main"
 spawn-scenario = "scenarios.odaibatest_spawn.run:main"
 splatsim-grpc-server = "splatsim.grpc_service.cli:main"
-splatsim-tile-server = "splatsim.tile_server.cli:main"
 
 [tool.ruff]
 exclude = ["src/splatsim/grpc_service/_generated"]

@@ -72,9 +72,9 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 device = torch.device(request.device or "cuda")
                 self._device = device
 
-                logger.info("Loading tileset: %s", request.tileset_path)
+                logger.info("Loading scene: %s", request.scene_path)
                 background = Background(
-                    request.tileset_path,
+                    request.scene_path,
                     device=device,
                     use_sh=request.use_sh,
                 )

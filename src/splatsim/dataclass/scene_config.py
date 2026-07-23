@@ -58,7 +58,7 @@ def _lidar_sensors_from_rigs(rigs) -> list[LidarConfig]:
 class SceneConfig:
     """Top-level scene configuration loaded from YAML."""
 
-    background_tileset: str | None = None
+    background_usdz: str | None = None
     use_sh: bool = True
     rigid_bodies: list[RigidBodyConfig] = field(default_factory=list)
     lidar_sensors: list[LidarConfig] = field(default_factory=list)
@@ -155,7 +155,7 @@ class SceneConfig:
             lidar_sensors = _lidar_sensors_from_rigs(rigs)
 
         return SceneConfig(
-            background_tileset=str(path),
+            background_usdz=str(path),
             use_sh=True,
             rigid_bodies=[],
             lidar_sensors=lidar_sensors,
@@ -179,9 +179,9 @@ class SceneConfig:
         base_dir = path.parent
 
         # Background
-        bg_tileset = raw.get("background_tileset")
-        if bg_tileset is not None:
-            bg_tileset = str(base_dir / bg_tileset)
+        bg_usdz = raw.get("background_usdz")
+        if bg_usdz is not None:
+            bg_usdz = str(base_dir / bg_usdz)
 
         # Rigid bodies
         rigid_bodies: list[RigidBodyConfig] = []
@@ -268,7 +268,7 @@ class SceneConfig:
             )
 
         return SceneConfig(
-            background_tileset=bg_tileset,
+            background_usdz=bg_usdz,
             use_sh=raw.get("use_sh", True),
             rigid_bodies=rigid_bodies,
             lidar_sensors=lidar_sensors,

@@ -163,7 +163,7 @@ class Scene:
         if device is None:
             device = torch.device(config.renderer.device)
 
-        has_bg = config.background_tileset is not None
+        has_bg = config.background_usdz is not None
         total = int(has_bg) + len(config.rigid_bodies)
         step = 0
 
@@ -173,9 +173,9 @@ class Scene:
 
         background: Background | None = None
         ppisp_tables: PpispTables | None = None
-        if config.background_tileset is not None:
+        if config.background_usdz is not None:
             background = Background(
-                config.background_tileset,
+                config.background_usdz,
                 device=device,
                 use_sh=config.use_sh,
                 lod_manager=lod_manager,
@@ -190,8 +190,8 @@ class Scene:
                 from splatsim.ppisp import load_ppisp_tables
 
                 ppisp_tables = load_ppisp_tables(
-                    config.background_tileset,
-                    load_rig_trajectories(config.background_tileset),
+                    config.background_usdz,
+                    load_rig_trajectories(config.background_usdz),
                     device=device,
                     centroid=background.tile_local_centroid,
                 )

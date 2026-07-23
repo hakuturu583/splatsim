@@ -60,7 +60,7 @@ class SplatSimScenario(BaseScenario):
 
     The geographic transform between CARLA world coordinates and the
     3DGS tile-local frame is computed automatically from the xodr
-    ``<geoReference>`` and the tileset.json ECEF transform.
+    ``<geoReference>`` and the scene USDZ ecef_anchor.
 
     Parameters
     ----------
@@ -159,7 +159,7 @@ class SplatSimScenario(BaseScenario):
         """The CARLA <-> tile-local coordinate transform.
 
         Created lazily on first access from the CARLA map's xodr
-        ``<geoReference>`` and the scene's tileset ECEF transform.
+        ``<geoReference>`` and the scene USDZ ecef_anchor.
         """
         if self._geo_transform is None:
             self._geo_transform = self._build_geo_transform()
@@ -481,12 +481,12 @@ class SplatSimScenario(BaseScenario):
         xodr_xml = self.world.get_map().to_opendrive()
         proj_origin = parse_geo_reference(xodr_xml)
 
-        # 2. Get tileset ECEF rotation/translation from Background
+        # 2. Get scene anchor ECEF rotation/translation from Background
         bg = self._scene.background
         if bg is None:
             raise RuntimeError(
                 "Cannot build GeoTransform: scene has no Background "
-                "(no tileset.json ECEF data)"
+                "(no scene USDZ ecef_anchor data)"
             )
 
         # 3. Get tile-local centroid (torch Tensor on GPU → numpy float64)

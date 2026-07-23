@@ -12,7 +12,7 @@ def test_scene_config_loads_lidar_sensors(tmp_path) -> None:
     scene_yaml.write_text(
         dedent(
             """
-            background_tileset: iteration_30000/tileset.json
+            background_usdz: scene.usdz
             use_sh: false
 
             lidar_sensors:
@@ -67,7 +67,7 @@ def test_scene_config_loads_hils_lidar(tmp_path) -> None:
     scene_yaml.write_text(
         dedent(
             """
-            background_tileset: iteration_30000/tileset.json
+            background_usdz: scene.usdz
 
             lidar_sensors:
               - name: top

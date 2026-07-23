@@ -1,4 +1,4 @@
-background_tileset: iteration_30000/tileset.json
+background_usdz: scene.usdz
 use_sh: false
 
 rigid_bodies: []
