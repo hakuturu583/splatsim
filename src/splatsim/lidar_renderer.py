@@ -992,12 +992,15 @@ class LidarRenderer:
         A cell is a valid return when it has enough alpha coverage, a low
         enough raydrop probability, and an in-range distance.
         """
-        return (
+        mask = (
             (panorama["alpha"] > alpha_threshold)
             & (torch.sigmoid(panorama["raydrop_logit"]) < drop_threshold)
             & (panorama["distance"] > self.min_range_m)
-            & (panorama["distance"] < self.max_range_m)
         )
+        # ``max_range_m`` is optional: ``None`` means "no far clip".
+        if self.max_range_m is not None:
+            mask = mask & (panorama["distance"] < self.max_range_m)
+        return mask
 
     def panorama_to_point_cloud(
         self,

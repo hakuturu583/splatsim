@@ -9,8 +9,8 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "gsplat[lidar]",
-    "torch==2.4.0+cu124",
-    "torchvision==0.19.0+cu124",
+    "torch==2.7.0+cu128",
+    "torchvision==0.22.0+cu128",
     "3dgs-io",
     "ppisp",
     "pyyaml>=6.0",
@@ -45,12 +45,13 @@ environments = ["sys_platform == 'linux'"]
 
 # gsplat compiles CUDA kernels during install and pulls `torch` unpinned as a
 # PEP 518 build dep. Without a constraint, uv's isolated build env grabs the
-# latest torch (currently 2.9.x, CUDA 13), which mismatches our CUDA 12.4
+# latest torch (currently 2.9.x, CUDA 13), which mismatches our CUDA 12.8
 # container's nvcc and fails with the "detected CUDA version mismatches"
 # RuntimeError from torch.utils.cpp_extension. Pin the build-time torch to
-# the 2.4 series (CUDA 12.1 on the default PyPI wheel) so the major CUDA
-# version matches the container.
-build-constraint-dependencies = ["torch<2.5"]
+# the 2.7 series (CUDA 12.x on the default PyPI wheel) so the major CUDA
+# version matches the container. sm_120 (Blackwell / RTX 50xx) native codegen
+# requires CUDA 12.8+/torch 2.7+, which this series provides.
+build-constraint-dependencies = ["torch>=2.7,<2.8"]
 
 # ppisp compiles a CUDA extension (`ppisp_cuda`) via
 # torch.utils.cpp_extension.CUDAExtension but does not declare torch as a
@@ -60,17 +61,17 @@ build-constraint-dependencies = ["torch<2.5"]
 ppisp = ["torch"]
 
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu124" },
+  { index = "pytorch-cu128" },
 ]
 
 torchvision = [
-  { index = "pytorch-cu124" },
+  { index = "pytorch-cu128" },
 ]
 
 # 3dgs_io v1.0.0: first tagged release. Includes the frame-explicit v2 scene
