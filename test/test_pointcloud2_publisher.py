@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import numpy as np
 import pytest
 
@@ -50,7 +52,12 @@ def test_make_pointcloud2_message_packs_autoware_fields() -> None:
         ("channel", 14, 4, 1),
     ]
 
-    rec = np.frombuffer(bytes(msg.data), dtype=_POINT_RECORD)
+    # np.frombuffer is typed as returning a float64 array regardless of the
+    # structured dtype= argument, so the field-name indexing below needs a cast.
+    rec = cast(
+        "np.ndarray[Any, np.dtype[np.void]]",
+        np.frombuffer(bytes(msg.data), dtype=_POINT_RECORD),
+    )
     np.testing.assert_allclose(np.column_stack([rec["x"], rec["y"], rec["z"]]), xyz)
     assert rec["intensity"].dtype == np.uint8
     assert rec["intensity"].tolist() == [63, 255]
@@ -67,7 +74,12 @@ def test_make_pointcloud2_message_defaults_channel_to_zero() -> None:
         xyz, intensity, stamp=Time(sec=0, nanosec=0), frame_id="lidar"
     )
 
-    rec = np.frombuffer(bytes(msg.data), dtype=_POINT_RECORD)
+    # np.frombuffer is typed as returning a float64 array regardless of the
+    # structured dtype= argument, so the field-name indexing below needs a cast.
+    rec = cast(
+        "np.ndarray[Any, np.dtype[np.void]]",
+        np.frombuffer(bytes(msg.data), dtype=_POINT_RECORD),
+    )
     assert rec["channel"].tolist() == [0, 0, 0]
 
 
