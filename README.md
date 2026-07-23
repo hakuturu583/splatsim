@@ -57,6 +57,11 @@ pick the tag that matches your GPU. Each tag is
 | H100 (Hopper)         | 9.0  | `sm90`  |
 | RTX 50xx (Blackwell)  | 12.0 | `sm120` |
 
+The tag suffix names the native SASS target (`sm_XX`). Every image also embeds
+`compute_XX` PTX, so the driver can JIT-run it on GPU generations newer than
+the one it was built for — PTX is uniform across images and is not a separate
+tag dimension.
+
 ```bash
 # A specific version for an RTX 40xx (Ada, sm_89), CUDA 12.8.1
 docker pull ghcr.io/tier4/splatsim:1.0.0-cuda12.8.1-sm89
