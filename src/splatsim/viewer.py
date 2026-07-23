@@ -345,6 +345,7 @@ class Viewer(QMainWindow):
                 self._pointcloud_pub.publish(
                     point_cloud["xyz"],
                     point_cloud["intensity"],
+                    channel=point_cloud["channel"],
                     stamp=_wall_clock_stamp(),
                 )
         return _lidar_panorama_to_rgb(

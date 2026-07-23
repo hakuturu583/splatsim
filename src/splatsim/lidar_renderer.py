@@ -1017,8 +1017,11 @@ class LidarRenderer:
             alpha_threshold: Minimum alpha coverage to keep a sample.
 
         Returns:
-            ``{"xyz": (N, 3) float32, "intensity": (N,) float32}``. Coordinates
-            in sensor frame (+x forward, +y left, +z up — gsplat lidar convention).
+            ``{"xyz": (N, 3) float32, "intensity": (N,) float32,
+            "channel": (N,) uint16}``. Coordinates are in the sensor frame
+            (+x forward, +y left, +z up — gsplat lidar convention).
+            ``channel`` is the panorama row index of each point, i.e. the
+            ring / laser-beam id (row 0 = topmost beam).
         """
         distance = panorama["distance"]
         intensity = panorama["intensity"]
@@ -1028,6 +1031,9 @@ class LidarRenderer:
 
         el_grid = self._elevs[:, None].expand(-1, self.n_columns)  # (H, W)
         az_grid = self._azimuths[None, :].expand(self.n_rows, -1)  # (H, W)
+        row_grid = torch.arange(self.n_rows, device=distance.device)[:, None].expand(
+            -1, self.n_columns
+        )  # (H, W) ring / laser-beam index
 
         cos_el = torch.cos(el_grid)
         x = distance * cos_el * torch.cos(az_grid)
@@ -1036,10 +1042,12 @@ class LidarRenderer:
 
         xyz = torch.stack([x, y, z], dim=-1)[valid]
         intensity_valid = intensity[valid]
+        channel_valid = row_grid[valid]
 
         return {
             "xyz": xyz.detach().cpu().numpy().astype(np.float32),
             "intensity": intensity_valid.detach().cpu().numpy().astype(np.float32),
+            "channel": channel_valid.detach().cpu().numpy().astype(np.uint16),
         }
 
     def panorama_to_range_image(

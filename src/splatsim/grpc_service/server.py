@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Callable, Iterator
 
 import grpc
 import torch
@@ -16,15 +16,19 @@ from cyclonedds.domain import DomainParticipant
 from splatsim.background import Background
 from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
 from splatsim.cyclonedds.msg_types import Time
+from splatsim.cyclonedds.pointcloud2_publisher import PointCloud2Publisher
+from splatsim.dataclass.lidar_config import LidarConfig
 from splatsim.grpc_service._generated import (
     rendering_service_pb2 as pb2,
     rendering_service_pb2_grpc as pb2_grpc,
 )
 from splatsim.grpc_service.pose_buffer import PoseBuffer, TimestampedPose
 from splatsim.grpc_service.viewmat_builder import (
+    build_base_to_world_from_pose,
     build_intrinsics,
     build_viewmat_from_pose,
 )
+from splatsim.lidar_renderer import LidarRenderer, build_lidar_sensors_from_config
 from splatsim.renderer import Renderer
 from splatsim.scene import Scene
 
@@ -60,6 +64,14 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         self._frame_rate: float = 30.0
         self._clock_initial_ns: int = 0
         self._render_count: int = 0
+
+        # LiDAR state (populated by InitializeLidar; shares self._scene).
+        self._lidar_renderer: LidarRenderer | None = None
+        self._pointcloud_pub: PointCloud2Publisher | None = None
+        self._lidar_frame_rate: float = 10.0
+        self._lidar_drop_threshold: float = 0.5
+        self._lidar_alpha_threshold: float = 0.1
+        self._lidar_render_count: int = 0
 
     def Initialize(
         self,
@@ -176,13 +188,34 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         assert self._K is not None  # noqa: S101
         assert self._device is not None  # noqa: S101
 
+        return self._run_pose_stream(
+            request_iterator,
+            frame_rate=self._frame_rate,
+            render_and_publish=self._render_and_publish,
+        )
+
+    def _run_pose_stream(
+        self,
+        request_iterator: Iterator[pb2.CameraData | pb2.LidarData],
+        *,
+        frame_rate: float,
+        render_and_publish: Callable[[TimestampedPose, int], None],
+    ) -> pb2.StreamSummary:
+        """Shared two-thread pose-streaming loop for camera and LiDAR.
+
+        Reading from the gRPC stream and GPU rendering run on separate
+        threads so slow rendering never blocks pose ingestion. The render
+        loop always uses the latest available pose at ``frame_rate`` cadence,
+        publishing through the supplied ``render_and_publish`` callback, and
+        old poses are dropped from the buffer.
+        """
         pose_buffer = PoseBuffer()
         stream_done = threading.Event()
         render_failed = threading.Event()
         frames_rendered = 0
         poses_received = 0
 
-        frame_period_s = 1.0 / self._frame_rate
+        frame_period_s = 1.0 / frame_rate
 
         def _render_loop() -> None:
             """Render at frame_rate using the latest buffered pose."""
@@ -212,7 +245,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                             latest.position[2],
                         )
 
-                    self._render_and_publish(latest, render_time_ns)
+                    render_and_publish(latest, render_time_ns)
                     frames_rendered += 1
                     pose_buffer.trim_before(render_time_ns)
 
@@ -229,12 +262,12 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         render_thread.start()
 
         try:
-            for camera_data in request_iterator:
-                stamp = camera_data.stamp
+            for data in request_iterator:
+                stamp = data.stamp
                 time_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
 
-                p = camera_data.pose.position
-                r = camera_data.pose.rotation
+                p = data.pose.position
+                r = data.pose.rotation
                 pose = TimestampedPose(
                     time_ns=time_ns,
                     position=(p.x, p.y, p.z),
@@ -320,4 +353,157 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 (t_render - t_viewmat) * 1000,
                 (t_transfer - t_render) * 1000,
                 (t_publish - t_transfer) * 1000,
+            )
+
+    # ── LiDAR ────────────────────────────────────────────────────────────
+
+    def InitializeLidar(
+        self,
+        request: pb2.InitializeLidarRequest,
+        context: grpc.ServicerContext,
+    ) -> pb2.InitializeResponse:
+        """Add a LiDAR sensor to the already-loaded scene.
+
+        ``Initialize`` must have been called first — the LiDAR renderer shares
+        the scene and DomainParticipant created there.
+        """
+        with self._lock:
+            try:
+                if not self._initialized or self._scene is None:
+                    return pb2.InitializeResponse(
+                        success=False,
+                        message="Scene not initialized. Call Initialize first.",
+                    )
+                assert self._device is not None  # noqa: S101
+                assert self._dp is not None  # noqa: S101
+
+                s = request.sensor
+                ext = s.extrinsic
+                pos = ext.position
+                rot = ext.rotation  # wxyz
+                elevation = tuple(s.elevation_deg) or None
+
+                cfg = LidarConfig(
+                    name=s.name or "lidar",
+                    sensor_type=s.sensor_type,
+                    n_rows=int(s.n_rows) or 128,
+                    n_columns=int(s.n_columns) or 2048,
+                    fps=s.fps or 10.0,
+                    min_range_m=s.min_range_m or 0.3,
+                    max_range_m=s.max_range_m or 120.0,
+                    position=(pos.x, pos.y, pos.z),
+                    rotation=(rot.w, rot.x, rot.y, rot.z),
+                    elevation_deg=elevation,
+                    pointcloud_topic=(
+                        s.pointcloud_topic or "/splatsim/lidar/pointcloud"
+                    ),
+                    frame_id=s.frame_id or "splatsim_lidar",
+                    drop_threshold=s.drop_threshold or 0.5,
+                    alpha_threshold=s.alpha_threshold or 0.1,
+                )
+
+                spec = build_lidar_sensors_from_config([cfg])[0]
+                self._lidar_renderer = LidarRenderer(
+                    spec,
+                    device=self._device,
+                    min_range_m=cfg.min_range_m,
+                    max_range_m=cfg.max_range_m,
+                )
+                self._pointcloud_pub = PointCloud2Publisher(
+                    self._dp,
+                    topic_name=cfg.pointcloud_topic,
+                    frame_id=cfg.frame_id,
+                )
+                self._lidar_frame_rate = cfg.fps
+                self._lidar_drop_threshold = cfg.drop_threshold
+                self._lidar_alpha_threshold = cfg.alpha_threshold
+
+                logger.info(
+                    "LiDAR initialized: name=%s rows=%d cols=%d %.1ffps topic=%s",
+                    cfg.name,
+                    self._lidar_renderer.n_rows,
+                    self._lidar_renderer.n_columns,
+                    cfg.fps,
+                    cfg.pointcloud_topic,
+                )
+                return pb2.InitializeResponse(success=True)
+
+            except Exception as exc:
+                logger.exception("InitializeLidar failed")
+                return pb2.InitializeResponse(success=False, message=str(exc))
+
+    def StreamLidarData(
+        self,
+        request_iterator: Iterator[pb2.LidarData],
+        context: grpc.ServicerContext,
+    ) -> pb2.StreamSummary:
+        """Consume timestamped base_link poses, render LiDAR, and publish via DDS.
+
+        Mirrors :meth:`StreamCameraData`: the gRPC ingestion thread and the GPU
+        render loop run separately, and the render loop always uses the latest
+        buffered pose at the sensor's spin rate.
+        """
+        if not self._initialized:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "Service not initialized. Call Initialize first.",
+            )
+        if self._lidar_renderer is None or self._pointcloud_pub is None:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "LiDAR not initialized. Call InitializeLidar first.",
+            )
+
+        assert self._scene is not None  # noqa: S101
+        assert self._device is not None  # noqa: S101
+
+        return self._run_pose_stream(
+            request_iterator,
+            frame_rate=self._lidar_frame_rate,
+            render_and_publish=self._render_and_publish_lidar,
+        )
+
+    def _render_and_publish_lidar(
+        self,
+        pose: TimestampedPose,
+        render_time_ns: int,
+    ) -> None:
+        """Render one LiDAR panorama at *pose* and publish a PointCloud2."""
+        assert self._lidar_renderer is not None  # noqa: S101
+        assert self._pointcloud_pub is not None  # noqa: S101
+        assert self._scene is not None  # noqa: S101
+        assert self._device is not None  # noqa: S101
+
+        t0 = time.monotonic()
+        base_to_world = build_base_to_world_from_pose(
+            pose.position, pose.rotation, self._device
+        )
+        with torch.no_grad():
+            panorama = self._lidar_renderer.render(base_to_world, scene=self._scene)
+            point_cloud = self._lidar_renderer.panorama_to_point_cloud(
+                panorama,
+                drop_threshold=self._lidar_drop_threshold,
+                alpha_threshold=self._lidar_alpha_threshold,
+            )
+        t_render = time.monotonic()
+
+        sec, nanosec = divmod(render_time_ns, 1_000_000_000)
+        stamp = Time(sec=sec, nanosec=nanosec)
+        self._pointcloud_pub.publish(
+            point_cloud["xyz"],
+            point_cloud["intensity"],
+            channel=point_cloud["channel"],
+            stamp=stamp,
+        )
+        t_publish = time.monotonic()
+
+        self._lidar_render_count += 1
+        if self._lidar_render_count <= 5 or self._lidar_render_count % 100 == 0:
+            logger.info(
+                "LiDAR render #%d: %d points total=%.1fms (render=%.1f publish=%.1f)",
+                self._lidar_render_count,
+                point_cloud["xyz"].shape[0],
+                (t_publish - t0) * 1000,
+                (t_render - t0) * 1000,
+                (t_publish - t_render) * 1000,
             )
