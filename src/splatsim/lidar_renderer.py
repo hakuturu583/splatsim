@@ -351,9 +351,7 @@ def _build_lidar_coeffs(
         # Explicit calibrated table (e.g. from a scene USDZ). Already sorted
         # strictly descending by the caller, matching the panorama's
         # row 0 = top-elevation convention used by the named tables below.
-        elevs = torch.tensor(
-            row_elevations_rad, dtype=torch.float32, device=device
-        )
+        elevs = torch.tensor(row_elevations_rad, dtype=torch.float32, device=device)
     elif sensor_type in _TABLES_RAD:
         elevs = torch.tensor(
             _TABLES_RAD[sensor_type], dtype=torch.float32, device=device
