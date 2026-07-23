@@ -88,7 +88,9 @@ jobs:
           file: docker/Dockerfile
           push: false
           build-args: |
-            TORCH_CUDA_ARCH_LIST=${{ matrix.arch }}
+            # +PTX embeds compute_XX PTX for forward-compat JIT onto newer GPUs
+            # (see the release workflow for details).
+            TORCH_CUDA_ARCH_LIST=${{ matrix.arch }}+PTX
           # Share the cache scope with the release publish job so a PR build
           # warms the cache the release reuses (and arches don't clobber).
           cache-from: type=gha,scope=${{ steps.scope.outputs.sm }}

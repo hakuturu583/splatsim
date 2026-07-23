@@ -27,8 +27,11 @@ WORKDIR /workspace/splatsim
 # with an IndexError from torch's _get_cuda_arch_flags.
 # Architectures cover consumer RTX 20xx (7.5, Turing) through RTX 50xx
 # (12.0, Blackwell), plus datacenter Ampere (8.0) and Hopper (9.0). sm_120
-# requires CUDA 12.8+ / torch 2.7+ (see pyproject.toml).
-ARG TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;12.0"
+# requires CUDA 12.8+ / torch 2.7+ (see pyproject.toml). The top arch carries
+# +PTX so the driver can JIT this (default, fat) image onto GPU generations
+# newer than Blackwell. The CI/release matrix overrides this with a single
+# arch (+PTX) per image.
+ARG TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;12.0+PTX"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 ENV TORCH_EXTENSIONS_DIR=/workspace/splatsim/.torch_extensions
 

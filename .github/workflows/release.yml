@@ -220,7 +220,10 @@ jobs:
           build-args: |
             CUDA_VERSION=${{ env.CUDA_VERSION }}
             UBUNTU_VERSION=${{ env.UBUNTU_VERSION }}
-            TORCH_CUDA_ARCH_LIST=${{ matrix.arch }}
+            # +PTX embeds compute_XX PTX alongside the sm_XX SASS so the driver
+            # can JIT this image onto GPU generations newer than the one it was
+            # built for (native GPUs still run SASS with no JIT cost).
+            TORCH_CUDA_ARCH_LIST=${{ matrix.arch }}+PTX
           # Scope the cache per arch so parallel matrix jobs don't clobber each
           # other's layers.
           cache-from: type=gha,scope=sm${{ matrix.sm }}
