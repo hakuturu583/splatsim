@@ -5,7 +5,7 @@
 ## Prerequisites
 
 - Python 3.10+
-- CUDA 12.4
+- CUDA 12.8
 - [uv](https://docs.astral.sh/uv/)
 - (Docker builds) Docker with [BuildKit](https://docs.docker.com/build/buildkit/) and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 
@@ -41,6 +41,35 @@ uv sync --extra all
 
 ### Docker
 
+#### Pull a published image
+
+Released images are published to the GitHub Container Registry. A **separate
+image is built per GPU architecture** (one CUDA compute capability each), so
+pick the tag that matches your GPU. Each tag is
+`<version>-cuda<cuda>-sm<XX>`, plus a rolling `latest-sm<XX>`.
+
+| GPU | Compute capability | Tag suffix |
+| --- | --- | --- |
+| RTX 20xx (Turing)     | 7.5  | `sm75`  |
+| A100 (Ampere)         | 8.0  | `sm80`  |
+| RTX 30xx (Ampere)     | 8.6  | `sm86`  |
+| RTX 40xx (Ada)        | 8.9  | `sm89`  |
+| H100 (Hopper)         | 9.0  | `sm90`  |
+| RTX 50xx (Blackwell)  | 12.0 | `sm120` |
+
+```bash
+# A specific version for an RTX 40xx (Ada, sm_89), CUDA 12.8.1
+docker pull ghcr.io/tier4/splatsim:1.0.0-cuda12.8.1-sm89
+
+# Rolling latest for an RTX 50xx (Blackwell, sm_120)
+docker pull ghcr.io/tier4/splatsim:latest-sm120
+
+# Run (requires NVIDIA Container Toolkit)
+docker run --rm -it --gpus all ghcr.io/tier4/splatsim:latest-sm89
+```
+
+#### Build locally
+
 The Dockerfile uses a multi-stage build with the `dds` extra to keep the image minimal.
 
 ```bash
@@ -58,7 +87,7 @@ To customize CUDA or Ubuntu versions:
 ```bash
 docker buildx build \
   -f docker/Dockerfile \
-  --build-arg CUDA_VERSION=12.4.1 \
+  --build-arg CUDA_VERSION=12.8.1 \
   --build-arg UBUNTU_VERSION=22.04 \
   -t splatsim .
 ```

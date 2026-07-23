@@ -54,6 +54,13 @@ jobs:
 
   docker-build:
     runs-on: ubuntu-22.04
+    # Mirror the per-arch fan-out used by the release publish job so PR-time
+    # validation compiles each GPU architecture in parallel instead of building
+    # all six compute capabilities serially in one image.
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["7.5", "8.0", "8.6", "8.9", "9.0", "12.0"]
     steps:
       - uses: actions/checkout@v4
 
@@ -70,11 +77,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Compute cache scope
+        id: scope
+        run: echo "sm=sm$(echo '${{ matrix.arch }}' | tr -d '.')" >> "$GITHUB_OUTPUT"
+
       - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=min
+          build-args: |
+            TORCH_CUDA_ARCH_LIST=${{ matrix.arch }}
+          # Share the cache scope with the release publish job so a PR build
+          # warms the cache the release reuses (and arches don't clobber).
+          cache-from: type=gha,scope=${{ steps.scope.outputs.sm }}
+          cache-to: type=gha,scope=${{ steps.scope.outputs.sm }},mode=min
