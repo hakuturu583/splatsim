@@ -34,7 +34,7 @@ class SplatSimLidarSensorConfig(LidarSensorConfig):
 
     @classmethod
     def from_scene_config(cls, config: LidarConfig) -> SplatSimLidarSensorConfig:
-        """Build a runtime sensor config from a scene YAML LiDAR entry."""
+        """Build a runtime sensor config from a scene LiDAR config entry."""
         return cls(
             name=config.name,
             sensor_type=config.sensor_type,

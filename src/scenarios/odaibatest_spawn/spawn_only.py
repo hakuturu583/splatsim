@@ -55,7 +55,7 @@ class SpawnOnlyScenario(SplatSimScenario):
     ) -> None:
         super().__init__(
             ego_config,
-            splatsim_config.scene_yaml,
+            splatsim_config.scene_source,
             spawn_pose=spawn_pose,
             ground_projection=ground_projection,
         )

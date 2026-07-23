@@ -7,7 +7,7 @@ Conversion pipeline (all in float64 to avoid precision loss)::
       → MGRS  (add MGRS offset from lanelet2 projector)
       → LLA   (MGRSProjector.reverse — matches the actual map projection)
       → ECEF  (WGS84 via pyproj)
-      → tile-local  (inverse of tileset.json transform)
+      → tile-local  (inverse of the scene USDZ ecef_anchor)
       → re-centered (subtract Background.tile_local_centroid)
 
 The rotation is converted via:
@@ -47,9 +47,9 @@ class GeoTransform:
         ``(latitude, longitude)`` of the xodr GeoReference origin in
         decimal degrees (parsed from ``+lat_0`` / ``+lon_0``).
     ecef_rotation:
-        3×3 rotation from tile-local to ECEF (from tileset.json).
+        3×3 rotation from tile-local to ECEF (from the scene USDZ ecef_anchor).
     ecef_translation:
-        3-vector ECEF translation (from tileset.json).
+        3-vector ECEF translation (from the scene USDZ ecef_anchor).
     tile_origin:
         3-vector subtracted from tile-local positions for re-centering
         (``Background.tile_local_centroid``).

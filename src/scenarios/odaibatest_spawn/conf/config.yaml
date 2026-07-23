@@ -39,7 +39,7 @@ simulation:
   fixed_delta_seconds: 0.05
 
 splatsim:
-  scene_yaml: ???
+  scene_source: ???
   image_topic: /splatsim/image_raw
   camera_info_topic: /splatsim/camera_info
   frame_id: splatsim_camera

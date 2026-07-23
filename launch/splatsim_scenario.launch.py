@@ -18,7 +18,7 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument("carla_host", default_value="localhost"),
         DeclareLaunchArgument("carla_port", default_value="2000"),
-        DeclareLaunchArgument("scene_yaml"),
+        DeclareLaunchArgument("scene_source"),
         DeclareLaunchArgument("spawn_lanelet_id", default_value="2303321"),
         DeclareLaunchArgument("spawn_s", default_value="0.0"),
         DeclareLaunchArgument(
@@ -46,7 +46,7 @@ def generate_launch_description():
             ),
             ["server.host=", LaunchConfiguration("carla_host")],
             ["server.port=", LaunchConfiguration("carla_port")],
-            ["splatsim.scene_yaml=", LaunchConfiguration("scene_yaml")],
+            ["splatsim.scene_source=", LaunchConfiguration("scene_source")],
             ["ego.spawn_lanelet_id=", LaunchConfiguration("spawn_lanelet_id")],
             ["ego.spawn_s=", LaunchConfiguration("spawn_s")],
             ["ego.vehicle_type=", LaunchConfiguration("vehicle_type")],

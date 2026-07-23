@@ -25,7 +25,7 @@ class SplatSimConfig:
        multi-camera configuration) as the integration matures.
     """
 
-    scene_yaml: str = ""
+    scene_source: str = ""
     image_topic: str = "/splatsim/image_raw"
     camera_info_topic: str = "/splatsim/camera_info"
     frame_id: str = "splatsim_camera"

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 @dataclass
 class LidarConfig:
-    """LiDAR sensor entry loaded from scene YAML."""
+    """LiDAR sensor entry (from a scene USDZ rig calibration or SceneConfig)."""
 
     name: str = "lidar"
     enabled: bool = True
