@@ -17,7 +17,7 @@ from splatsim.background import Background
 from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
 from splatsim.cyclonedds.msg_types import Time
 from splatsim.cyclonedds.pointcloud2_publisher import PointCloud2Publisher
-from splatsim.dataclass.lidar_config import LidarConfig
+from splatsim.dataclass.lidar_config import LidarConfig, sensor_defaults
 from splatsim.grpc_service._generated import (
     rendering_service_pb2 as pb2,
     rendering_service_pb2_grpc as pb2_grpc,
@@ -383,14 +383,19 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 rot = ext.rotation  # wxyz
                 elevation = tuple(s.elevation_deg) or None
 
+                # Faithful hardware defaults for the requested model fill in
+                # any field the client left at 0 (e.g. Velodyne HDL-64E gets
+                # 64 beams / 2083 azimuth samples / 120 m range). Unknown
+                # models fall back to the baseline literals below.
+                d = sensor_defaults(s.sensor_type)
                 cfg = LidarConfig(
                     name=s.name or "lidar",
                     sensor_type=s.sensor_type,
-                    n_rows=int(s.n_rows) or 128,
-                    n_columns=int(s.n_columns) or 2048,
-                    fps=s.fps or 10.0,
-                    min_range_m=s.min_range_m or 0.3,
-                    max_range_m=s.max_range_m or 120.0,
+                    n_rows=int(s.n_rows) or int(d.get("n_rows", 128)),
+                    n_columns=int(s.n_columns) or int(d.get("n_columns", 2048)),
+                    fps=s.fps or d.get("fps", 10.0),
+                    min_range_m=s.min_range_m or d.get("min_range_m", 0.3),
+                    max_range_m=s.max_range_m or d.get("max_range_m", 120.0),
                     position=(pos.x, pos.y, pos.z),
                     rotation=(rot.w, rot.x, rot.y, rot.z),
                     elevation_deg=elevation,

@@ -41,3 +41,41 @@ class LidarConfig:
     # Wall-clock (Unix) time that simulation time 0 maps to, stamped into the
     # HILS packet date-time. ``None`` -> "now" when the sensor is created.
     hils_start_epoch: float | None = None
+
+    @classmethod
+    def for_sensor(cls, sensor_type: str, **overrides: object) -> "LidarConfig":
+        """Build a config preloaded with faithful hardware defaults.
+
+        For known models (see :data:`SENSOR_PRESETS`) this fills in realistic
+        channel count, azimuth resolution, spin rate and range so the rendered
+        scan matches the physical sensor. Any keyword ``overrides`` win over
+        the preset. Unknown models fall back to the field defaults.
+        """
+        params: dict[str, object] = {"sensor_type": sensor_type}
+        params.update(sensor_defaults(sensor_type))
+        params.update(overrides)
+        return cls(**params)  # ty: ignore[invalid-argument-type]
+
+
+# Faithful per-model hardware defaults. Only fields that differ from the
+# ``LidarConfig`` baseline (tuned for Hesai OT128) are listed; models without
+# an entry keep the baseline field defaults.
+SENSOR_PRESETS: dict[str, dict[str, float | int]] = {
+    # Velodyne HDL-64E S3: 64 beams, 360° spin. Datasheet — vertical FOV
+    # +2.0°/-24.9° (~26.9°), horizontal resolution 0.1728° at 10 Hz
+    # (≈2083 azimuth samples per turn), range up to 120 m, 5-20 Hz spin
+    # (10 Hz nominal), practical near clip ≈0.9 m. Per-beam elevations come
+    # from the built-in "HDL64E" table in ``lidar_renderer``.
+    "HDL64E": {
+        "n_rows": 64,
+        "n_columns": 2083,
+        "fps": 10.0,
+        "min_range_m": 0.9,
+        "max_range_m": 120.0,
+    },
+}
+
+
+def sensor_defaults(sensor_type: str) -> dict[str, float | int]:
+    """Faithful hardware defaults for ``sensor_type`` (empty when unknown)."""
+    return dict(SENSOR_PRESETS.get(sensor_type, {}))
