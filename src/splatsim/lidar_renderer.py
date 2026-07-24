@@ -215,9 +215,28 @@ _XT32_DEG: tuple[float, ...] = (
 )
 
 
+def _linspace_deg(hi_deg: float, lo_deg: float, n: int) -> tuple[float, ...]:
+    """Inclusive top→bottom elevation ramp of ``n`` beams in degrees."""
+    step = (hi_deg - lo_deg) / (n - 1)
+    return tuple(hi_deg - step * i for i in range(n))
+
+
+# Velodyne HDL-64E S3 — 64 beams across two stacked 32-laser blocks,
+# ordered top→bottom. Physical units ship with a per-laser factory
+# calibration (db.xml) that varies unit-to-unit; absent that we use the
+# datasheet nominal two-block design: an upper block from +2.0° to -8.33°
+# (~1/3° spacing) and a lower block from -8.83° to -24.33° (~1/2° spacing),
+# i.e. a +2.0°/-24.33° vertical field of view (~26.9° per the datasheet).
+_HDL64E_DEG: tuple[float, ...] = (
+    *_linspace_deg(2.0, -8.33, 32),
+    *_linspace_deg(-8.83, -24.33, 32),
+)
+
+
 _TABLES_RAD: dict[str, tuple[float, ...]] = {
     "OT128": tuple(math.radians(d) for d in _OT128_DEG),
     "XT32": tuple(math.radians(d) for d in _XT32_DEG),
+    "HDL64E": tuple(math.radians(d) for d in _HDL64E_DEG),
 }
 
 
