@@ -56,6 +56,7 @@ import argparse
 import dataclasses
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -532,23 +533,50 @@ def _build_lidar_renderers(config, args, device, gt_base=None) -> list[_Lidar]:
     return out
 
 
-# ── main pipeline ───────────────────────────────────────────────────────────
+# ── evaluation context ──────────────────────────────────────────────────────
 
 
-def run(args) -> None:
-    T4Devkit, LidarPointCloud = _require_t4()
-    rr = _require_rerun()
+@dataclasses.dataclass
+class _EvalContext:
+    """Run-invariant state shared by every per-frame evaluation.
 
-    device = torch.device(args.device)
-    rng = np.random.default_rng(args.seed)
+    Built once by :func:`_build_context`; consumed by :func:`_eval_frame` and
+    :func:`_log_frame`. ``align`` (map→world) and ``centroid`` are on-device
+    tensors; ``gt_s2b`` (calibrated_sensor→base_link) is a numpy 4x4.
+    """
 
-    # --- scene ---------------------------------------------------------------
+    args: argparse.Namespace
+    device: torch.device
+    rng: np.random.Generator
+    t4: Any
+    LidarPointCloud: Any
+    scene: Scene
+    lidars: list[_Lidar]
+    gt_channel: str
+    gt_s2b: np.ndarray
+    align: torch.Tensor
+    centroid: torch.Tensor
+
+
+def _load_scene(args, device) -> tuple[SceneConfig, Scene]:
+    """Load the splat scene; return its config and the built Scene."""
     print(f"[scene] loading {args.scene}")
     config = SceneConfig.from_source(args.scene)
-    usdz_path = config.background_usdz
     scene = Scene.from_config(config, device=device, progress=print_progress)
     if scene.background is None:
         raise SystemExit("Scene has no background; cannot evaluate LiDAR against it.")
+    return config, scene
+
+
+def _build_context(args, device) -> _EvalContext:
+    """Load scene + dataset, resolve alignment and render sensors into a context."""
+    T4Devkit, LidarPointCloud = _require_t4()
+    rng = np.random.default_rng(args.seed)
+
+    # --- scene ---------------------------------------------------------------
+    config, scene = _load_scene(args, device)
+    usdz_path = config.background_usdz
+    assert scene.background is not None  # guaranteed by _load_scene
     centroid = (
         scene.background.tile_local_centroid.detach().cpu().numpy().astype(np.float64)
     )
@@ -593,6 +621,168 @@ def run(args) -> None:
             f"range=[{ld.renderer.min_range_m}, {ld.renderer.max_range_m}] m"
         )
 
+    return _EvalContext(
+        args=args,
+        device=device,
+        rng=rng,
+        t4=t4,
+        LidarPointCloud=LidarPointCloud,
+        scene=scene,
+        lidars=lidars,
+        gt_channel=gt_channel,
+        gt_s2b=gt_s2b,
+        align=align_t,
+        centroid=centroid_t,
+    )
+
+
+# ── per-frame evaluation ─────────────────────────────────────────────────────
+
+
+@dataclasses.dataclass
+class _FrameResult:
+    """Everything one frame produces: geometry (base_link) + both Chamfer tuples.
+
+    ``raw``/``ranged`` are each ``(symmetric, render→gt, gt→render)`` in metres;
+    ``b2w`` is the base_link→world 4x4 used to place the clouds in the 3D view.
+    """
+
+    seconds: float
+    gt_base: np.ndarray
+    rd_base: np.ndarray
+    cover: np.ndarray
+    b2w: np.ndarray
+    raw: tuple[float, float, float]
+    ranged: tuple[float, float, float]
+
+
+def _eval_frame(ctx: _EvalContext, sample) -> _FrameResult:
+    """Render + score a single GT sample in the common base_link frame."""
+    args = ctx.args
+    sd = ctx.t4.get("sample_data", sample.data[ctx.gt_channel])
+    ego = ctx.t4.get("ego_pose", sd.ego_pose_token)
+    seconds = float(sd.timestamp) * 1e-6
+
+    # ego(base)→map, then map→world(align), then re-center to Gaussians.
+    ego_in_map = torch.from_numpy(
+        _pose_to_matrix(ego.translation, ego.rotation).astype(np.float32)
+    ).to(ctx.device)
+    base_to_world = ctx.align @ ego_in_map
+    base_to_world[:3, 3] = base_to_world[:3, 3] - ctx.centroid
+
+    # GT scan: (4, N) -> (N, 3) in its calibrated_sensor frame -> base_link.
+    gt_path = ctx.t4.get_sample_data_path(sd.token)
+    gt_pc = ctx.LidarPointCloud.from_file(gt_path)
+    gt_xyz = np.ascontiguousarray(gt_pc.points[:3].T, dtype=np.float32)
+    gt_base = _transform(ctx.gt_s2b, gt_xyz)
+
+    # Rendered scan: render every LiDAR at its USDZ mount, map each into
+    # base_link, and union them to mirror the GT LIDAR_CONCAT.
+    rd_parts = []
+    for ld in ctx.lidars:
+        panorama = ld.renderer.render(base_to_world, scene=ctx.scene)
+        rendered = ld.renderer.panorama_to_point_cloud(
+            panorama,
+            drop_threshold=args.drop_threshold,
+            alpha_threshold=args.alpha_threshold,
+        )
+        rd_parts.append(_transform(ld.s2b, rendered["xyz"]))
+    rd_base = (
+        np.concatenate(rd_parts, axis=0) if rd_parts else np.empty((0, 3), np.float32)
+    )
+
+    # Chamfer distance in the common base_link frame. "raw" uses all GT;
+    # "ranged" restricts GT to the sim's range + FOV envelope so the metric
+    # isn't penalised for GT returns the sensor model physically can't make.
+    rd_dev = torch.from_numpy(_subsample(rd_base, args.max_points, ctx.rng)).to(
+        ctx.device
+    )
+    gt_dev = torch.from_numpy(_subsample(gt_base, args.max_points, ctx.rng)).to(
+        ctx.device
+    )
+    raw = chamfer_distance(rd_dev, gt_dev)
+
+    cover = _coverage_mask(gt_base, ctx.lidars)
+    gt_ranged = gt_base[cover]
+    gtr_dev = torch.from_numpy(_subsample(gt_ranged, args.max_points, ctx.rng)).to(
+        ctx.device
+    )
+    ranged = chamfer_distance(rd_dev, gtr_dev)
+
+    return _FrameResult(
+        seconds=seconds,
+        gt_base=gt_base,
+        rd_base=rd_base,
+        cover=cover,
+        b2w=base_to_world.cpu().numpy(),
+        raw=raw,
+        ranged=ranged,
+    )
+
+
+def _log_frame(rr, ctx: _EvalContext, result: _FrameResult, i: int) -> None:
+    """Log one frame's clouds, ego transform, and Chamfer scalars to Rerun."""
+    radius = ctx.args.point_radius
+    b2w, cover = result.b2w, result.cover
+    # Transform both (base_link) clouds into the scene world frame for the
+    # 3D view. The ego/base_link pose drives the sensor transform + track.
+    gt_world = _transform(b2w, result.gt_base)
+    rd_world = _transform(b2w, result.rd_base)
+
+    rr.set_time("frame", sequence=i)
+    rr.set_time("stamp", duration=result.seconds)
+    # GT split by coverage: in-range (green, used by the ranged metric) vs
+    # out-of-range (grey, only counted by the raw metric).
+    rr.log(
+        "world/gt_lidar",
+        rr.Points3D(gt_world[cover], colors=(80, 200, 120), radii=radius),
+    )
+    rr.log(
+        "world/gt_out_of_range",
+        rr.Points3D(gt_world[~cover], colors=(120, 120, 120), radii=radius),
+    )
+    rr.log(
+        "world/rendered_lidar",
+        rr.Points3D(rd_world, colors=(255, 130, 40), radii=radius),
+    )
+    rr.log(
+        "world/ego",
+        rr.Transform3D(translation=b2w[:3, 3], mat3x3=b2w[:3, :3]),
+    )
+    for (path, _, _), value in zip(CHAMFER_SERIES, (*result.raw, *result.ranged)):
+        _log_scalar(rr, path, value)
+
+
+# ── summary ──────────────────────────────────────────────────────────────────
+
+
+def _summarize(raw_syms: list[float], ranged_syms: list[float]) -> None:
+    """Print the final raw + ranged symmetric-Chamfer statistics."""
+
+    def _stats(label: str, values: list[float]) -> None:
+        finite = np.asarray([c for c in values if np.isfinite(c)], dtype=np.float64)
+        if finite.size:
+            print(
+                f"[summary] {label} symmetric Chamfer over {finite.size} frames: "
+                f"mean={finite.mean():.4f} m  median={np.median(finite):.4f} m  "
+                f"min={finite.min():.4f} m  max={finite.max():.4f} m"
+            )
+        else:
+            print(f"[summary] {label}: no finite Chamfer values computed.")
+
+    print()
+    _stats("raw   ", raw_syms)
+    _stats("ranged", ranged_syms)
+
+
+# ── main pipeline ───────────────────────────────────────────────────────────
+
+
+def run(args) -> None:
+    rr = _require_rerun()
+    device = torch.device(args.device)
+    ctx = _build_context(args, device)
+
     # --- rerun recording -----------------------------------------------------
     rr.init("splatsim_lidar_eval", spawn=False)
     output = Path(args.output).expanduser()
@@ -603,6 +793,7 @@ def run(args) -> None:
         rr.log(path, rr.SeriesLines(names=[name], colors=[color]), static=True)
 
     # --- per-frame loop ------------------------------------------------------
+    samples = list(ctx.t4.sample)
     stride = max(1, args.stride)
     selected = samples[::stride]
     if args.max_frames:
@@ -614,96 +805,18 @@ def run(args) -> None:
     print(f"[eval] rendering {len(selected)} frames")
 
     for i, sample in enumerate(selected):
-        sd = t4.get("sample_data", sample.data[gt_channel])
-        ego = t4.get("ego_pose", sd.ego_pose_token)
-        seconds = float(sd.timestamp) * 1e-6
+        result = _eval_frame(ctx, sample)
+        _log_frame(rr, ctx, result, i)
 
-        # ego(base)→map, then map→world(align), then re-center to Gaussians.
-        ego_in_map = torch.from_numpy(
-            _pose_to_matrix(ego.translation, ego.rotation).astype(np.float32)
-        ).to(device)
-        base_to_world = align_t @ ego_in_map
-        base_to_world[:3, 3] = base_to_world[:3, 3] - centroid_t
-
-        # GT scan: (4, N) -> (N, 3) in its calibrated_sensor frame -> base_link.
-        gt_path = t4.get_sample_data_path(sd.token)
-        gt_pc = LidarPointCloud.from_file(gt_path)
-        gt_xyz = np.ascontiguousarray(gt_pc.points[:3].T, dtype=np.float32)
-        gt_base = _transform(gt_s2b, gt_xyz)
-
-        # Rendered scan: render every LiDAR at its USDZ mount, map each into
-        # base_link, and union them to mirror the GT LIDAR_CONCAT.
-        rd_parts = []
-        for ld in lidars:
-            panorama = ld.renderer.render(base_to_world, scene=scene)
-            rendered = ld.renderer.panorama_to_point_cloud(
-                panorama,
-                drop_threshold=args.drop_threshold,
-                alpha_threshold=args.alpha_threshold,
-            )
-            rd_parts.append(_transform(ld.s2b, rendered["xyz"]))
-        rd_base = (
-            np.concatenate(rd_parts, axis=0)
-            if rd_parts
-            else np.empty((0, 3), np.float32)
-        )
-
-        # Chamfer distance in the common base_link frame. "raw" uses all GT;
-        # "ranged" restricts GT to the sim's range + FOV envelope so the metric
-        # isn't penalised for GT returns the sensor model physically can't make.
-        rd_dev = torch.from_numpy(_subsample(rd_base, args.max_points, rng)).to(device)
-        gt_dev = torch.from_numpy(_subsample(gt_base, args.max_points, rng)).to(device)
-        raw = chamfer_distance(rd_dev, gt_dev)
-
-        cover = _coverage_mask(gt_base, lidars)
-        gt_ranged = gt_base[cover]
-        gtr_dev = torch.from_numpy(_subsample(gt_ranged, args.max_points, rng)).to(
-            device
-        )
-        ranged = chamfer_distance(rd_dev, gtr_dev)
-
-        raw_sym_values.append(raw[0])
-        ranged_sym_values.append(ranged[0])
-
-        # Transform both (base_link) clouds into the scene world frame for the
-        # 3D view. The ego/base_link pose drives the sensor transform + track.
-        b2w = base_to_world.cpu().numpy()
-        gt_world = _transform(b2w, gt_base)
-        rd_world = _transform(b2w, rd_base)
-        traj_world.append(b2w[:3, 3].copy())
-
-        rr.set_time("frame", sequence=i)
-        rr.set_time("stamp", duration=seconds)
-        # GT split by coverage: in-range (green, used by the ranged metric) vs
-        # out-of-range (grey, only counted by the raw metric).
-        rr.log(
-            "world/gt_lidar",
-            rr.Points3D(
-                gt_world[cover], colors=(80, 200, 120), radii=args.point_radius
-            ),
-        )
-        rr.log(
-            "world/gt_out_of_range",
-            rr.Points3D(
-                gt_world[~cover], colors=(120, 120, 120), radii=args.point_radius
-            ),
-        )
-        rr.log(
-            "world/rendered_lidar",
-            rr.Points3D(rd_world, colors=(255, 130, 40), radii=args.point_radius),
-        )
-        rr.log(
-            "world/ego",
-            rr.Transform3D(translation=b2w[:3, 3], mat3x3=b2w[:3, :3]),
-        )
-        for (path, _, _), value in zip(CHAMFER_SERIES, (*raw, *ranged)):
-            _log_scalar(rr, path, value)
+        raw_sym_values.append(result.raw[0])
+        ranged_sym_values.append(result.ranged[0])
+        traj_world.append(result.b2w[:3, 3].copy())
 
         print(
-            f"  [{i + 1}/{len(selected)}] t={seconds:.2f}s "
-            f"gt={gt_base.shape[0]:>7d} ({int(cover.sum())} in-range) "
-            f"render={rd_base.shape[0]:>7d} | chamfer raw={raw[0]:.4f}m "
-            f"ranged={ranged[0]:.4f}m"
+            f"  [{i + 1}/{len(selected)}] t={result.seconds:.2f}s "
+            f"gt={result.gt_base.shape[0]:>7d} ({int(result.cover.sum())} in-range) "
+            f"render={result.rd_base.shape[0]:>7d} | chamfer raw={result.raw[0]:.4f}m "
+            f"ranged={result.ranged[0]:.4f}m"
         )
 
     # The full ego path is logged once (static) rather than re-serialising the
@@ -718,20 +831,7 @@ def run(args) -> None:
         )
 
     # --- summary -------------------------------------------------------------
-    def _stats(label: str, values: list[float]) -> None:
-        finite = np.asarray([c for c in values if np.isfinite(c)], dtype=np.float64)
-        if finite.size:
-            print(
-                f"[summary] {label} symmetric Chamfer over {finite.size} frames: "
-                f"mean={finite.mean():.4f} m  median={np.median(finite):.4f} m  "
-                f"min={finite.min():.4f} m  max={finite.max():.4f} m"
-            )
-        else:
-            print(f"[summary] {label}: no finite Chamfer values computed.")
-
-    print()
-    _stats("raw   ", raw_sym_values)
-    _stats("ranged", ranged_sym_values)
+    _summarize(raw_sym_values, ranged_sym_values)
     print(f"[done] wrote Rerun recording to {output}")
 
 
@@ -781,8 +881,20 @@ def build_parser() -> argparse.ArgumentParser:
     sensor.add_argument(
         "--max-range", type=float, default=None, help="Override max range (m)."
     )
-    sensor.add_argument("--drop-threshold", type=float, default=0.5)
-    sensor.add_argument("--alpha-threshold", type=float, default=0.1)
+    sensor.add_argument(
+        "--drop-threshold",
+        type=float,
+        default=0.5,
+        help="Drop a rendered sample when its ray-drop probability exceeds this "
+        "(default: 0.5).",
+    )
+    sensor.add_argument(
+        "--alpha-threshold",
+        type=float,
+        default=0.1,
+        help="Drop a rendered sample when its accumulated alpha is below this "
+        "(default: 0.1).",
+    )
 
     align = p.add_argument_group("alignment (T4 map → splat world)")
     align.add_argument(
