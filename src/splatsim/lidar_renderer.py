@@ -880,6 +880,11 @@ class LidarRenderer:
         Torch device for CUDA rasterization (must match the scene).
     min_range_m / max_range_m:
         Range gating passed through to :func:`render_lidar_panorama`.
+    ignore_lidar_mask:
+        When True, ignore each group's per-Gaussian ``lidar_mask`` and let
+        every Gaussian participate in the LiDAR pass (A/B eval knob). When
+        False (default), Gaussians with ``lidar_mask == False`` are
+        hard-excluded from the LiDAR geometry pass.
     """
 
     def __init__(
@@ -896,6 +901,7 @@ class LidarRenderer:
         elev_fov_cull: bool = True,
         with_ut: bool = True,
         with_eval3d: bool = True,
+        ignore_lidar_mask: bool = False,
     ) -> None:
         self.sensor_spec = sensor_spec
         self.device = torch.device(device)
@@ -908,6 +914,10 @@ class LidarRenderer:
         self.elev_fov_cull = bool(elev_fov_cull)
         self.with_ut = bool(with_ut)
         self.with_eval3d = bool(with_eval3d)
+        # When True, the per-Gaussian ``lidar_mask`` (appearance-only /
+        # far-field exclusion) is ignored and every Gaussian participates in
+        # the LiDAR pass. Useful for A/B evaluation of masked vs unmasked.
+        self.ignore_lidar_mask = bool(ignore_lidar_mask)
         # Precompute the (H,) elevation table once (used by point-cloud conv).
         self._elevs = _sensor_row_elevations(sensor_spec).to(self.device)
         self._azimuths = _sensor_column_azimuths(sensor_spec).to(self.device)
@@ -926,6 +936,19 @@ class LidarRenderer:
     @property
     def n_columns(self) -> int:
         return int(self.sensor_spec.n_columns)
+
+    def _empty_panorama(self) -> dict[str, torch.Tensor]:
+        """Zero-filled panorama output (no LiDAR returns): alpha/distance/intensity
+        are 0 and every ray drops (raydrop_logit = DEFAULT_RAYDROP_LOGIT)."""
+        zero = torch.zeros(
+            (self.n_rows, self.n_columns), dtype=torch.float32, device=self.device
+        )
+        return {
+            "alpha": zero.clone(),
+            "distance": zero.clone(),
+            "intensity": zero.clone(),
+            "raydrop_logit": torch.full_like(zero, DEFAULT_RAYDROP_LOGIT),
+        }
 
     def render(
         self,
@@ -957,32 +980,41 @@ class LidarRenderer:
 
         tensor_list = scene.collect_tensors(cam_pos)
         if not tensor_list:
-            zero = torch.zeros(
-                (self.n_rows, self.n_columns), dtype=torch.float32, device=self.device
-            )
-            return {
-                "alpha": zero.clone(),
-                "distance": zero.clone(),
-                "intensity": zero.clone(),
-                "raydrop_logit": torch.full_like(zero, DEFAULT_RAYDROP_LOGIT),
-            }
+            return self._empty_panorama()
 
         sh_degrees = {t.sh_degree for t in tensor_list}
         if len(sh_degrees) != 1:
             raise ValueError(f"Mixed SH degrees across scene sources: {sh_degrees}")
 
-        means = torch.cat([t.means for t in tensor_list], dim=0).to(self.device)
-        quats = torch.cat([t.quats for t in tensor_list], dim=0).to(self.device)
-        scales = torch.cat([t.scales for t in tensor_list], dim=0).to(self.device)
-        opacities = torch.cat([t.opacities for t in tensor_list], dim=0).to(self.device)
-
+        means_list, quats_list, scales_list, opacities_list = [], [], [], []
         intensity_list, raydrop_list = [], []
         for t in tensor_list:
+            # Hard-exclude appearance-only / far-field Gaussians (lidar_mask == False)
+            # from the LiDAR geometry pass BEFORE resolving attrs, so the sigmoid /
+            # luminance fallback only runs over kept Gaussians. __getitem__ filters
+            # every field (geometry + intensity_raw/raydrop_logit) consistently, so it
+            # also carries any future per-Gaussian field. ``None`` (or the
+            # ``ignore_lidar_mask`` override) keeps every Gaussian.
+            if not self.ignore_lidar_mask and t.lidar_mask is not None:
+                t = t[t.lidar_mask]
             i_sig, r_logit = _resolve_lidar_attrs(t)
+            means_list.append(t.means)
+            quats_list.append(t.quats)
+            scales_list.append(t.scales)
+            opacities_list.append(t.opacities)
             intensity_list.append(i_sig)
             raydrop_list.append(r_logit)
+
+        means = torch.cat(means_list, dim=0).to(self.device)
+        quats = torch.cat(quats_list, dim=0).to(self.device)
+        scales = torch.cat(scales_list, dim=0).to(self.device)
+        opacities = torch.cat(opacities_list, dim=0).to(self.device)
         intensity_sig = torch.cat(intensity_list, dim=0)
         raydrop_logit = torch.cat(raydrop_list, dim=0)
+
+        # Every Gaussian masked out of the LiDAR pass -> zero-output panorama.
+        if means.shape[0] == 0:
+            return self._empty_panorama()
 
         return render_lidar_panorama(
             means=means,

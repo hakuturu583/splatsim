@@ -138,6 +138,17 @@ def load_spz_scene(
                     )
                 tensors.intensity_raw = torch.from_numpy(intensity).to(device)
                 tensors.raydrop_logit = torch.from_numpy(raydrop).to(device)
+                # Optional per-Gaussian LiDAR participation mask (3dgs_io >=
+                # v1.1.0). Absent for old 2-channel sidecars → leave None
+                # (all Gaussians participate). Stored {0.0, 1.0} floats;
+                # threshold to a bool tensor on the render device.
+                mask = attrs.get("lidar_mask")
+                if mask is not None:
+                    if len(mask) != cloud.num_points:
+                        raise ValueError(
+                            f"{usdz_path}: LiDAR sidecar count does not match {name}"
+                        )
+                    tensors.lidar_mask = torch.as_tensor(mask, device=device) > 0.5
             tensor_list.append(tensors)
 
     if not tensor_list:
@@ -510,25 +521,27 @@ def initial_camera_pose_from_rig_trajectories(
     return position, yaw_deg
 
 
+def _cat_optional(tensors: list[GaussianTensors], attr: str) -> torch.Tensor | None:
+    """Concatenate an optional per-Gaussian field across chunks with an
+    all-or-nothing policy: if ANY chunk lacks it, the scene-level value is
+    None (else the field would mis-align against the concatenated Gaussians)."""
+    vals = [getattr(t, attr) for t in tensors]
+    if any(v is None for v in vals):
+        return None
+    return torch.cat(vals, dim=0)
+
+
 def _concat_tensors(tensors: list[GaussianTensors]) -> GaussianTensors:
     sh_degrees = {t.sh_degree for t in tensors}
     if len(sh_degrees) != 1:
         raise ValueError(f"Mixed SH degrees across chunks: {sh_degrees}")
     sh_degree = sh_degrees.pop()
-    # LiDAR attributes concatenate only if every chunk carries them; otherwise
-    # drop to None so the renderer falls back uniformly.
-    if all(t.intensity_raw is not None for t in tensors):
-        intensity_raw = torch.cat(
-            [t.intensity_raw for t in tensors if t.intensity_raw is not None], dim=0
-        )
-    else:
-        intensity_raw = None
-    if all(t.raydrop_logit is not None for t in tensors):
-        raydrop_logit = torch.cat(
-            [t.raydrop_logit for t in tensors if t.raydrop_logit is not None], dim=0
-        )
-    else:
-        raydrop_logit = None
+    # LiDAR attributes (incl. the participation mask) concatenate only if every
+    # chunk carries them; otherwise drop to None so the renderer falls back
+    # uniformly. See _cat_optional for the all-or-nothing rationale.
+    intensity_raw = _cat_optional(tensors, "intensity_raw")
+    raydrop_logit = _cat_optional(tensors, "raydrop_logit")
+    lidar_mask = _cat_optional(tensors, "lidar_mask")
     return GaussianTensors(
         means=torch.cat([t.means for t in tensors], dim=0),
         quats=torch.cat([t.quats for t in tensors], dim=0),
@@ -538,4 +551,5 @@ def _concat_tensors(tensors: list[GaussianTensors]) -> GaussianTensors:
         sh_degree=sh_degree,
         intensity_raw=intensity_raw,
         raydrop_logit=raydrop_logit,
+        lidar_mask=lidar_mask,
     )

@@ -27,6 +27,14 @@ class GaussianTensors:
     # LiDAR renderer falls back to SH-derived intensity and a fixed low raydrop.
     intensity_raw: Tensor | None = None  # [N] unbounded, sigmoid at render
     raydrop_logit: Tensor | None = None  # [N] unbounded logit
+    # Optional per-Gaussian LiDAR participation mask. Emitted by 3dgs_io >=
+    # v1.1.0 as the sidecar's `lidar_mask` channel: True (1) = the Gaussian
+    # participates in LiDAR / near-field geometry, False (0) = appearance-only
+    # / far-field (excluded from the LiDAR geometry pass). ``None`` means the
+    # channel is absent, i.e. all Gaussians participate (backward compatible
+    # with old 2-channel sidecars). Consumed only by the LiDAR renderer; the
+    # RGB/camera path ignores it.
+    lidar_mask: Tensor | None = None  # [N] bool; True = participates in LiDAR
 
     def __getitem__(self, idx: Tensor | slice) -> GaussianTensors:
         """Return a new instance with all tensor fields indexed/sliced by *idx*."""
@@ -43,6 +51,7 @@ class GaussianTensors:
             raydrop_logit=None
             if self.raydrop_logit is None
             else self.raydrop_logit[idx],
+            lidar_mask=None if self.lidar_mask is None else self.lidar_mask[idx],
         )
 
 
@@ -189,4 +198,5 @@ def apply_rigid_transform(
         sh_degree=tensors.sh_degree,
         intensity_raw=tensors.intensity_raw,
         raydrop_logit=tensors.raydrop_logit,
+        lidar_mask=tensors.lidar_mask,
     )
