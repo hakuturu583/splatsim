@@ -760,10 +760,17 @@ _LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)
 def _sensor_row_elevations(spec: LidarSensorSpec) -> torch.Tensor:
     """Return the (H,) descending elevation table used by ``spec``.
 
-    Mirrors the logic in :func:`_build_lidar_coeffs` (known-sensor lookup vs
-    uniform linspace fallback) so consumers can reconstruct per-pixel
-    directions without touching gsplat internals.
+    Mirrors the precedence of :func:`_build_lidar_coeffs` (explicit calibrated
+    table, then known-sensor lookup, then uniform linspace fallback) so
+    reconstruction uses the exact same per-row elevations as beam emission and
+    consumers can reconstruct per-pixel directions without touching gsplat
+    internals.
     """
+    if spec.row_elevations_rad:
+        # Explicit calibrated table (e.g. from a scene USDZ). Consumed exactly
+        # as ``_build_lidar_coeffs`` consumes it: already sorted strictly
+        # descending by the caller (row 0 = top elevation).
+        return torch.tensor(spec.row_elevations_rad, dtype=torch.float32)
     if spec.sensor_type in _TABLES_RAD:
         return torch.tensor(_TABLES_RAD[spec.sensor_type], dtype=torch.float32)
     elevs = torch.linspace(
