@@ -38,11 +38,13 @@ Coordinate frames
   → uncentered-ENU-world; the centroid is then subtracted to reach the frame the
   Gaussians live in.
 
-Because the renderer is given the GT sensor's own extrinsic as its mount, the
-rendered point cloud and the GT point cloud share the sensor frame, so the
-Chamfer distance is computed there directly (no cross-frame resampling). The
-point clouds are additionally transformed into the scene world frame for the
-Rerun 3D view.
+The render sensor's mount (height, orientation, beam table) comes from the scene
+USDZ's own rig LiDAR calibration, not from the T4 ``LIDAR_CONCAT`` extrinsic —
+that concat frame sits at base_link (ground), so rendering there would bury the
+rays in the road. The rendered scan (render-sensor frame) and the GT scan (its
+calibrated_sensor frame) are both mapped into base_link, where the Chamfer
+distance is computed; both are additionally transformed into the scene world
+frame for the Rerun 3D view.
 """
 
 from __future__ import annotations
@@ -56,8 +58,11 @@ import torch
 
 from splatsim._usdz import _rig_in_world, load_rig_trajectories
 from splatsim.dataclass import SceneConfig
-from splatsim.dataclass.lidar_config import LidarConfig
-from splatsim.lidar_renderer import LidarRenderer, LidarSensorSpec, is_known_sensor
+from splatsim.lidar_renderer import (
+    LidarRenderer,
+    LidarSensorSpec,
+    build_lidar_sensors_from_config,
+)
 from splatsim.scene import Scene, print_progress
 
 
@@ -102,6 +107,11 @@ def _pose_to_matrix(translation, rotation) -> np.ndarray:
     m[:3, :3] = np.asarray(rotation.rotation_matrix, dtype=np.float64)
     m[:3, 3] = np.asarray(translation, dtype=np.float64).reshape(3)
     return m
+
+
+def _transform(t: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Apply a 4x4 rigid transform ``t`` to an (N, 3) point array."""
+    return pts @ t[:3, :3].T + t[:3, 3]
 
 
 def umeyama(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, float]:
@@ -310,30 +320,37 @@ def _compute_alignment(args, t4, usdz_path: str | None) -> np.ndarray:
 # ── sensor spec ─────────────────────────────────────────────────────────────
 
 
-def _build_sensor_spec(args, cs_record) -> tuple[LidarSensorSpec, float, float]:
-    """Build a :class:`LidarSensorSpec` mounted at the GT sensor's extrinsic.
+def _select_lidar_spec(config, args) -> tuple[LidarSensorSpec, float, float]:
+    """Pick the render sensor from the scene USDZ's own LiDAR calibration.
 
-    Returns ``(spec, min_range_m, max_range_m)`` — ranges come from the model
-    preset unless overridden on the CLI.
+    The USDZ rig records each LiDAR's sensor-in-rig extrinsic (mount height /
+    orientation) and per-beam elevation table, populated onto
+    ``config.lidar_sensors``. Rendering must use *that* mount — the T4
+    ``LIDAR_CONCAT`` calibrated_sensor sits at base_link (ground), so rendering
+    there would bury the rays in the road. Flows through the production
+    ``build_lidar_sensors_from_config`` path so the eval matches deployment.
+
+    Returns ``(spec, min_range_m, max_range_m)``.
     """
-    s2b = _pose_to_matrix(cs_record.translation, cs_record.rotation)
+    sensors = config.lidar_sensors or []
+    if not sensors:
+        raise SystemExit(
+            "Scene USDZ carries no LiDAR calibration (config.lidar_sensors is "
+            "empty); cannot determine the sensor mount. Use a scene exported "
+            "with rig LiDAR extrinsics."
+        )
+    if args.lidar_name:
+        matches = [c for c in sensors if c.name == args.lidar_name]
+        if not matches:
+            avail = [c.name for c in sensors]
+            raise SystemExit(f"--lidar-name {args.lidar_name!r} not in {avail}")
+        cfg_sensor = matches[0]
+    else:
+        cfg_sensor = sensors[0]
 
-    preset = LidarConfig.for_sensor(args.sensor_type)
-    n_columns = args.n_columns if args.n_columns else preset.n_columns
-    fps = preset.fps
-    min_range = args.min_range if args.min_range is not None else preset.min_range_m
-    max_range = args.max_range if args.max_range is not None else preset.max_range_m
-
-    spec = LidarSensorSpec(
-        name=args.lidar_channel,
-        sensor_type=args.sensor_type if is_known_sensor(args.sensor_type) else "",
-        s2b=s2b,
-        n_columns=int(n_columns),
-        spinning_frequency_hz=float(fps),
-        n_rows_uniform=int(args.n_rows),
-        el_hi_rad=np.radians(args.el_hi_deg),
-        el_lo_rad=np.radians(args.el_lo_deg),
-    )
+    spec = build_lidar_sensors_from_config([cfg_sensor])[0]
+    min_range = args.min_range if args.min_range is not None else cfg_sensor.min_range_m
+    max_range = args.max_range if args.max_range is not None else cfg_sensor.max_range_m
     return spec, float(min_range), float(max_range)
 
 
@@ -371,18 +388,24 @@ def run(args) -> None:
     samples = list(t4.sample)
     if not samples:
         raise SystemExit("Dataset has no samples.")
-    first_channel = _pick_lidar_channel(samples[0], args.lidar_channel)
-    first_sd = t4.get("sample_data", samples[0].data[first_channel])
-    cs_record = t4.get("calibrated_sensor", first_sd.calibrated_sensor_token)
-    spec, min_range, max_range = _build_sensor_spec(args, cs_record)
+    gt_channel = _pick_lidar_channel(samples[0], args.lidar_channel)
+    first_sd = t4.get("sample_data", samples[0].data[gt_channel])
+    gt_cs = t4.get("calibrated_sensor", first_sd.calibrated_sensor_token)
+    # GT scans live in their calibrated_sensor frame; this maps them to base_link
+    # (for LIDAR_CONCAT that frame is base_link itself, i.e. an identity mount).
+    gt_s2b = _pose_to_matrix(gt_cs.translation, gt_cs.rotation).astype(np.float32)
+
+    # Render sensor comes from the scene USDZ's own rig LiDAR calibration (mount
+    # height + beam table), NOT the GT concat frame — see _select_lidar_spec.
+    spec, min_range, max_range = _select_lidar_spec(config, args)
     renderer = LidarRenderer(
         spec, device=device, min_range_m=min_range, max_range_m=max_range
     )
-    s2b_t = torch.from_numpy(spec.s2b.astype(np.float32)).to(device)
+    render_s2b = spec.s2b.astype(np.float32)
     print(
-        f"[sensor] channel={first_channel} type={args.sensor_type or 'uniform'} "
+        f"[sensor] render='{spec.name}' mount={render_s2b[:3, 3].round(3).tolist()} "
         f"rows={renderer.n_rows} cols={renderer.n_columns} "
-        f"range=[{min_range}, {max_range}] m"
+        f"range=[{min_range}, {max_range}] m | GT channel={gt_channel}"
     )
 
     # --- rerun recording -----------------------------------------------------
@@ -405,7 +428,7 @@ def run(args) -> None:
     print(f"[eval] rendering {len(selected)} frames")
 
     for i, sample in enumerate(selected):
-        sd = t4.get("sample_data", sample.data[first_channel])
+        sd = t4.get("sample_data", sample.data[gt_channel])
         ego = t4.get("ego_pose", sd.ego_pose_token)
         seconds = float(sd.timestamp) * 1e-6
 
@@ -416,32 +439,32 @@ def run(args) -> None:
         base_to_world = align_t @ ego_in_map
         base_to_world[:3, 3] = base_to_world[:3, 3] - centroid_t
 
-        # GT scan (sensor frame): (4, N) -> (N, 3).
+        # GT scan: (4, N) -> (N, 3) in its calibrated_sensor frame -> base_link.
         gt_path = t4.get_sample_data_path(sd.token)
         gt_pc = LidarPointCloud.from_file(gt_path)
         gt_xyz = np.ascontiguousarray(gt_pc.points[:3].T, dtype=np.float32)
+        gt_base = _transform(gt_s2b, gt_xyz)
 
-        # Rendered scan (same sensor frame, since s2b == GT extrinsic).
+        # Rendered scan (render-sensor frame) -> base_link, using the USDZ mount.
         panorama = renderer.render(base_to_world, scene=scene)
         rendered = renderer.panorama_to_point_cloud(
             panorama,
             drop_threshold=args.drop_threshold,
             alpha_threshold=args.alpha_threshold,
         )
-        rendered_xyz = rendered["xyz"]
+        rd_base = _transform(render_s2b, rendered["xyz"])
 
-        # Chamfer distance in the shared sensor frame.
-        gt_sub = _subsample(gt_xyz, args.max_points, rng)
-        rd_sub = _subsample(rendered_xyz, args.max_points, rng)
-        gt_dev = torch.from_numpy(gt_sub).to(device)
-        rd_dev = torch.from_numpy(rd_sub).to(device)
+        # Chamfer distance in the common base_link frame.
+        gt_dev = torch.from_numpy(_subsample(gt_base, args.max_points, rng)).to(device)
+        rd_dev = torch.from_numpy(_subsample(rd_base, args.max_points, rng)).to(device)
         cd_sym, cd_r2g, cd_g2r = chamfer_distance(rd_dev, gt_dev)
         cd_values.append(cd_sym)
 
         # Transform both clouds into the scene world frame for the 3D view.
-        sensor_to_world = (base_to_world @ s2b_t).cpu().numpy()
-        gt_world = (gt_xyz @ sensor_to_world[:3, :3].T) + sensor_to_world[:3, 3]
-        rd_world = (rendered_xyz @ sensor_to_world[:3, :3].T) + sensor_to_world[:3, 3]
+        b2w = base_to_world.cpu().numpy()
+        gt_world = _transform(b2w, gt_base)
+        rd_world = _transform(b2w, rd_base)
+        sensor_to_world = b2w @ render_s2b
         traj_world.append(sensor_to_world[:3, 3].copy())
 
         rr.set_time("frame", sequence=i)
@@ -468,7 +491,7 @@ def run(args) -> None:
 
         print(
             f"  [{i + 1}/{len(selected)}] t={seconds:.2f}s "
-            f"gt={gt_xyz.shape[0]:>7d} render={rendered_xyz.shape[0]:>7d} "
+            f"gt={gt_base.shape[0]:>7d} render={rd_base.shape[0]:>7d} "
             f"chamfer={cd_sym:.4f}m (r→g {cd_r2g:.4f} / g→r {cd_g2r:.4f})"
         )
 
@@ -521,29 +544,14 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument(
         "--lidar-channel",
         default="LIDAR_CONCAT",
-        help="LiDAR channel to evaluate (default: LIDAR_CONCAT).",
+        help="GT LiDAR channel to read from the T4 dataset (default: LIDAR_CONCAT).",
     )
 
     sensor = p.add_argument_group("sensor / rendering")
     sensor.add_argument(
-        "--sensor-type",
-        default="OT128",
-        help="Scan pattern for rendering: OT128 / XT32 / HDL64E, or '' for uniform.",
-    )
-    sensor.add_argument(
-        "--n-columns", type=int, default=0, help="Override azimuth bins."
-    )
-    sensor.add_argument(
-        "--n-rows", type=int, default=128, help="Beam count for the uniform fallback."
-    )
-    sensor.add_argument(
-        "--el-hi-deg", type=float, default=15.0, help="Uniform-fallback top elevation."
-    )
-    sensor.add_argument(
-        "--el-lo-deg",
-        type=float,
-        default=-25.0,
-        help="Uniform-fallback bottom elevation.",
+        "--lidar-name",
+        default=None,
+        help="Which USDZ rig LiDAR to render (default: the first one).",
     )
     sensor.add_argument(
         "--min-range", type=float, default=None, help="Override min range (m)."
