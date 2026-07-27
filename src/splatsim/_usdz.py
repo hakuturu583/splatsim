@@ -371,7 +371,7 @@ def iter_world_to_camera_interpolated_uncentered(
         alpha = float(max(0.0, min(1.0, alpha)))
 
         t_rig = (1.0 - alpha) * translations[i] + alpha * translations[i + 1]
-        q = slerp(quaternions[i], quaternions[i + 1], alpha)
+        q = slerp(quaternions[i], quaternions[i + 1], alpha, order="xyzw")
         r_rig = quat_to_matrix(q, order="xyzw")
 
         yield float(t), _compose_w2c(sensor_in_rig, r_rig, t_rig)

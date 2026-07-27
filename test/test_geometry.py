@@ -120,14 +120,25 @@ def test_slerp_takes_shortest_path() -> None:
     np.testing.assert_allclose(np.abs(mid), np.abs(q0), atol=1e-9)
 
 
-def test_slerp_near_identical_uses_lerp_branch() -> None:
-    # Very close inputs exercise the dot > 0.9995 normalized-LERP fallback.
+def test_slerp_near_identical_is_stable() -> None:
+    # Near-coincident inputs must stay unit and interpolate toward q1.
     q0 = np.array([1.0, 0.0, 0.0, 0.0])
     q1 = np.array([1.0, 1e-5, 0.0, 0.0])
     q1 = q1 / np.linalg.norm(q1)
     mid = slerp(q0, q1, 0.5)
     assert np.isclose(np.linalg.norm(mid), 1.0)
     assert mid[1] > 0.0  # interpolated toward q1
+
+
+def test_slerp_xyzw_order_matches_wxyz() -> None:
+    # The same interpolation done in xyzw must equal the wxyz result reordered.
+    rng = np.random.default_rng(4)
+    q0 = _rand_unit_quat(rng)
+    q1 = _rand_unit_quat(rng)
+    t = 0.37
+    wxyz = slerp(q0, q1, t, order="wxyz")
+    xyzw = slerp(q0[[1, 2, 3, 0]], q1[[1, 2, 3, 0]], t, order="xyzw")
+    np.testing.assert_allclose(xyzw, wxyz[[1, 2, 3, 0]], atol=1e-12)
 
 
 def test_slerp_matches_matrix_halfway_rotation() -> None:
