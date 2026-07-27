@@ -53,6 +53,7 @@ frame for the Rerun 3D view.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -392,7 +393,84 @@ class _Lidar:
         self.el_max = el_max
 
 
-def _build_lidar_renderers(config, args, device) -> list[_Lidar]:
+def _spec_el_bounds(spec) -> tuple[float, float]:
+    """(min, max) beam elevation in radians for a spec.
+
+    The explicit per-beam table wins over the uniform-span fallback — the same
+    precedence :mod:`splatsim.lidar_renderer` uses to build the beam pattern.
+    """
+    if spec.row_elevations_rad:
+        return float(min(spec.row_elevations_rad)), float(max(spec.row_elevations_rad))
+    return float(spec.el_lo_rad), float(spec.el_hi_rad)
+
+
+def _estimate_gt_azimuth_columns(
+    gt_base: np.ndarray, s2b: np.ndarray, el_min_rad: float, el_max_rad: float
+) -> int | None:
+    """Estimate a spinning LiDAR's azimuth column count from GT point density.
+
+    GT points (base_link) are expressed in the sensor frame and restricted to its
+    vertical FOV; within thin elevation rings the fundamental azimuth step is the
+    20th-percentile gap between consecutive returns (robust to occlusion gaps and
+    the rare dual return). ``round(360° / step)`` is the samples per revolution.
+    Returns None when the GT is too sparse in this FOV to estimate (e.g. a
+    narrow-FOV auxiliary LiDAR that the concat barely populates).
+    """
+    p = (gt_base - s2b[:3, 3]) @ s2b[:3, :3]  # base -> sensor (R orthonormal)
+    el = np.degrees(np.arctan2(p[:, 2], np.hypot(p[:, 0], p[:, 1])))
+    lo, hi = np.degrees(el_min_rad), np.degrees(el_max_rad)
+    in_fov = (el >= lo) & (el <= hi)
+    el = el[in_fov]  # work on the in-FOV subset only
+    az = np.degrees(np.arctan2(p[in_fov, 1], p[in_fov, 0]))
+    ring_steps: list[float] = []
+    for center in np.linspace(lo + 2.0, hi - 2.0, 40):
+        ring = np.abs(el - center) < 0.04
+        if ring.sum() < 300:
+            continue
+        gaps = np.diff(np.sort(az[ring]))
+        # Exclude dual-return duplicates (~0) and occlusion gaps (>1°); what
+        # remains is the firing interval within the ring.
+        gaps = gaps[(gaps > 0.01) & (gaps < 1.0)]
+        if gaps.size > 50:
+            ring_steps.append(float(np.median(gaps)))
+    if not ring_steps:
+        return None
+    # The true grid step is the finest consistent ring (occlusion only widens
+    # gaps, never narrows them); the 10th percentile is a robust "finest".
+    step = float(np.percentile(ring_steps, 10))
+    return int(round(360.0 / step))
+
+
+def _resolve_n_columns(args, specs, gt_base) -> int | None:
+    """Resolve one azimuth column count applied to every render sensor (or None).
+
+    ``--n-columns``: an integer overrides directly; ``usdz`` keeps each sensor's
+    stored value (``None``); ``auto`` (default) derives one resolution from the
+    GT density. Because ``LIDAR_CONCAT`` carries no per-sensor labels, a single
+    value measured from the densest (highest-beam) LiDAR is applied to all —
+    per-sensor estimates from the merged cloud are unreliable. Logs its choice.
+    """
+    keep_msg = "[n_columns] keeping per-sensor USDZ value"
+    mode = args.n_columns
+    if mode == "usdz":
+        print(f"{keep_msg} (usdz)")
+        return None
+    if mode != "auto":
+        print(f"[n_columns] {int(mode)} (override)")
+        return int(mode)
+    if gt_base is None:
+        print(f"{keep_msg} (no GT)")
+        return None
+    ref = max(specs, key=lambda s: len(s.row_elevations_rad) or s.n_rows_uniform)
+    est = _estimate_gt_azimuth_columns(gt_base, ref.s2b, *_spec_el_bounds(ref))
+    if est is None:
+        print(f"{keep_msg} (GT too sparse)")
+        return None
+    print(f"[n_columns] {est} (gt-density from {ref.name})")
+    return est
+
+
+def _build_lidar_renderers(config, args, device, gt_base=None) -> list[_Lidar]:
     """Build one renderer per USDZ rig LiDAR, to be aggregated at eval time.
 
     The T4 GT is ``LIDAR_CONCAT`` — the point cloud of *all* physical LiDARs
@@ -402,6 +480,10 @@ def _build_lidar_renderers(config, args, device) -> list[_Lidar]:
     calibration (``config.lidar_sensors``, via the production
     ``build_lidar_sensors_from_config`` path); the T4 ``LIDAR_CONCAT``
     calibrated_sensor sits at base_link (ground) and must NOT be used as a mount.
+
+    Azimuth resolution (``n_columns``) is resolved per :func:`_resolve_n_columns`
+    — by default measured from the GT density, since the scene's stored value is
+    typically a library default (e.g. 2048) rather than the real sensor's.
 
     ``--lidar-name`` (comma-separated) restricts to a subset; the default is all.
 
@@ -424,8 +506,14 @@ def _build_lidar_renderers(config, args, device) -> list[_Lidar]:
             )
 
     specs = build_lidar_sensors_from_config(sensors)
+    n_columns = _resolve_n_columns(args, specs, gt_base)
+
     out: list[_Lidar] = []
     for cfg_sensor, spec in zip(sensors, specs):
+        el_min, el_max = _spec_el_bounds(spec)
+        if n_columns is not None:
+            spec = dataclasses.replace(spec, n_columns=n_columns)
+
         min_range = (
             args.min_range if args.min_range is not None else cfg_sensor.min_range_m
         )
@@ -438,12 +526,6 @@ def _build_lidar_renderers(config, args, device) -> list[_Lidar]:
             min_range_m=float(min_range),
             max_range_m=float(max_range),
         )
-        # Vertical FOV bounds: explicit beam table if present, else uniform span.
-        if spec.row_elevations_rad:
-            el_min = float(min(spec.row_elevations_rad))
-            el_max = float(max(spec.row_elevations_rad))
-        else:
-            el_min, el_max = float(spec.el_lo_rad), float(spec.el_hi_rad)
         out.append(
             _Lidar(spec.name, renderer, spec.s2b.astype(np.float32), el_min, el_max)
         )
@@ -490,11 +572,19 @@ def run(args) -> None:
     # GT scans live in their calibrated_sensor frame; this maps them to base_link
     # (for LIDAR_CONCAT that frame is base_link itself, i.e. an identity mount).
     gt_s2b = _pose_to_matrix(gt_cs.translation, gt_cs.rotation).astype(np.float32)
+    # First GT scan (in base_link) — only needed to derive azimuth resolution,
+    # so skip the extra file read unless --n-columns auto will use it.
+    gt0_base = None
+    if args.n_columns == "auto":
+        gt0 = LidarPointCloud.from_file(t4.get_sample_data_path(first_sd.token))
+        gt0_base = _transform(
+            gt_s2b, np.ascontiguousarray(gt0.points[:3].T, np.float32)
+        )
 
     # Render sensors come from the scene USDZ's own rig LiDAR calibration (mount
     # height + beam table), NOT the GT concat frame. All are rendered and unioned
     # to match the GT LIDAR_CONCAT — see _build_lidar_renderers.
-    lidars = _build_lidar_renderers(config, args, device)
+    lidars = _build_lidar_renderers(config, args, device, gt_base=gt0_base)
     print(f"[sensor] {len(lidars)} render LiDAR(s), GT channel={gt_channel}")
     for ld in lidars:
         print(
@@ -678,6 +768,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated USDZ rig LiDAR names to render (default: all, "
         "unioned to match the GT LIDAR_CONCAT).",
+    )
+    sensor.add_argument(
+        "--n-columns",
+        default="auto",
+        help="Azimuth columns per render LiDAR: 'auto' (derive from GT density, "
+        "default), an integer, or 'usdz' (keep the scene's stored value).",
     )
     sensor.add_argument(
         "--min-range", type=float, default=None, help="Override min range (m)."
