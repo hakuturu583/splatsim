@@ -13,6 +13,19 @@ model physically cannot make. Everything — the two point clouds and both Chamf
 series — is logged to a `Rerun` recording (``.rrd``) so the geometry and the
 metrics can be inspected together on a shared timeline.
 
+Two corrections keep the comparison fair against a *static* reconstruction:
+
+* **Rolling shutter.** A spinning LiDAR paints its panorama over a finite sweep
+  (~100 ms) while the ego is moving, so the scan is not a single-instant
+  snapshot. The render mirrors this: the sweep-end ego pose is reconstructed by
+  interpolating the T4 ``ego_pose`` trajectory ``--sweep-period-s`` after the
+  frame's timestamp, and both start/end poses drive the renderer's
+  motion-during-sweep path (``--no-rolling-shutter`` to disable).
+* **Dynamic-object masking.** The GT LiDAR sees moving vehicles/pedestrians that
+  a static scene cannot reproduce. Before scoring, GT and rendered points that
+  fall inside the frame's annotated 3D boxes are dropped so the Chamfer distance
+  reflects static geometry only (``--no-mask-dynamic`` to disable).
+
 Both heavy dependencies (``t4-devkit`` for the dataset, ``rerun-sdk`` for the
 recording) are **optional** and live behind the ``eval`` extra::
 
@@ -61,7 +74,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from splatsim._usdz import _rig_in_world, load_rig_trajectories
+from splatsim._usdz import _mat4, _rig_in_world, load_rig_trajectories
 from splatsim.dataclass import SceneConfig
 from splatsim.lidar_renderer import (
     LidarRenderer,
@@ -116,6 +129,60 @@ def _pose_to_matrix(translation, rotation) -> np.ndarray:
 def _transform(t: np.ndarray, pts: np.ndarray) -> np.ndarray:
     """Apply a 4x4 rigid transform ``t`` to an (N, 3) point array."""
     return pts @ t[:3, :3].T + t[:3, 3]
+
+
+def _interp_ego_map(
+    ts_us: np.ndarray, trans: np.ndarray, quats: list, t_us: float
+) -> np.ndarray:
+    """Interpolated ego(base)→map 4x4 pose at unix-microsecond time ``t_us``.
+
+    Translation is linearly interpolated; rotation is SLERP'd (via the same
+    ``pyquaternion.Quaternion`` the T4 records already carry) between the two
+    bracketing ``ego_pose`` records. Queries outside the recorded span clamp to
+    the nearest endpoint. Used to reconstruct the sweep-end pose that drives the
+    rolling-shutter render.
+    """
+    if t_us <= ts_us[0]:
+        i0 = i1 = 0
+        a = 0.0
+    elif t_us >= ts_us[-1]:
+        i0 = i1 = ts_us.shape[0] - 1
+        a = 0.0
+    else:
+        i1 = int(np.searchsorted(ts_us, t_us))
+        i0 = i1 - 1
+        a = float((t_us - ts_us[i0]) / (ts_us[i1] - ts_us[i0]))
+    pos = trans[i0] * (1.0 - a) + trans[i1] * a
+    q0 = quats[i0]
+    quat = q0 if i0 == i1 else type(q0).slerp(q0, quats[i1], a)
+    return _mat4(np.asarray(quat.rotation_matrix, dtype=np.float64), pos)
+
+
+def _dynamic_box_mask(pts_map: np.ndarray, boxes: list, margin: float) -> np.ndarray:
+    """Boolean mask of ``pts_map`` (T4 map frame) lying inside any annotated box.
+
+    T4 ``sample_annotation`` boxes are the dataset's movable/dynamic objects
+    (vehicles, pedestrians, …). The splat scene is a *static* reconstruction, so
+    GT returns off those objects — and any Gaussians the scene may have frozen in
+    their place — corrupt the Chamfer distance. Masking both clouds by these
+    boxes isolates static-reconstruction quality from dynamic content.
+
+    Each box carries a map-frame ``position``/``rotation`` and a
+    ``shape.size = (width, length, height)`` (extents along local y/x/z). A point
+    is inside when, expressed in the box's local frame, it falls within the
+    half-extents (optionally grown by ``margin`` metres on every side).
+    """
+    inside = np.zeros(pts_map.shape[0], dtype=bool)
+    if pts_map.shape[0] == 0 or not boxes:
+        return inside
+    for box in boxes:
+        center = np.asarray(box.position, dtype=np.float64)
+        rot = np.asarray(box.rotation.rotation_matrix, dtype=np.float64)  # local→map
+        width, length, height = (float(v) for v in box.shape.size)
+        half = np.array([length, width, height], dtype=np.float64) / 2.0 + margin
+        local = (pts_map - center) @ rot  # R^T (p - c): map → box-local
+        inside |= np.all(np.abs(local) <= half, axis=1)
+    return inside
 
 
 def umeyama(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, float]:
@@ -280,6 +347,21 @@ def _t4_ego_trajectory(t4) -> tuple[np.ndarray, np.ndarray]:
     xyz = np.asarray([np.asarray(p.translation, dtype=np.float64) for p in poses])
     ts = np.asarray([float(p.timestamp) for p in poses], dtype=np.float64)
     return xyz, ts
+
+
+def _ego_pose_table(t4) -> tuple[np.ndarray, np.ndarray, list]:
+    """(timestamps_us, translations, rotations) of every ego_pose, time-sorted.
+
+    ``rotations`` are the records' own ``pyquaternion.Quaternion`` objects, fed
+    as-is to :func:`_interp_ego_map` for the rolling-shutter sweep-end pose.
+    """
+    poses = sorted(t4.ego_pose, key=lambda p: p.timestamp)
+    ts = np.asarray([float(p.timestamp) for p in poses], dtype=np.float64)
+    trans = np.asarray(
+        [np.asarray(p.translation, dtype=np.float64) for p in poses], dtype=np.float64
+    )
+    quats = [p.rotation for p in poses]
+    return ts, trans, quats
 
 
 def _usdz_rig_trajectory(usdz_path: str) -> tuple[np.ndarray, np.ndarray]:
@@ -556,6 +638,14 @@ class _EvalContext:
     gt_s2b: np.ndarray
     align: torch.Tensor
     centroid: torch.Tensor
+    # map(T4)→world(Gaussian) 4x4 (numpy): align with the centroid folded into
+    # the translation. Places map-frame annotation boxes into the 3D view.
+    map_to_world: np.ndarray
+    # ego(base)→map trajectory for rolling-shutter sweep-end interpolation.
+    # ``ego_quat`` holds the records' pyquaternion.Quaternion rotations.
+    ego_ts_us: np.ndarray
+    ego_trans: np.ndarray
+    ego_quat: list
 
 
 def _load_scene(args, device) -> tuple[SceneConfig, Scene]:
@@ -589,6 +679,11 @@ def _build_context(args, device) -> _EvalContext:
     align = _compute_alignment(args, t4, usdz_path)
     align_t = torch.from_numpy(align.astype(np.float32)).to(device)
     centroid_t = torch.from_numpy(centroid.astype(np.float32)).to(device)
+    # map→world = align, then re-center to the Gaussians (subtract the centroid
+    # from the translation). Constant across frames.
+    map_to_world = align.copy()
+    map_to_world[:3, 3] = map_to_world[:3, 3] - centroid
+    ego_ts_us, ego_trans, ego_quat = _ego_pose_table(t4)
 
     # --- sensor + renderer ---------------------------------------------------
     samples = list(t4.sample)
@@ -633,6 +728,10 @@ def _build_context(args, device) -> _EvalContext:
         gt_s2b=gt_s2b,
         align=align_t,
         centroid=centroid_t,
+        map_to_world=map_to_world,
+        ego_ts_us=ego_ts_us,
+        ego_trans=ego_trans,
+        ego_quat=ego_quat,
     )
 
 
@@ -645,15 +744,48 @@ class _FrameResult:
 
     ``raw``/``ranged`` are each ``(symmetric, render→gt, gt→render)`` in metres;
     ``b2w`` is the base_link→world 4x4 used to place the clouds in the 3D view.
+    ``cover`` / ``dyn_gt`` are boolean masks over ``gt_base`` (in the sim's range
+    + FOV envelope; inside a dynamic-object box) and ``dyn_rd`` over ``rd_base``;
+    all three are kept so the 3D view can colour points by category even though
+    the Chamfer metrics score only the static, in-envelope subset. ``boxes`` is
+    ``(centers, half_sizes, quats_xyzw)`` in the world frame for the box overlay.
     """
 
     seconds: float
     gt_base: np.ndarray
     rd_base: np.ndarray
     cover: np.ndarray
+    dyn_gt: np.ndarray
+    dyn_rd: np.ndarray
+    boxes: tuple[np.ndarray, np.ndarray, np.ndarray]
     b2w: np.ndarray
     raw: tuple[float, float, float]
     ranged: tuple[float, float, float]
+
+
+def _world_boxes(
+    ctx: _EvalContext, boxes: list
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(centers, half_sizes, quats_xyzw) of map-frame boxes in the world frame."""
+    if not boxes:
+        z3 = np.empty((0, 3), dtype=np.float32)
+        return z3, z3, np.empty((0, 4), dtype=np.float32)
+    r_mw = ctx.map_to_world[:3, :3]
+    centers, halfs, quats = [], [], []
+    for box in boxes:
+        centers.append(_transform(ctx.map_to_world, np.asarray(box.position)[None])[0])
+        width, length, height = (float(v) for v in box.shape.size)
+        halfs.append([length / 2.0, width / 2.0, height / 2.0])
+        # Compose the box orientation into the world frame, then reorder
+        # pyquaternion's (w, x, y, z) to the (x, y, z, w) Rerun expects.
+        rot = type(box.rotation)(matrix=r_mw @ np.asarray(box.rotation.rotation_matrix))
+        w, x, y, z = rot.elements
+        quats.append([x, y, z, w])
+    return (
+        np.asarray(centers, dtype=np.float32),
+        np.asarray(halfs, dtype=np.float32),
+        np.asarray(quats, dtype=np.float32),
+    )
 
 
 def _eval_frame(ctx: _EvalContext, sample) -> _FrameResult:
@@ -664,11 +796,26 @@ def _eval_frame(ctx: _EvalContext, sample) -> _FrameResult:
     seconds = float(sd.timestamp) * 1e-6
 
     # ego(base)→map, then map→world(align), then re-center to Gaussians.
-    ego_in_map = torch.from_numpy(
-        _pose_to_matrix(ego.translation, ego.rotation).astype(np.float32)
-    ).to(ctx.device)
-    base_to_world = ctx.align @ ego_in_map
+    ego_in_map = _pose_to_matrix(ego.translation, ego.rotation)
+    base_to_world = torch.from_numpy(ego_in_map.astype(np.float32)).to(ctx.device)
+    base_to_world = ctx.align @ base_to_world
     base_to_world[:3, 3] = base_to_world[:3, 3] - ctx.centroid
+
+    # Rolling shutter: the spinning sweep finishes ~sweep_period after the frame
+    # timestamp while the ego keeps moving. Reconstruct that sweep-end base pose
+    # by interpolating the ego trajectory and feed both ends to the renderer.
+    base_to_world_end = None
+    if args.rolling_shutter:
+        ego_end_map = _interp_ego_map(
+            ctx.ego_ts_us,
+            ctx.ego_trans,
+            ctx.ego_quat,
+            float(sd.timestamp) + args.sweep_period_s * 1e6,
+        )
+        b2w_end = torch.from_numpy(ego_end_map.astype(np.float32)).to(ctx.device)
+        b2w_end = ctx.align @ b2w_end
+        b2w_end[:3, 3] = b2w_end[:3, 3] - ctx.centroid
+        base_to_world_end = b2w_end
 
     # GT scan: (4, N) -> (N, 3) in its calibrated_sensor frame -> base_link.
     gt_path = ctx.t4.get_sample_data_path(sd.token)
@@ -676,11 +823,14 @@ def _eval_frame(ctx: _EvalContext, sample) -> _FrameResult:
     gt_xyz = np.ascontiguousarray(gt_pc.points[:3].T, dtype=np.float32)
     gt_base = _transform(ctx.gt_s2b, gt_xyz)
 
-    # Rendered scan: render every LiDAR at its USDZ mount, map each into
-    # base_link, and union them to mirror the GT LIDAR_CONCAT.
+    # Rendered scan: render every LiDAR at its USDZ mount (with the sweep-end
+    # pose when rolling shutter is on), map each into base_link, and union them
+    # to mirror the GT LIDAR_CONCAT.
     rd_parts = []
     for ld in ctx.lidars:
-        panorama = ld.renderer.render(base_to_world, scene=ctx.scene)
+        panorama = ld.renderer.render(
+            base_to_world, scene=ctx.scene, base_to_world_end=base_to_world_end
+        )
         rendered = ld.renderer.panorama_to_point_cloud(
             panorama,
             drop_threshold=args.drop_threshold,
@@ -691,19 +841,35 @@ def _eval_frame(ctx: _EvalContext, sample) -> _FrameResult:
         np.concatenate(rd_parts, axis=0) if rd_parts else np.empty((0, 3), np.float32)
     )
 
-    # Chamfer distance in the common base_link frame. "raw" uses all GT;
-    # "ranged" restricts GT to the sim's range + FOV envelope so the metric
-    # isn't penalised for GT returns the sensor model physically can't make.
-    rd_dev = torch.from_numpy(_subsample(rd_base, args.max_points, ctx.rng)).to(
+    # Dynamic-object masking: drop GT and rendered points inside the frame's
+    # annotated 3D boxes (a static scene cannot reproduce moving objects). Boxes
+    # come back in the T4 map frame, so test the clouds there.
+    boxes = ctx.t4.get_box3ds(sd.token) if args.mask_dynamic else []
+    if boxes:
+        dyn_gt = _dynamic_box_mask(
+            _transform(ego_in_map, gt_base), boxes, args.dynamic_margin
+        )
+        dyn_rd = _dynamic_box_mask(
+            _transform(ego_in_map, rd_base), boxes, args.dynamic_margin
+        )
+    else:
+        dyn_gt = np.zeros(gt_base.shape[0], dtype=bool)
+        dyn_rd = np.zeros(rd_base.shape[0], dtype=bool)
+
+    # Chamfer in base_link over the *static* subset. "raw" uses all static GT;
+    # "ranged" further restricts GT to the sim's range + FOV envelope so the
+    # metric isn't penalised for GT returns the sensor model physically can't make.
+    rd_static = rd_base[~dyn_rd]
+    rd_dev = torch.from_numpy(_subsample(rd_static, args.max_points, ctx.rng)).to(
         ctx.device
     )
-    gt_dev = torch.from_numpy(_subsample(gt_base, args.max_points, ctx.rng)).to(
-        ctx.device
-    )
+    gt_dev = torch.from_numpy(
+        _subsample(gt_base[~dyn_gt], args.max_points, ctx.rng)
+    ).to(ctx.device)
     raw = chamfer_distance(rd_dev, gt_dev)
 
     cover = _coverage_mask(gt_base, ctx.lidars)
-    gt_ranged = gt_base[cover]
+    gt_ranged = gt_base[cover & ~dyn_gt]
     gtr_dev = torch.from_numpy(_subsample(gt_ranged, args.max_points, ctx.rng)).to(
         ctx.device
     )
@@ -714,6 +880,9 @@ def _eval_frame(ctx: _EvalContext, sample) -> _FrameResult:
         gt_base=gt_base,
         rd_base=rd_base,
         cover=cover,
+        dyn_gt=dyn_gt,
+        dyn_rd=dyn_rd,
+        boxes=_world_boxes(ctx, boxes),
         b2w=base_to_world.cpu().numpy(),
         raw=raw,
         ranged=ranged,
@@ -723,7 +892,7 @@ def _eval_frame(ctx: _EvalContext, sample) -> _FrameResult:
 def _log_frame(rr, ctx: _EvalContext, result: _FrameResult, i: int) -> None:
     """Log one frame's clouds, ego transform, and Chamfer scalars to Rerun."""
     radius = ctx.args.point_radius
-    b2w, cover = result.b2w, result.cover
+    b2w, cover, dyn_gt, dyn_rd = result.b2w, result.cover, result.dyn_gt, result.dyn_rd
     # Transform both (base_link) clouds into the scene world frame for the
     # 3D view. The ego/base_link pose drives the sensor transform + track.
     gt_world = _transform(b2w, result.gt_base)
@@ -731,19 +900,41 @@ def _log_frame(rr, ctx: _EvalContext, result: _FrameResult, i: int) -> None:
 
     rr.set_time("frame", sequence=i)
     rr.set_time("stamp", duration=result.seconds)
-    # GT split by coverage: in-range (green, used by the ranged metric) vs
+    # GT split into three categories: dynamic (red, masked out of the metric),
+    # static in-range (green, used by the ranged metric), and static
     # out-of-range (grey, only counted by the raw metric).
+    static_gt = ~dyn_gt
+    rr.log(
+        "world/gt_dynamic",
+        rr.Points3D(gt_world[dyn_gt], colors=(230, 60, 60), radii=radius),
+    )
     rr.log(
         "world/gt_lidar",
-        rr.Points3D(gt_world[cover], colors=(80, 200, 120), radii=radius),
+        rr.Points3D(gt_world[cover & static_gt], colors=(80, 200, 120), radii=radius),
     )
     rr.log(
         "world/gt_out_of_range",
-        rr.Points3D(gt_world[~cover], colors=(120, 120, 120), radii=radius),
+        rr.Points3D(gt_world[~cover & static_gt], colors=(120, 120, 120), radii=radius),
     )
+    # Rendered: static (orange, scored) vs points that fell in a dynamic box
+    # (dark red, masked out — e.g. Gaussians frozen where an object once was).
     rr.log(
         "world/rendered_lidar",
-        rr.Points3D(rd_world, colors=(255, 130, 40), radii=radius),
+        rr.Points3D(rd_world[~dyn_rd], colors=(255, 130, 40), radii=radius),
+    )
+    rr.log(
+        "world/rendered_dynamic",
+        rr.Points3D(rd_world[dyn_rd], colors=(150, 40, 40), radii=radius),
+    )
+    centers, half_sizes, quats = result.boxes
+    rr.log(
+        "world/dynamic_boxes",
+        rr.Boxes3D(
+            centers=centers,
+            half_sizes=half_sizes,
+            quaternions=[rr.Quaternion(xyzw=q) for q in quats],
+            colors=(230, 60, 60),
+        ),
     )
     rr.log(
         "world/ego",
@@ -814,9 +1005,11 @@ def run(args) -> None:
 
         print(
             f"  [{i + 1}/{len(selected)}] t={result.seconds:.2f}s "
-            f"gt={result.gt_base.shape[0]:>7d} ({int(result.cover.sum())} in-range) "
-            f"render={result.rd_base.shape[0]:>7d} | chamfer raw={result.raw[0]:.4f}m "
-            f"ranged={result.ranged[0]:.4f}m"
+            f"gt={result.gt_base.shape[0]:>7d} "
+            f"({int((result.cover & ~result.dyn_gt).sum())} in-range, "
+            f"{int(result.dyn_gt.sum())} dynamic) "
+            f"render={result.rd_base.shape[0]:>7d} ({int(result.dyn_rd.sum())} dynamic) "
+            f"| chamfer raw={result.raw[0]:.4f}m ranged={result.ranged[0]:.4f}m"
         )
 
     # The full ego path is logged once (static) rather than re-serialising the
@@ -882,6 +1075,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-range", type=float, default=None, help="Override max range (m)."
     )
     sensor.add_argument(
+        "--rolling-shutter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Model motion-during-sweep: render with the interpolated sweep-end "
+        "ego pose (default: on; --no-rolling-shutter for a single-instant scan).",
+    )
+    sensor.add_argument(
+        "--sweep-period-s",
+        type=float,
+        default=0.1,
+        help="LiDAR sweep duration in seconds, i.e. the start→end time span used "
+        "for rolling shutter (default: 0.1 = a 10 Hz spinning LiDAR).",
+    )
+    sensor.add_argument(
         "--drop-threshold",
         type=float,
         default=0.5,
@@ -920,6 +1127,21 @@ def build_parser() -> argparse.ArgumentParser:
     ev = p.add_argument_group("evaluation / output")
     ev.add_argument(
         "--output", default="outputs/eval_lidar.rrd", help="Output .rrd path."
+    )
+    ev.add_argument(
+        "--mask-dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop GT and rendered points inside the frame's annotated 3D boxes "
+        "before scoring, so the static reconstruction isn't penalised for moving "
+        "objects (default: on; --no-mask-dynamic to score raw clouds).",
+    )
+    ev.add_argument(
+        "--dynamic-margin",
+        type=float,
+        default=0.25,
+        help="Grow each dynamic box by this many metres per side when masking, to "
+        "catch returns just outside the annotated extent (default: 0.25).",
     )
     ev.add_argument("--stride", type=int, default=1, help="Use every Nth sample.")
     ev.add_argument(
