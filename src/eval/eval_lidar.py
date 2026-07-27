@@ -5,10 +5,13 @@ The splatsim scene (a reconstructed 3DGS ``.usdz``) carries **no** ground-truth
 LiDAR. This script pulls the ground truth from the matching WebAuto / T4 dataset
 instead: it walks the dataset's GT ego trajectory, renders a LiDAR panorama from
 the splat scene at every GT pose, and compares each rendered scan to the recorded
-GT LiDAR scan with a symmetric Chamfer distance. Everything — the two point
-clouds and the per-frame Chamfer distance — is logged to a `Rerun` recording
-(``.rrd``) so the geometry and the metric can be inspected together on a shared
-timeline.
+GT LiDAR scan with a symmetric Chamfer distance. Two variants are computed per
+frame: a **raw** Chamfer over all GT points, and a **range-aware** ("ranged")
+Chamfer that first drops GT points outside the sim's range + FOV envelope (see
+:func:`_coverage_mask`), so the metric isn't penalised for returns the sensor
+model physically cannot make. Everything — the two point clouds and both Chamfer
+series — is logged to a `Rerun` recording (``.rrd``) so the geometry and the
+metrics can be inspected together on a shared timeline.
 
 Both heavy dependencies (``t4-devkit`` for the dataset, ``rerun-sdk`` for the
 recording) are **optional** and live behind the ``eval`` extra::
@@ -155,6 +158,33 @@ def _subsample(
     return xyz[idx]
 
 
+def _coverage_mask(gt_base: np.ndarray, lidars: list["_Lidar"]) -> np.ndarray:
+    """Boolean mask of GT points the LiDAR simulation could actually return.
+
+    A GT point (in base_link) is *coverable* if, expressed in some render
+    sensor's frame, it lies within that sensor's range shell ``[min, max]`` and
+    its vertical FOV ``[el_min, el_max]`` (azimuth is a full 360° spin, so it
+    imposes no constraint). Points outside every sensor's envelope — e.g. beyond
+    the sim's ``max_range`` or above/below the beam fan — can never be rendered,
+    so excluding them isolates reconstruction quality from sensor-model limits.
+    """
+    if gt_base.shape[0] == 0:
+        return np.zeros((0,), dtype=bool)
+    mask = np.zeros(gt_base.shape[0], dtype=bool)
+    for ld in lidars:
+        # p_sensor = R^T (p - t), with s2b = [R | t] (sensor -> base).
+        p = (gt_base - ld.s2b[:3, 3]) @ ld.s2b[:3, :3]
+        rng = np.linalg.norm(p, axis=1)
+        el = np.arctan2(p[:, 2], np.hypot(p[:, 0], p[:, 1]))
+        mask |= (
+            (rng >= ld.min_range)
+            & (rng <= ld.max_range)
+            & (el >= ld.el_min)
+            & (el <= ld.el_max)
+        )
+    return mask
+
+
 def chamfer_distance(
     a: torch.Tensor, b: torch.Tensor, *, chunk: int = 4096
 ) -> tuple[float, float, float]:
@@ -191,10 +221,16 @@ def chamfer_distance(
 # ── rerun logging ───────────────────────────────────────────────────────────
 
 # Chamfer time-series to log: (rerun entity path, legend label, RGB colour).
+# Two variants: "raw" over all GT points, and "ranged" over only the GT points
+# the LiDAR sim could actually return (range + FOV envelope; see _coverage_mask).
+# The per-frame value order in the loop must match this tuple order.
 CHAMFER_SERIES: tuple[tuple[str, str, tuple[int, int, int]], ...] = (
-    ("metrics/chamfer/symmetric", "symmetric", (255, 200, 40)),
-    ("metrics/chamfer/render_to_gt", "render→gt", (255, 130, 40)),
-    ("metrics/chamfer/gt_to_render", "gt→render", (80, 200, 120)),
+    ("metrics/chamfer/raw/symmetric", "raw symmetric", (255, 200, 40)),
+    ("metrics/chamfer/raw/render_to_gt", "raw render→gt", (255, 130, 40)),
+    ("metrics/chamfer/raw/gt_to_render", "raw gt→render", (80, 200, 120)),
+    ("metrics/chamfer/ranged/symmetric", "ranged symmetric", (180, 120, 255)),
+    ("metrics/chamfer/ranged/render_to_gt", "ranged render→gt", (120, 160, 255)),
+    ("metrics/chamfer/ranged/gt_to_render", "ranged gt→render", (40, 190, 190)),
 )
 
 
@@ -320,14 +356,40 @@ def _compute_alignment(args, t4, usdz_path: str | None) -> np.ndarray:
 
 
 class _Lidar:
-    """A render sensor: its :class:`LidarRenderer` plus sensor→base 4x4 mount."""
+    """A render sensor: its renderer, sensor→base mount, and coverage envelope.
 
-    __slots__ = ("name", "renderer", "s2b")
+    ``min_range``/``max_range`` and ``el_min``/``el_max`` (radians) describe the
+    range shell + vertical FOV the sim can return, used by :func:`_coverage_mask`
+    to build the range-aware Chamfer metric.
+    """
 
-    def __init__(self, name: str, renderer: LidarRenderer, s2b: np.ndarray) -> None:
+    __slots__ = (
+        "name",
+        "renderer",
+        "s2b",
+        "min_range",
+        "max_range",
+        "el_min",
+        "el_max",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        renderer: LidarRenderer,
+        s2b: np.ndarray,
+        el_min: float,
+        el_max: float,
+    ) -> None:
         self.name = name
         self.renderer = renderer
         self.s2b = s2b
+        self.min_range = renderer.min_range_m
+        self.max_range = (
+            renderer.max_range_m if renderer.max_range_m is not None else float("inf")
+        )
+        self.el_min = el_min
+        self.el_max = el_max
 
 
 def _build_lidar_renderers(config, args, device) -> list[_Lidar]:
@@ -376,7 +438,15 @@ def _build_lidar_renderers(config, args, device) -> list[_Lidar]:
             min_range_m=float(min_range),
             max_range_m=float(max_range),
         )
-        out.append(_Lidar(spec.name, renderer, spec.s2b.astype(np.float32)))
+        # Vertical FOV bounds: explicit beam table if present, else uniform span.
+        if spec.row_elevations_rad:
+            el_min = float(min(spec.row_elevations_rad))
+            el_max = float(max(spec.row_elevations_rad))
+        else:
+            el_min, el_max = float(spec.el_lo_rad), float(spec.el_hi_rad)
+        out.append(
+            _Lidar(spec.name, renderer, spec.s2b.astype(np.float32), el_min, el_max)
+        )
     return out
 
 
@@ -449,7 +519,8 @@ def run(args) -> None:
         selected = selected[: args.max_frames]
 
     traj_world: list[np.ndarray] = []
-    cd_values: list[float] = []
+    raw_sym_values: list[float] = []
+    ranged_sym_values: list[float] = []
     print(f"[eval] rendering {len(selected)} frames")
 
     for i, sample in enumerate(selected):
@@ -487,11 +558,22 @@ def run(args) -> None:
             else np.empty((0, 3), np.float32)
         )
 
-        # Chamfer distance in the common base_link frame.
-        gt_dev = torch.from_numpy(_subsample(gt_base, args.max_points, rng)).to(device)
+        # Chamfer distance in the common base_link frame. "raw" uses all GT;
+        # "ranged" restricts GT to the sim's range + FOV envelope so the metric
+        # isn't penalised for GT returns the sensor model physically can't make.
         rd_dev = torch.from_numpy(_subsample(rd_base, args.max_points, rng)).to(device)
-        cd_sym, cd_r2g, cd_g2r = chamfer_distance(rd_dev, gt_dev)
-        cd_values.append(cd_sym)
+        gt_dev = torch.from_numpy(_subsample(gt_base, args.max_points, rng)).to(device)
+        raw = chamfer_distance(rd_dev, gt_dev)
+
+        cover = _coverage_mask(gt_base, lidars)
+        gt_ranged = gt_base[cover]
+        gtr_dev = torch.from_numpy(_subsample(gt_ranged, args.max_points, rng)).to(
+            device
+        )
+        ranged = chamfer_distance(rd_dev, gtr_dev)
+
+        raw_sym_values.append(raw[0])
+        ranged_sym_values.append(ranged[0])
 
         # Transform both (base_link) clouds into the scene world frame for the
         # 3D view. The ego/base_link pose drives the sensor transform + track.
@@ -502,9 +584,19 @@ def run(args) -> None:
 
         rr.set_time("frame", sequence=i)
         rr.set_time("stamp", duration=seconds)
+        # GT split by coverage: in-range (green, used by the ranged metric) vs
+        # out-of-range (grey, only counted by the raw metric).
         rr.log(
             "world/gt_lidar",
-            rr.Points3D(gt_world, colors=(80, 200, 120), radii=args.point_radius),
+            rr.Points3D(
+                gt_world[cover], colors=(80, 200, 120), radii=args.point_radius
+            ),
+        )
+        rr.log(
+            "world/gt_out_of_range",
+            rr.Points3D(
+                gt_world[~cover], colors=(120, 120, 120), radii=args.point_radius
+            ),
         )
         rr.log(
             "world/rendered_lidar",
@@ -514,15 +606,14 @@ def run(args) -> None:
             "world/ego",
             rr.Transform3D(translation=b2w[:3, 3], mat3x3=b2w[:3, :3]),
         )
-        for path, value in zip(
-            (p for p, _, _ in CHAMFER_SERIES), (cd_sym, cd_r2g, cd_g2r)
-        ):
+        for (path, _, _), value in zip(CHAMFER_SERIES, (*raw, *ranged)):
             _log_scalar(rr, path, value)
 
         print(
             f"  [{i + 1}/{len(selected)}] t={seconds:.2f}s "
-            f"gt={gt_base.shape[0]:>7d} render={rd_base.shape[0]:>7d} "
-            f"chamfer={cd_sym:.4f}m (r→g {cd_r2g:.4f} / g→r {cd_g2r:.4f})"
+            f"gt={gt_base.shape[0]:>7d} ({int(cover.sum())} in-range) "
+            f"render={rd_base.shape[0]:>7d} | chamfer raw={raw[0]:.4f}m "
+            f"ranged={ranged[0]:.4f}m"
         )
 
     # The full ego path is logged once (static) rather than re-serialising the
@@ -537,16 +628,20 @@ def run(args) -> None:
         )
 
     # --- summary -------------------------------------------------------------
-    finite = np.asarray([c for c in cd_values if np.isfinite(c)], dtype=np.float64)
-    if finite.size:
-        print(
-            "\n[summary] Chamfer distance over "
-            f"{finite.size} frames: "
-            f"mean={finite.mean():.4f} m  median={np.median(finite):.4f} m  "
-            f"min={finite.min():.4f} m  max={finite.max():.4f} m"
-        )
-    else:
-        print("\n[summary] no finite Chamfer values computed.")
+    def _stats(label: str, values: list[float]) -> None:
+        finite = np.asarray([c for c in values if np.isfinite(c)], dtype=np.float64)
+        if finite.size:
+            print(
+                f"[summary] {label} symmetric Chamfer over {finite.size} frames: "
+                f"mean={finite.mean():.4f} m  median={np.median(finite):.4f} m  "
+                f"min={finite.min():.4f} m  max={finite.max():.4f} m"
+            )
+        else:
+            print(f"[summary] {label}: no finite Chamfer values computed.")
+
+    print()
+    _stats("raw   ", raw_sym_values)
+    _stats("ranged", ranged_sym_values)
     print(f"[done] wrote Rerun recording to {output}")
 
 
