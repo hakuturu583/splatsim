@@ -74,7 +74,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from splatsim._usdz import _mat4, _rig_in_world, load_rig_trajectories
+from splatsim._geometry import mat4, quat_to_matrix, slerp
+from splatsim._usdz import _rig_in_world, load_rig_trajectories
 from splatsim.dataclass import SceneConfig
 from splatsim.lidar_renderer import (
     LidarRenderer,
@@ -120,10 +121,7 @@ def _pose_to_matrix(translation, rotation) -> np.ndarray:
     ``rotation`` is a ``pyquaternion.Quaternion`` (as carried by ``EgoPose`` /
     ``CalibratedSensor``), exposing a 3x3 ``rotation_matrix``.
     """
-    m = np.eye(4, dtype=np.float64)
-    m[:3, :3] = np.asarray(rotation.rotation_matrix, dtype=np.float64)
-    m[:3, 3] = np.asarray(translation, dtype=np.float64).reshape(3)
-    return m
+    return mat4(np.asarray(rotation.rotation_matrix, dtype=np.float64), translation)
 
 
 def _transform(t: np.ndarray, pts: np.ndarray) -> np.ndarray:
@@ -136,11 +134,12 @@ def _interp_ego_map(
 ) -> np.ndarray:
     """Interpolated ego(base)→map 4x4 pose at unix-microsecond time ``t_us``.
 
-    Translation is linearly interpolated; rotation is SLERP'd (via the same
-    ``pyquaternion.Quaternion`` the T4 records already carry) between the two
-    bracketing ``ego_pose`` records. Queries outside the recorded span clamp to
-    the nearest endpoint. Used to reconstruct the sweep-end pose that drives the
-    rolling-shutter render.
+    Translation is linearly interpolated; rotation is SLERP'd (via the shared
+    :func:`splatsim._geometry.slerp`) between the two bracketing ``ego_pose``
+    records. ``quats`` are the records' ``pyquaternion.Quaternion`` rotations,
+    read here as ``(w, x, y, z)`` via ``.elements``. Queries outside the
+    recorded span clamp to the nearest endpoint. Used to reconstruct the
+    sweep-end pose that drives the rolling-shutter render.
     """
     if t_us <= ts_us[0]:
         i0 = i1 = 0
@@ -153,9 +152,8 @@ def _interp_ego_map(
         i0 = i1 - 1
         a = float((t_us - ts_us[i0]) / (ts_us[i1] - ts_us[i0]))
     pos = trans[i0] * (1.0 - a) + trans[i1] * a
-    q0 = quats[i0]
-    quat = q0 if i0 == i1 else type(q0).slerp(q0, quats[i1], a)
-    return _mat4(np.asarray(quat.rotation_matrix, dtype=np.float64), pos)
+    q = slerp(quats[i0].elements, quats[i1].elements, a)  # wxyz
+    return mat4(quat_to_matrix(q, order="wxyz"), pos)
 
 
 def _dynamic_box_mask(pts_map: np.ndarray, boxes: list, margin: float) -> np.ndarray:

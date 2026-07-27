@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -10,6 +9,7 @@ import torch
 from numpy.typing import NDArray
 
 from autoware_carla_scenario.sensor import LidarSensorBase, LidarSensorConfig
+from splatsim._geometry import mat4, rpy_deg_to_matrix
 from splatsim.lidar_renderer import LidarRenderer, LidarSensorSpec
 
 if TYPE_CHECKING:
@@ -172,11 +172,9 @@ class SplatSimLidarSensor(LidarSensorBase):
 
 
 def _sensor_spec_from_config(config: SplatSimLidarSensorConfig) -> LidarSensorSpec:
-    s2b = np.eye(4, dtype=np.float64)
-    s2b[:3, :3] = _rpy_deg_to_matrix(config.roll, config.pitch, config.yaw)
-    s2b[:3, 3] = np.array(
-        [config.position_x, config.position_y, config.position_z],
-        dtype=np.float64,
+    s2b = mat4(
+        rpy_deg_to_matrix((config.roll, config.pitch, config.yaw)),
+        (config.position_x, config.position_y, config.position_z),
     )
     return LidarSensorSpec(
         name=config.name,
@@ -185,27 +183,4 @@ def _sensor_spec_from_config(config: SplatSimLidarSensorConfig) -> LidarSensorSp
         n_columns=config.n_columns,
         spinning_frequency_hz=config.fps,
         n_rows_uniform=config.n_rows,
-    )
-
-
-def _rpy_deg_to_matrix(
-    roll_deg: float,
-    pitch_deg: float,
-    yaw_deg: float,
-) -> NDArray[np.float64]:
-    r = math.radians(roll_deg)
-    p = math.radians(pitch_deg)
-    y = math.radians(yaw_deg)
-
-    cr, sr = math.cos(r), math.sin(r)
-    cp, sp = math.cos(p), math.sin(p)
-    cy, sy = math.cos(y), math.sin(y)
-
-    return np.array(
-        [
-            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
-            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
-            [-sp, cp * sr, cp * cr],
-        ],
-        dtype=np.float64,
     )

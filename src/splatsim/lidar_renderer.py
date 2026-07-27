@@ -41,6 +41,7 @@ import numpy as np
 import torch
 
 from splatsim import _lidar_cull_ext as _cuda_cull_ext
+from splatsim._geometry import mat4, quat_to_matrix, rpy_deg_to_matrix
 
 if TYPE_CHECKING:
     from splatsim.scene import Scene
@@ -252,56 +253,12 @@ def is_known_sensor(sensor_type: str) -> bool:
 # ── Sensor pose / spec ──────────────────────────────────────────────
 
 
-def _quat_wxyz_to_rotmat_np(qwxyz: Sequence[float]) -> np.ndarray:
-    qw, qx, qy, qz = (float(c) for c in qwxyz)
-    n = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
-    qw, qx, qy, qz = qw / n, qx / n, qy / n, qz / n
-    return np.array(
-        [
-            [
-                1 - 2 * (qy * qy + qz * qz),
-                2 * (qx * qy - qw * qz),
-                2 * (qx * qz + qw * qy),
-            ],
-            [
-                2 * (qx * qy + qw * qz),
-                1 - 2 * (qx * qx + qz * qz),
-                2 * (qy * qz - qw * qx),
-            ],
-            [
-                2 * (qx * qz - qw * qy),
-                2 * (qy * qz + qw * qx),
-                1 - 2 * (qx * qx + qy * qy),
-            ],
-        ],
-        dtype=np.float64,
-    )
-
-
-def _rpy_deg_to_rotmat_np(rpy_deg: Sequence[float]) -> np.ndarray:
-    roll, pitch, yaw = (math.radians(float(c)) for c in rpy_deg)
-    cr, sr = math.cos(roll), math.sin(roll)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    return np.array(
-        [
-            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
-            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
-            [-sp, cp * sr, cp * cr],
-        ],
-        dtype=np.float64,
-    )
-
-
 def sensor_to_base_4x4(
     translation: Sequence[float],
     rotation_wxyz: Sequence[float],
 ) -> np.ndarray:
     """4×4 sensor→base_link rigid transform from a YAML pose entry."""
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = _quat_wxyz_to_rotmat_np(rotation_wxyz)
-    T[:3, 3] = np.asarray(translation, dtype=np.float64).reshape(3)
-    return T
+    return mat4(quat_to_matrix(rotation_wxyz, order="wxyz"), translation)
 
 
 @dataclass
@@ -426,17 +383,16 @@ def build_lidar_sensors_from_config(cfg_sensors) -> list[LidarSensorSpec]:
             getattr(s, "translation", getattr(s, "position", (0.0, 0.0, 0.0)))
         )
         rotation = list(getattr(s, "rotation", (1.0, 0.0, 0.0, 0.0)))
-        s2b = np.eye(4, dtype=np.float64)
-        s2b[:3, 3] = np.asarray(translation, dtype=np.float64).reshape(3)
         if len(rotation) == 4:
-            s2b[:3, :3] = _quat_wxyz_to_rotmat_np(rotation)
+            r = quat_to_matrix(rotation, order="wxyz")
         elif len(rotation) == 3:
-            s2b[:3, :3] = _rpy_deg_to_rotmat_np(rotation)
+            r = rpy_deg_to_matrix(rotation)
         else:
             raise ValueError(
                 f"LiDAR sensor {getattr(s, 'name', '<unnamed>')}: "
                 "rotation must be quaternion [w,x,y,z] or RPY [roll,pitch,yaw]"
             )
+        s2b = mat4(r, translation)
         elevation_deg = getattr(s, "elevation_deg", None)
         if elevation_deg:
             # Sort strictly descending (top→bottom) so the panorama's row 0

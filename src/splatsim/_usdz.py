@@ -27,6 +27,7 @@ import numpy as np
 import torch
 
 from splatsim._conversions import GaussianTensors, cloud_to_tensors
+from splatsim._geometry import mat4, quat_to_matrix, slerp
 
 if typing.TYPE_CHECKING:
     from splatsim.background import Background
@@ -351,7 +352,7 @@ def iter_world_to_camera_interpolated_uncentered(
 
     n_poses = timestamps.shape[0]
     if n_poses == 1:
-        r_rig = _quat_to_matrix(tuple(quaternions[0]))
+        r_rig = quat_to_matrix(quaternions[0], order="xyzw")
         yield float(timestamps[0]), _compose_w2c(sensor_in_rig, r_rig, translations[0])
         return
 
@@ -370,8 +371,8 @@ def iter_world_to_camera_interpolated_uncentered(
         alpha = float(max(0.0, min(1.0, alpha)))
 
         t_rig = (1.0 - alpha) * translations[i] + alpha * translations[i + 1]
-        q = _slerp(quaternions[i], quaternions[i + 1], alpha)
-        r_rig = _quat_to_matrix(tuple(q))
+        q = slerp(quaternions[i], quaternions[i + 1], alpha)
+        r_rig = quat_to_matrix(q, order="xyzw")
 
         yield float(t), _compose_w2c(sensor_in_rig, r_rig, t_rig)
 
@@ -405,18 +406,14 @@ def _find_rig_with_camera(
     return None, None
 
 
-def _mat4(r: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Assemble a 4x4 rigid transform from a 3x3 rotation and a translation."""
-    m = np.eye(4, dtype=np.float64)
-    m[:3, :3] = r
-    m[:3, 3] = t
-    return m
-
-
 def _rig_in_world(pose: Any) -> np.ndarray:
-    """Return the 4x4 rig-in-world transform for a ``RigPose`` (ENU world)."""
-    return _mat4(
-        _quat_to_matrix(pose.rotation),
+    """Return the 4x4 rig-in-world transform for a ``RigPose`` (ENU world).
+
+    ``3dgs_io.parse_rig_trajectories`` exposes rotations in ``(x, y, z, w)``
+    order (the scipy / Eigen / glTF convention).
+    """
+    return mat4(
+        quat_to_matrix(pose.rotation, order="xyzw"),
         np.asarray(pose.translation, dtype=np.float64),
     )
 
@@ -432,26 +429,8 @@ def _compose_w2c(
     sensor_in_rig: np.ndarray, r_rig: np.ndarray, t_rig: np.ndarray
 ) -> np.ndarray:
     """Compose a rig pose with sensor-in-rig into a 4x4 world→camera matrix."""
-    camera_in_world = _mat4(r_rig, t_rig) @ sensor_in_rig
+    camera_in_world = mat4(r_rig, t_rig) @ sensor_in_rig
     return np.linalg.inv(camera_in_world)
-
-
-def _slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
-    """SLERP between two ``(x, y, z, w)`` unit quaternions."""
-    q0 = q0 / np.linalg.norm(q0)
-    q1 = q1 / np.linalg.norm(q1)
-    dot = float(np.dot(q0, q1))
-    if dot < 0.0:
-        q1 = -q1
-        dot = -dot
-    if dot > 0.9995:
-        result = (1.0 - t) * q0 + t * q1
-        return result / np.linalg.norm(result)
-    theta = float(np.arccos(dot))
-    sin_theta = float(np.sin(theta))
-    s0 = float(np.sin((1.0 - t) * theta) / sin_theta)
-    s1 = float(np.sin(t * theta) / sin_theta)
-    return s0 * q0 + s1 * q1
 
 
 def read_rig_trajectories(usdz_path: str | Path, rig_uri: str) -> list[Any]:
@@ -529,23 +508,6 @@ def initial_camera_pose_from_rig_trajectories(
         float(t_sensor_world[2]),
     )
     return position, yaw_deg
-
-
-def _quat_to_matrix(q: tuple[float, float, float, float]) -> np.ndarray:
-    """Convert an ``(x, y, z, w)`` quaternion to a 3x3 rotation matrix.
-
-    ``3dgs_io.parse_rig_trajectories`` exposes rotations in ``(x, y, z, w)``
-    order (the same convention as scipy / Eigen / glTF).
-    """
-    x, y, z, w = q
-    return np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-        ],
-        dtype=np.float64,
-    )
 
 
 def _concat_tensors(tensors: list[GaussianTensors]) -> GaussianTensors:
