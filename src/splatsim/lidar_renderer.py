@@ -596,8 +596,9 @@ def render_lidar_panorama(
     opacities: torch.Tensor,  # (N,) post-sigmoid in [0, 1]
     intensity_sig: torch.Tensor,  # (N,) sigmoid(lidar_intensity_raw)
     raydrop_logit: torch.Tensor,  # (N,) raw lidar_raydrop_logit
-    sensor_to_world: torch.Tensor,  # (4, 4) on the same device
+    sensor_to_world: torch.Tensor,  # (4, 4) sweep-start pose, same device
     lidar_spec: LidarSensorSpec,
+    sensor_to_world_end: torch.Tensor | None = None,  # (4, 4) sweep-end pose
     min_range_m: float = 0.3,
     max_range_m: float | None = 120.0,
     packed: bool = False,
@@ -653,10 +654,26 @@ def render_lidar_panorama(
     correct choice under the spherical lidar camera model). Turn them
     off in exchange for ``packed=True`` when speed matters more than
     covariance fidelity.
+
+    ``sensor_to_world_end`` enables rolling-shutter (motion-during-sweep)
+    rendering: ``sensor_to_world`` is the pose at the first azimuth column and
+    ``sensor_to_world_end`` the pose at the last, with gsplat interpolating the
+    sensor pose across the spin. This reproduces the skew a real spinning LiDAR
+    accumulates while the vehicle moves (and, conversely, lets a consumer feed
+    de-skewing poses). Requires ``with_ut=True``. When ``None`` (default) the
+    whole panorama is rendered from the single ``sensor_to_world`` pose
+    (``RollingShutterType.GLOBAL``), i.e. the previous behaviour.
     """
     import gsplat
 
     device = means.device
+
+    if sensor_to_world_end is not None and not with_ut:
+        raise ValueError(
+            "sensor_to_world_end (rolling shutter) requires with_ut=True; "
+            "gsplat's unscented-transform path is the only one that interpolates "
+            "the per-column sensor pose."
+        )
 
     if frustum_cull and means.shape[0] > 0:
         if elev_fov_cull:
@@ -668,10 +685,20 @@ def render_lidar_panorama(
             )
         else:
             sin_min = cos_min = sin_max = cos_max = 0.0
+        # For a rolling-shutter sweep the sensor moves; pre-cull from the sweep
+        # midpoint so a boundary Gaussian isn't dropped for either endpoint (the
+        # exact per-column near/far gating still happens inside gsplat).
+        cull_s2w = sensor_to_world
+        if sensor_to_world_end is not None:
+            cull_s2w = sensor_to_world.clone()
+            cull_s2w[:3, 3] = 0.5 * (
+                sensor_to_world[:3, 3]
+                + sensor_to_world_end.to(cull_s2w.device, cull_s2w.dtype)[:3, 3]
+            )
         keep = _lidar_cull_keep(
             means=means,
             scales=scales,
-            sensor_to_world=sensor_to_world,
+            sensor_to_world=cull_s2w,
             min_range_m=float(min_range_m),
             max_range_m=None if max_range_m is None else float(max_range_m),
             cull_scale_sigmas=float(cull_scale_sigmas),
@@ -709,6 +736,17 @@ def render_lidar_panorama(
     sensor_to_world_f32 = sensor_to_world.to(device=device, dtype=torch.float32)
     viewmats = _rigid_inverse_4x4(sensor_to_world_f32).unsqueeze(0)  # (C=1, 4, 4)
 
+    # Rolling shutter: interpolate sensor pose start->end across the azimuth spin.
+    # Our columns sweep +pi -> -pi (col 0 -> col W-1), i.e. left-to-right.
+    viewmats_rs = None
+    rolling_shutter = None
+    if sensor_to_world_end is not None:
+        from gsplat.cuda._wrapper import RollingShutterType
+
+        end_f32 = sensor_to_world_end.to(device=device, dtype=torch.float32)
+        viewmats_rs = _rigid_inverse_4x4(end_f32).unsqueeze(0)
+        rolling_shutter = RollingShutterType.ROLLING_LEFT_TO_RIGHT
+
     Ks = _lidar_intrinsics(int(H), int(W), str(device))
 
     # Pack (intensity_sig, raydrop_logit) into a 2-channel ``colors``.
@@ -742,6 +780,9 @@ def render_lidar_panorama(
     )
     if max_range_m is not None:
         rast_kwargs["far_plane"] = float(max_range_m)
+    if viewmats_rs is not None:
+        rast_kwargs["viewmats_rs"] = viewmats_rs
+        rast_kwargs["rolling_shutter"] = rolling_shutter
 
     render_colors, render_alphas, _meta = gsplat.rasterization(**rast_kwargs)
     rc = render_colors[0]  # (H, W, 3) = intensity, raydrop_logit, distance
@@ -935,12 +976,17 @@ class LidarRenderer:
         base_to_world: torch.Tensor,
         *,
         scene: "Scene",
+        base_to_world_end: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Render one LiDAR panorama.
 
         Args:
-            base_to_world: (4, 4) float32 tensor. Ego/base pose in world.
+            base_to_world: (4, 4) float32 tensor. Ego/base pose at the start of
+                the azimuth sweep (the whole panorama when no end pose is given).
             scene: The splatsim Scene providing Gaussians.
+            base_to_world_end: Optional (4, 4) ego/base pose at the end of the
+                sweep. When given, enables rolling-shutter (motion-during-sweep)
+                rendering — gsplat interpolates the sensor pose across the spin.
 
         Returns:
             ``{"alpha", "distance", "intensity", "raydrop_logit"}`` — each an
@@ -948,6 +994,9 @@ class LidarRenderer:
             ``W`` = ``sensor_spec.n_columns``.
         """
         sensor_to_world = base_to_world.to(self.device) @ self._s2b_t
+        sensor_to_world_end = None
+        if base_to_world_end is not None:
+            sensor_to_world_end = base_to_world_end.to(self.device) @ self._s2b_t
         cam_pos = sensor_to_world[:3, 3].detach()
 
         tensor_list = scene.collect_tensors(cam_pos)
@@ -988,6 +1037,7 @@ class LidarRenderer:
             raydrop_logit=raydrop_logit,
             sensor_to_world=sensor_to_world,
             lidar_spec=self.sensor_spec,
+            sensor_to_world_end=sensor_to_world_end,
             min_range_m=self.min_range_m,
             max_range_m=self.max_range_m,
             packed=self.packed,
