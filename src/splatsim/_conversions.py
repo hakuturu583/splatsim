@@ -114,7 +114,12 @@ def cloud_to_tensors(
 
 
 def quat_to_rotation_matrix(q: Tensor) -> Tensor:
-    """Convert a (w,x,y,z) quaternion to a 3x3 rotation matrix."""
+    """Convert a (w,x,y,z) quaternion to a 3x3 rotation matrix.
+
+    Differentiable torch counterpart of
+    :func:`splatsim._geometry.quat_to_matrix` (same wxyz convention); kept here
+    because it stays on-device and preserves gradients for the render path.
+    """
     w, x, y, z = q[0], q[1], q[2], q[3]
     return torch.stack(
         [

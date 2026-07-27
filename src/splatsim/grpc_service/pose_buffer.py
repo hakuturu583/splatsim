@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import bisect
-import math
 import threading
 from dataclasses import dataclass
+
+from splatsim._geometry import lerp, slerp
 
 
 @dataclass
@@ -98,55 +99,10 @@ class PoseBuffer:
             return p0
 
         t = (time_ns - p0.time_ns) / (p1.time_ns - p0.time_ns)
-        pos = _lerp_position(p0.position, p1.position, t)
-        rot = _slerp(p0.rotation, p1.rotation, t)
-        return TimestampedPose(time_ns=time_ns, position=pos, rotation=rot)
-
-
-def _slerp(
-    q0: tuple[float, float, float, float],
-    q1: tuple[float, float, float, float],
-    t: float,
-) -> tuple[float, float, float, float]:
-    """Spherical linear interpolation (wxyz convention, shortest path)."""
-    dot = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3]
-
-    # Ensure shortest path
-    if dot < 0.0:
-        q1 = (-q1[0], -q1[1], -q1[2], -q1[3])
-        dot = -dot
-
-    # Clamp for numerical safety
-    dot = min(dot, 1.0)
-
-    if dot > 0.9995:
-        # Very close — use linear interpolation and normalise
-        w = q0[0] + t * (q1[0] - q0[0])
-        x = q0[1] + t * (q1[1] - q0[1])
-        y = q0[2] + t * (q1[2] - q0[2])
-        z = q0[3] + t * (q1[3] - q0[3])
-    else:
-        theta = math.acos(dot)
-        sin_theta = math.sin(theta)
-        s0 = math.sin((1.0 - t) * theta) / sin_theta
-        s1 = math.sin(t * theta) / sin_theta
-        w = s0 * q0[0] + s1 * q1[0]
-        x = s0 * q0[1] + s1 * q1[1]
-        y = s0 * q0[2] + s1 * q1[2]
-        z = s0 * q0[3] + s1 * q1[3]
-
-    norm = math.sqrt(w * w + x * x + y * y + z * z)
-    return (w / norm, x / norm, y / norm, z / norm)
-
-
-def _lerp_position(
-    p0: tuple[float, float, float],
-    p1: tuple[float, float, float],
-    t: float,
-) -> tuple[float, float, float]:
-    """Linear interpolation between two 3D positions."""
-    return (
-        p0[0] + t * (p1[0] - p0[0]),
-        p0[1] + t * (p1[1] - p0[1]),
-        p0[2] + t * (p1[2] - p0[2]),
-    )
+        pos = lerp(p0.position, p1.position, t)
+        rot = slerp(p0.rotation, p1.rotation, t)  # wxyz in, wxyz out
+        return TimestampedPose(
+            time_ns=time_ns,
+            position=(float(pos[0]), float(pos[1]), float(pos[2])),
+            rotation=(float(rot[0]), float(rot[1]), float(rot[2]), float(rot[3])),
+        )
