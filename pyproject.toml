@@ -36,6 +36,17 @@ carla = [
     "python-dotenv>=1.0.0",
     "pyproj>=3.7.1",
 ]
+# Ground-truth LiDAR evaluation (src/eval/eval_lidar.py). Pulls a local
+# WebAuto / T4 dataset via t4-devkit for the GT trajectory + GT LiDAR scans,
+# and Rerun for logging the point clouds and Chamfer-distance time series to
+# an .rrd. Kept optional so the core simulator install stays lean.
+# t4-devkit is pinned to the v0.7.1 tag via [tool.uv.sources] (not published to
+# PyPI); rerun-sdk is a normal PyPI dep. Floor is 0.23 (unified set_time /
+# Scalars / SeriesLines API) within t4-devkit's supported <0.28 range.
+eval = [
+    "t4-devkit",
+    "rerun-sdk>=0.23,<0.28",
+]
 all = [
     "splatsim[gui,carla]",
 ]
@@ -79,6 +90,11 @@ torchvision = [
 # USDZ readers (load_spz, decode_lidar_sidecar, parse_rig_trajectories, ...) are
 # used; splatsim no longer loads 3D Tiles tilesets.
 3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v1.0.0" }
+
+# t4-devkit: WebAuto / T4 dataset devkit, used by the optional 'eval' extra to
+# pull the GT ego trajectory + GT LiDAR scans. Not published to PyPI; pin to the
+# v0.7.1 release tag.
+t4-devkit = { git = "https://github.com/tier4/t4-devkit.git", tag = "v0.7.1" }
 
 # nv-tlabs/ppisp: physically-plausible ISP for novel-view radiance-field rendering.
 # No release tag yet; pin to the current main commit. Ships a CUDA extension
@@ -142,6 +158,13 @@ unresolved-import = "ignore"
 # so they are absent during CI type-checking.
 [[tool.ty.overrides]]
 include = ["src/splatsim/grpc_service/**"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
+# The LiDAR eval script depends on the optional `eval` extra (t4-devkit,
+# rerun-sdk), which is not installed in the default/CI environment.
+[[tool.ty.overrides]]
+include = ["src/eval/**"]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
 
