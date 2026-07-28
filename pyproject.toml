@@ -37,16 +37,33 @@ carla = [
     "python-dotenv>=1.0.0",
     "pyproj>=3.7.1",
 ]
-# Ground-truth LiDAR evaluation (src/eval/eval_lidar.py). Pulls a local
-# WebAuto / T4 dataset via t4-devkit for the GT trajectory + GT LiDAR scans,
-# and Rerun for logging the point clouds and Chamfer-distance time series to
-# an .rrd. Kept optional so the core simulator install stays lean.
+# Ground-truth LiDAR evaluation (src/eval, run as `python -m eval.eval_lidar`).
+# Pulls a local WebAuto / T4 dataset via t4-devkit for the GT trajectory + GT
+# LiDAR scans, and Rerun for logging the point clouds + per-metric time series
+# to an .rrd. Kept optional so the core simulator install stays lean. This
+# extra covers the geometric (`chamfer`) metric; the learned-representation
+# (`bev`) metric additionally needs the `bev` extra below.
 # t4-devkit is pinned to the v0.7.1 tag via [tool.uv.sources] (not published to
 # PyPI); rerun-sdk is a normal PyPI dep. Floor is 0.23 (unified set_time /
 # Scalars / SeriesLines API) within t4-devkit's supported <0.28 range.
 eval = [
     "t4-devkit",
     "rerun-sdk>=0.23,<0.28",
+]
+# BEV-encoder metric (src/eval/bev, src/eval/metrics/bev_encoder.py). Runs the
+# OnePlanner BEV-encoder ONNX, which embeds `autoware` sparse-conv custom ops
+# (GetIndicePairsImplicitGemm / ImplicitGemm) that plain onnxruntime cannot
+# execute -- they require TensorRT with the `autoware_tensorrt_plugins` shared
+# library loaded at runtime. Only the TensorRT Python bindings are declared here;
+# the plugin .so and the encoder ONNX are environment-specific artifacts pointed
+# at via --bev-plugins / --bev-onnx (or $ONEPLANNER_TRT_PLUGINS / $ONEPLANNER_BEV_ONNX).
+# The device buffers are torch tensors, so no pycuda / cuda-python is needed.
+# IMPORTANT: the wheel must match the system libnvinfer the autoware plugins were
+# built against (TensorRT 10 / CUDA 12 here; `libautoware_tensorrt_plugins.so`
+# links `libnvinfer.so.10`). Mixing a pip-bundled libnvinfer of a different minor
+# with the system-built plugin can break plugin registration -- keep them aligned.
+bev = [
+    "tensorrt-cu12>=10,<11",
 ]
 all = [
     "splatsim[gui,carla]",
