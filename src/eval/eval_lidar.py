@@ -167,8 +167,10 @@ def build_parser() -> argparse.ArgumentParser:
     bev = p.add_argument_group("bev encoder metric")
     bev.add_argument(
         "--bev-backend",
-        default="tensorrt",
-        help="BEV encoder backend (only 'tensorrt' is implemented).",
+        default="spconv",
+        choices=("spconv", "tensorrt"),
+        help="BEV encoder backend: 'spconv' (default, onnx2torch + spconv, "
+        "pure-pip) or 'tensorrt' (needs --bev-plugins).",
     )
     bev.add_argument(
         "--bev-onnx",

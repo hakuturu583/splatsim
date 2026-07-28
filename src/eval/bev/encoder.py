@@ -36,40 +36,55 @@ class BEVEncoder(Protocol):
 def build_bev_encoder(args, cfg: BEVConfig | None = None) -> BEVEncoder:
     """Instantiate the BEV encoder backend selected by ``args.bev_backend``.
 
-    Paths fall back to the ``ONEPLANNER_BEV_ONNX`` / ``ONEPLANNER_TRT_PLUGINS``
-    environment variables so the personal artifact locations need not be baked
-    into the repo. Raises :class:`SystemExit` with an actionable message when a
-    required artifact or dependency is missing.
+    Two backends run the same encoder ONNX:
+
+    * ``spconv`` (default) -- onnx2torch + spconv, pure-pip and CUDA-aligned with
+      the project's torch; needs only the ONNX.
+    * ``tensorrt`` -- TensorRT + the ``autoware_tensorrt_plugins`` ``.so``; the
+      production path, but its TensorRT/CUDA must match the prebuilt plugin.
+
+    The ONNX / plugin paths fall back to the ``ONEPLANNER_BEV_ONNX`` /
+    ``ONEPLANNER_TRT_PLUGINS`` environment variables so the personal artifact
+    locations need not be baked into the repo. Raises :class:`SystemExit` with an
+    actionable message when a required artifact or dependency is missing.
     """
     cfg = cfg or BEVConfig()
-    backend = getattr(args, "bev_backend", "tensorrt")
-    if backend != "tensorrt":
-        raise SystemExit(
-            f"Unknown --bev-backend {backend!r}; only 'tensorrt' is implemented."
-        )
+    backend = getattr(args, "bev_backend", "spconv")
+    device = str(getattr(args, "device", "cuda"))
 
     onnx_path = getattr(args, "bev_onnx", None) or os.environ.get("ONEPLANNER_BEV_ONNX")
-    plugin_path = getattr(args, "bev_plugins", None) or os.environ.get(
-        "ONEPLANNER_TRT_PLUGINS"
-    )
     if not onnx_path:
         raise SystemExit(
             "BEV metric needs the encoder ONNX. Pass --bev-onnx PATH "
             "(oneplanner_bev_encoder.onnx) or set $ONEPLANNER_BEV_ONNX."
         )
-    if not plugin_path:
-        raise SystemExit(
-            "BEV metric needs the autoware TensorRT plugins. Pass --bev-plugins "
-            "PATH (libautoware_tensorrt_plugins.so) or set $ONEPLANNER_TRT_PLUGINS."
+
+    if backend == "spconv":
+        from .spconv_backend import SpconvBEVEncoder
+
+        return SpconvBEVEncoder(onnx_path, cfg, device=device)
+
+    if backend == "tensorrt":
+        plugin_path = getattr(args, "bev_plugins", None) or os.environ.get(
+            "ONEPLANNER_TRT_PLUGINS"
+        )
+        if not plugin_path:
+            raise SystemExit(
+                "The tensorrt BEV backend needs the autoware TensorRT plugins. "
+                "Pass --bev-plugins PATH (libautoware_tensorrt_plugins.so) or set "
+                "$ONEPLANNER_TRT_PLUGINS -- or use the default --bev-backend spconv."
+            )
+        from .tensorrt_backend import TensorRTBEVEncoder
+
+        return TensorRTBEVEncoder(
+            onnx_path=onnx_path,
+            plugin_path=plugin_path,
+            cfg=cfg,
+            device=device,
+            engine_cache=getattr(args, "bev_engine_cache", None),
+            fp16=bool(getattr(args, "bev_fp16", False)),
         )
 
-    from .tensorrt_backend import TensorRTBEVEncoder
-
-    return TensorRTBEVEncoder(
-        onnx_path=onnx_path,
-        plugin_path=plugin_path,
-        cfg=cfg,
-        device=str(getattr(args, "device", "cuda")),
-        engine_cache=getattr(args, "bev_engine_cache", None),
-        fp16=bool(getattr(args, "bev_fp16", False)),
+    raise SystemExit(
+        f"Unknown --bev-backend {backend!r}; choose 'spconv' or 'tensorrt'."
     )

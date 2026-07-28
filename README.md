@@ -174,28 +174,33 @@ uv run python -m eval.eval_lidar \
 The BEV encoder is the LiDAR branch of OnePlanner's BEVFusion, shipped as
 `oneplanner_bev_encoder.onnx`. Its ONNX embeds `autoware` sparse-convolution
 custom ops (`GetIndicePairsImplicitGemm` / `ImplicitGemm`) that **plain
-`onnxruntime` cannot execute** — they run only under **TensorRT** with the
-`autoware_tensorrt_plugins` shared library loaded. The backend loads that `.so`,
-builds (and disk-caches) a TensorRT engine, and runs inference using torch
-tensors as the CUDA buffers (no pycuda / cuda-python).
+`onnxruntime` cannot execute** — their implementation lives only in the
+`autoware_tensorrt_plugins` (which wrap [spconv](https://github.com/traveller59/spconv)).
+Two backends run the ONNX:
+
+- **`spconv` (default).** `onnx2torch` converts the whole graph to a
+  `torch.nn.Module` and loads all weights from the ONNX; the two custom ops are
+  supplied by `spconv` (the same library the plugins wrap) via lightweight
+  converters. Pure-pip and CUDA-aligned with the project's torch — no TensorRT,
+  no plugin `.so`, no version matching. This is the recommended path.
+- **`tensorrt` (`--bev-backend tensorrt`).** Loads the `autoware_tensorrt_plugins`
+  `.so`, builds (and disk-caches) a TensorRT engine, and runs inference using
+  torch tensors as the CUDA buffers. The production path, but its `tensorrt`
+  wheel + CUDA must match the prebuilt plugin's `libnvinfer` (here the plugin
+  links `libnvinfer.so.10`, TensorRT 10.16.1), so install a matching `tensorrt`
+  yourself and pass `--bev-plugins`.
 
 ```bash
-uv sync --extra eval --extra bev           # + TensorRT python bindings
+uv sync --extra eval --extra bev           # onnx2torch + spconv (default backend)
 export ONEPLANNER_BEV_ONNX=/path/to/oneplanner_bev_encoder.onnx
-export ONEPLANNER_TRT_PLUGINS=/path/to/libautoware_tensorrt_plugins.so
 uv run python -m eval.eval_lidar \
     --scene scene.usdz --data-root ~/.webauto/datasets --dataset-id <id> \
     --metrics chamfer,bev --output outputs/eval_lidar.rrd
 ```
 
-> **Environment note.** The `tensorrt` wheel and CUDA toolkit must match the
-> `libnvinfer` the plugins were built against (here `libautoware_tensorrt_plugins.so`
-> links `libnvinfer.so.10`, TensorRT 10.16.1 / CUDA 13). Because the core
-> simulator pins torch to CUDA 12.8, the BEV metric is best run in an environment
-> whose TensorRT and torch share a CUDA major version — hence it is isolated
-> behind the optional `bev` extra and its runtime artifacts (the plugin `.so` and
-> the encoder ONNX) are supplied via `--bev-plugins` / `--bev-onnx` rather than
-> vendored.
+The encoder ONNX is an environment-specific artifact supplied via `--bev-onnx`
+(or `$ONEPLANNER_BEV_ONNX`) rather than vendored. `spconv-cu126` pairs
+`cumm-cu126` (CUDA 12.6 wheels, compatible with the CUDA 12.8 torch here).
 
 ## Development
 

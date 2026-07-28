@@ -50,20 +50,22 @@ eval = [
     "t4-devkit",
     "rerun-sdk>=0.23,<0.28",
 ]
-# BEV-encoder metric (src/eval/bev, src/eval/metrics/bev_encoder.py). Runs the
-# OnePlanner BEV-encoder ONNX, which embeds `autoware` sparse-conv custom ops
-# (GetIndicePairsImplicitGemm / ImplicitGemm) that plain onnxruntime cannot
-# execute -- they require TensorRT with the `autoware_tensorrt_plugins` shared
-# library loaded at runtime. Only the TensorRT Python bindings are declared here;
-# the plugin .so and the encoder ONNX are environment-specific artifacts pointed
-# at via --bev-plugins / --bev-onnx (or $ONEPLANNER_TRT_PLUGINS / $ONEPLANNER_BEV_ONNX).
-# The device buffers are torch tensors, so no pycuda / cuda-python is needed.
-# IMPORTANT: the wheel must match the system libnvinfer the autoware plugins were
-# built against (TensorRT 10 / CUDA 12 here; `libautoware_tensorrt_plugins.so`
-# links `libnvinfer.so.10`). Mixing a pip-bundled libnvinfer of a different minor
-# with the system-built plugin can break plugin registration -- keep them aligned.
+# BEV-encoder metric (src/eval/bev, src/eval/metrics/bev_encoder.py). The
+# OnePlanner BEV-encoder ONNX embeds `autoware` sparse-conv custom ops
+# (GetIndicePairsImplicitGemm / ImplicitGemm) that plain onnxruntime cannot run.
+# The default `spconv` backend converts the ONNX to a torch module with
+# onnx2torch and supplies those two ops via spconv (the exact library the
+# autoware_tensorrt_plugins wrap) -- pure-pip and CUDA-aligned with the project's
+# torch. spconv-cu126 pairs cumm-cu126 (CUDA 12.6 wheels, compatible with the
+# CUDA 12.8 torch here). The encoder ONNX is an environment-specific artifact
+# passed via --bev-onnx (or $ONEPLANNER_BEV_ONNX).
+# The alternative `--bev-backend tensorrt` (autoware plugin .so) additionally
+# needs a `tensorrt` wheel matching the plugin's libnvinfer; install it yourself
+# (e.g. `uv pip install "tensorrt-cu12"`), it is intentionally not pinned here.
 bev = [
-    "tensorrt-cu12>=10,<11",
+    "onnx>=1.16",
+    "onnx2torch>=1.5",
+    "spconv-cu126>=2.3,<2.4",
 ]
 all = [
     "splatsim[gui,carla]",
