@@ -197,6 +197,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Zero the intensity channel fed to the BEV encoder.",
     )
+    bev.add_argument(
+        "--bev-active-cells",
+        default="rendered",
+        choices=("rendered", "gt", "intersection", "union"),
+        help="Which BEV cells the loss aggregates over (default: rendered = cells "
+        "the reconstruction populates, so unbuilt far regions don't inflate it).",
+    )
 
     ev = p.add_argument_group("evaluation / output")
     ev.add_argument(

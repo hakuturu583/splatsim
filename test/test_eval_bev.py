@@ -103,11 +103,12 @@ def test_compare_identical_features():
 
     rng = np.random.default_rng(0)
     a = torch.from_numpy(rng.standard_normal((8, 6, 6)).astype(np.float32))
-    stats, cos_map, active = _compare_features(a, a.clone())
+    active = torch.ones((6, 6), dtype=torch.bool)
+    stats, cos_map = _compare_features(a, a.clone(), active)
     assert stats["cosine"] == pytest.approx(1.0, abs=1e-5)
     assert stats["global_cosine"] == pytest.approx(1.0, abs=1e-5)
     assert stats["rel_l2"] == pytest.approx(0.0, abs=1e-6)
-    assert tuple(cos_map.shape) == (6, 6) and tuple(active.shape) == (6, 6)
+    assert tuple(cos_map.shape) == (6, 6)
 
 
 def test_compare_orthogonal_and_scaled_features():
@@ -118,14 +119,31 @@ def test_compare_orthogonal_and_scaled_features():
     b = torch.zeros((c, h, w))
     a[0] = 1.0  # channel-0 unit vectors
     b[1] = 1.0  # orthogonal channel-1 unit vectors
-    stats, _, active = _compare_features(a, b)
+    active = torch.ones((h, w), dtype=torch.bool)
+    stats, _ = _compare_features(a, b, active)
     assert stats["cosine"] == pytest.approx(0.0, abs=1e-5)
-    assert bool(active.all())
 
     # cosine is scale-invariant: scaling one map leaves per-cell cosine at 1.
-    stats2, _, _ = _compare_features(a, a * 5.0)
+    stats2, _ = _compare_features(a, a * 5.0, active)
     assert stats2["cosine"] == pytest.approx(1.0, abs=1e-5)
     assert stats2["rel_l2"] > 0.0  # but L2 grows
+
+
+def test_bev_occupancy_alignment():
+    from eval.bev.config import BEVConfig
+    from eval.metrics.bev_encoder import bev_occupancy
+
+    cfg = BEVConfig()
+    h, w = cfg.bev_size
+    # A point at +x should land at row > centre, +y at col > centre.
+    occ = bev_occupancy(np.array([[60.0, 0.0, 0.0], [0.0, 60.0, 0.0]], np.float32), cfg)
+    rows, cols = np.where(occ)
+    assert occ.sum() == 2
+    # +x point: row above centre, col near centre; +y point: the reverse.
+    assert rows.max() > h // 2  # +x pushed the row past centre
+    assert cols.max() > w // 2  # +y pushed the col past centre
+    # empty cloud -> empty mask
+    assert bev_occupancy(np.empty((0, 3), np.float32), cfg).sum() == 0
 
 
 def test_pca_rgb_and_colorize_shapes():

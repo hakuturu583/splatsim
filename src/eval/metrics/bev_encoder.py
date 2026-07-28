@@ -50,6 +50,27 @@ def _to_points(xyz: np.ndarray, intensity: np.ndarray, cfg) -> np.ndarray:
     return np.ascontiguousarray(np.stack(cols, axis=1), dtype=np.float32)
 
 
+def bev_occupancy(xyz: np.ndarray, cfg) -> np.ndarray:
+    """(H, W) bool mask of BEV cells that contain at least one point.
+
+    Aligned to the encoder's BEV output orientation (verified empirically):
+    ``row`` is the x axis, ``col`` is the y axis, ego at the grid centre. Used to
+    restrict the loss to cells the reconstruction actually populates -- a cell is
+    "occupied" where the rendered LiDAR (i.e. the background Gaussians) returns a
+    point, so far regions the scene has not built yet are excluded.
+    """
+    h, w = cfg.bev_size
+    lo = cfg.point_cloud_range
+    occ = np.zeros((h, w), dtype=bool)
+    if xyz.shape[0] == 0:
+        return occ
+    row = np.floor((xyz[:, 0] - lo[0]) / (lo[3] - lo[0]) * h).astype(np.int64)
+    col = np.floor((xyz[:, 1] - lo[1]) / (lo[4] - lo[1]) * w).astype(np.int64)
+    keep = (row >= 0) & (row < h) & (col >= 0) & (col < w)
+    occ[row[keep], col[keep]] = True
+    return occ
+
+
 def _colorize(scalar01: np.ndarray) -> np.ndarray:
     """Map an (H, W) array in [0, 1] to an (H, W, 3) uint8 heatmap (blue->red)."""
     s = np.clip(scalar01, 0.0, 1.0)
@@ -60,33 +81,48 @@ def _colorize(scalar01: np.ndarray) -> np.ndarray:
 
 
 def _compare_features(
-    a: torch.Tensor, b: torch.Tensor
-) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
-    """Compare two (C, H, W) BEV maps on-device.
+    a: torch.Tensor, b: torch.Tensor, active: torch.Tensor
+) -> tuple[dict[str, float], torch.Tensor]:
+    """Compare two (C, H, W) BEV maps over the ``active`` cells only.
 
-    Returns ``(stats, cosine_map, active_mask)`` where ``stats`` holds the scalar
-    similarities, ``cosine_map`` is the (H, W) per-cell cosine, and
-    ``active_mask`` marks cells occupied in either map. Keys in ``stats`` match
-    the last segment of each :data:`_BEV_SERIES` path.
+    ``active`` is an (H, W) bool mask selecting which cells to aggregate -- the
+    caller restricts this to cells the reconstruction actually populates (see
+    :func:`bev_occupancy`), so regions the scene has not reconstructed yet (e.g.
+    far background with no Gaussians) do not inflate the loss. Because the 2D
+    backbone makes the *output* feature map dense (every cell non-zero), the mask
+    must come from the input occupancy, not the feature norm.
+
+    Returns ``(stats, cosine_map)``: ``stats`` holds the scalar similarities
+    (keys match the last segment of each :data:`_BEV_SERIES` path); ``cosine_map``
+    is the (H, W) per-cell cosine, zeroed outside ``active`` for the heatmap.
     """
     c, h, w = a.shape
     fa = a.reshape(c, -1)
     fb = b.reshape(c, -1)
-    na = fa.norm(dim=0)
-    nb = fb.norm(dim=0)
-    active = (na > 1e-6) | (nb > 1e-6)
+    act = active.reshape(-1)
+    nan = float("nan")
+    if not bool(act.any()):
+        stats = {"cosine": nan, "global_cosine": nan, "rel_l2": nan}
+        return stats, torch.zeros(h, w, device=a.device)
 
+    fa_a = fa[:, act]  # (C, n_active)
+    fb_a = fb[:, act]
+    na = fa_a.norm(dim=0)
+    nb = fb_a.norm(dim=0)
     denom = torch.clamp(na * nb, min=1e-12)
-    cell_cos = torch.where(active, (fa * fb).sum(0) / denom, torch.zeros_like(na))
-    cosine = float(cell_cos[active].mean()) if bool(active.any()) else float("nan")
+    cell_cos_active = (fa_a * fb_a).sum(0) / denom
+    cosine = float(cell_cos_active.mean())
 
-    ga = fa.mean(1)
-    gb = fb.mean(1)
+    # Global descriptor + relative L2, also over active cells only.
+    ga = fa_a.mean(1)
+    gb = fb_a.mean(1)
     global_cosine = float(ga @ gb / torch.clamp(ga.norm() * gb.norm(), min=1e-12))
-    rel_l2 = float((fa - fb).norm() / torch.clamp(fa.norm(), min=1e-12))
+    rel_l2 = float((fa_a - fb_a).norm() / torch.clamp(fa_a.norm(), min=1e-12))
 
+    cell_cos = torch.zeros(h * w, device=a.device)
+    cell_cos[act] = cell_cos_active
     stats = {"cosine": cosine, "global_cosine": global_cosine, "rel_l2": rel_l2}
-    return stats, cell_cos.reshape(h, w), active.reshape(h, w)
+    return stats, cell_cos.reshape(h, w)
 
 
 def _pca_rgb(
@@ -137,6 +173,10 @@ class BEVEncoderMetric(LidarEvalMetric):
 
         cfg = BEVConfig(use_intensity=not getattr(args, "bev_no_intensity", False))
         self.cfg = cfg
+        # Which BEV cells the loss aggregates over. Default 'rendered' = cells the
+        # reconstruction (background Gaussians) actually populates, so far regions
+        # the scene has not built yet don't inflate the error.
+        self.active_cells = getattr(args, "bev_active_cells", "rendered")
         self.encoder = build_bev_encoder(args, cfg)
         self._cosine: list[float] = []
         self._global_cosine: list[float] = []
@@ -145,8 +185,21 @@ class BEVEncoderMetric(LidarEvalMetric):
         print(
             f"[bev] encoder ready: {cfg.feature_channels}ch "
             f"{cfg.bev_size[0]}x{cfg.bev_size[1]} BEV, "
-            f"{mx:.2f}x{my:.2f} m/px, intensity={cfg.use_intensity}"
+            f"{mx:.2f}x{my:.2f} m/px, intensity={cfg.use_intensity}, "
+            f"active_cells={self.active_cells}"
         )
+
+    def _active_mask(self, frame: FrameData, device) -> torch.Tensor:
+        """(H, W) bool mask of BEV cells to score, per ``self.active_cells``."""
+        occ_rd = bev_occupancy(frame.rd_static_xyz, self.cfg)
+        occ_gt = bev_occupancy(frame.gt_static_xyz, self.cfg)
+        mask = {
+            "rendered": occ_rd,
+            "gt": occ_gt,
+            "intersection": occ_rd & occ_gt,
+            "union": occ_rd | occ_gt,
+        }[self.active_cells]
+        return torch.from_numpy(mask).to(device)
 
     def setup_rerun(self, rr, ctx: EvalContext) -> None:
         for path, name, color in _BEV_SERIES:
@@ -162,14 +215,15 @@ class BEVEncoderMetric(LidarEvalMetric):
         feat_gt = self.encoder.encode(gt_pts)  # (C, H, W) torch on device
         feat_rd = self.encoder.encode(rd_pts)
 
-        stats, cosine_map, active = _compare_features(feat_gt, feat_rd)
+        active = self._active_mask(frame, feat_gt.device)
+        stats, cosine_map = _compare_features(feat_gt, feat_rd, active)
         for path, _, _ in _BEV_SERIES:
             log_scalar(rr, path, stats[path.rsplit("/", 1)[-1]])
 
         gt_rgb, rd_rgb = _pca_rgb(feat_gt, feat_rd, active)
         rr.log("bev/gt", rr.Image(gt_rgb))
         rr.log("bev/rendered", rr.Image(rd_rgb))
-        # Per-cell cosine in [-1, 1] -> [0, 1] heatmap; empty cells black.
+        # Per-cell cosine in [-1, 1] -> [0, 1] heatmap; non-scored cells black.
         active_np = active.cpu().numpy()
         heat = _colorize(((cosine_map + 1.0) * 0.5).cpu().numpy())
         heat[~active_np] = 0
