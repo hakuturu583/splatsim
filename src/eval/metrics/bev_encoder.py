@@ -11,33 +11,33 @@ Each similarity (per-cell cosine, globally mean-pooled cosine, and Frobenius
 relative L2 ``||gt-rd|| / ||gt||``) is logged for **two aggregations** so they can
 be compared in Rerun:
 
-* ``…`` (``metrics/bev/cosine`` …) -- over **occupied** cells only: the cells the
+* ``metrics/bev/cosine`` … -- over **occupied** cells only: the cells the
   reconstruction populates (rendered LiDAR = background Gaussians; see
-  :func:`bev_occupancy`). This is the honest number for the region actually built.
-* ``…_all`` (``metrics/bev/cosine_all`` …) -- over **every** 180x180 cell. This
-  matches the naive dense comparison but is optimistic: most cells are empty on
-  both sides and trivially agree (identical "no input" response), inflating cosine.
+  :func:`bev_occupancy`). The honest number for the region actually built.
+* ``metrics/bev/cosine_all`` … -- over **every** 180x180 cell. Matches the naive
+  dense comparison but is optimistic: most cells are empty on both sides and
+  trivially agree (identical "no input" response), inflating cosine.
 
 Per frame it also logs images: ``bev/gt`` / ``bev/rendered`` (shared-basis
 PCA(512->3) RGB, directly comparable by eye) and per-cell cosine heatmaps
 ``bev/cosine_map`` (occupied) / ``bev/cosine_map_all`` (all cells).
 
-The feature maps stay on the GPU the encoder produced them on; only the scalars
-and the small ``(180, 180, 3)`` uint8 images cross back to the host.
+The per-cell cosine map is computed once (dense) and both aggregations are
+derived from it; the feature maps stay on the GPU, only the scalars and the small
+``(180, 180, 3)`` uint8 images cross back to the host.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from ..context import EvalContext
 from ..frame import FrameData
 from ..rerun_io import log_scalar
 from .base import LidarEvalMetric, summarize_series
 
-# (rerun entity path, legend label, RGB colour). The stats key for each series is
-# the last path segment, so logging can zip against the metric's stats dict.
 # Each BEV metric is logged for TWO aggregations so they can be compared in
 # Rerun: "occupied" (only cells the reconstruction populates, per bev_occupancy)
 # and "all" (every 180x180 cell). Columns: path, legend label, RGB colour,
@@ -87,6 +87,9 @@ _BEV_SERIES: tuple[tuple[str, str, tuple[int, int, int], str, str], ...] = (
     ),
 )
 
+_METRIC_KEYS = ("cosine", "global_cosine", "rel_l2")
+_VARIANTS = ("occupied", "all")
+
 
 def _to_points(xyz: np.ndarray, intensity: np.ndarray, cfg) -> np.ndarray:
     """Assemble the (N, F) encoder input: (x, y, z, intensity, time_lag)."""
@@ -129,49 +132,43 @@ def _colorize(scalar01: np.ndarray) -> np.ndarray:
     return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
 
-def _compare_features(
-    a: torch.Tensor, b: torch.Tensor, active: torch.Tensor
-) -> tuple[dict[str, float], torch.Tensor]:
-    """Compare two (C, H, W) BEV maps over the ``active`` cells only.
+def _per_cell_cosine(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dense per-cell cosine of two (C, H, W) maps.
 
-    ``active`` is an (H, W) bool mask selecting which cells to aggregate -- the
-    caller restricts this to cells the reconstruction actually populates (see
-    :func:`bev_occupancy`), so regions the scene has not reconstructed yet (e.g.
-    far background with no Gaussians) do not inflate the loss. Because the 2D
-    backbone makes the *output* feature map dense (every cell non-zero), the mask
-    must come from the input occupancy, not the feature norm.
-
-    Returns ``(stats, cosine_map)``: ``stats`` holds the scalar similarities
-    (keys match the last segment of each :data:`_BEV_SERIES` path); ``cosine_map``
-    is the (H, W) per-cell cosine, zeroed outside ``active`` for the heatmap.
+    Returns ``(fa, fb, cos)`` where ``fa``/``fb`` are the (C, H*W) views and
+    ``cos`` is the (H*W,) per-cell cosine -- computed once so both the occupied
+    and all-cell aggregations can be derived from it without recomputing.
     """
-    c, h, w = a.shape
+    c = a.shape[0]
     fa = a.reshape(c, -1)
     fb = b.reshape(c, -1)
-    act = active.reshape(-1)
-    nan = float("nan")
-    if not bool(act.any()):
-        stats = {"cosine": nan, "global_cosine": nan, "rel_l2": nan}
-        return stats, torch.zeros(h, w, device=a.device)
+    cos = F.cosine_similarity(fa, fb, dim=0, eps=1e-12)  # (H*W,)
+    return fa, fb, cos
 
-    fa_a = fa[:, act]  # (C, n_active)
-    fb_a = fb[:, act]
-    na = fa_a.norm(dim=0)
-    nb = fb_a.norm(dim=0)
-    denom = torch.clamp(na * nb, min=1e-12)
-    cell_cos_active = (fa_a * fb_a).sum(0) / denom
-    cosine = float(cell_cos_active.mean())
 
-    # Global descriptor + relative L2, also over active cells only.
-    ga = fa_a.mean(1)
-    gb = fb_a.mean(1)
-    global_cosine = float(ga @ gb / torch.clamp(ga.norm() * gb.norm(), min=1e-12))
-    rel_l2 = float((fa_a - fb_a).norm() / torch.clamp(fa_a.norm(), min=1e-12))
+def _variant_stats(
+    fa: torch.Tensor, fb: torch.Tensor, cos: torch.Tensor, active: torch.Tensor | None
+) -> dict[str, float]:
+    """Similarity scalars over ``active`` cells (``None`` = every cell).
 
-    cell_cos = torch.zeros(h * w, device=a.device)
-    cell_cos[act] = cell_cos_active
-    stats = {"cosine": cosine, "global_cosine": global_cosine, "rel_l2": rel_l2}
-    return stats, cell_cos.reshape(h, w)
+    ``cosine`` slices the precomputed per-cell ``cos``; ``global_cosine`` and
+    ``rel_l2`` need the masked feature columns (not sliceable from ``cos``).
+    """
+    if active is None:
+        fa_a, fb_a, cell = fa, fb, cos
+    elif bool(active.any()):
+        fa_a, fb_a, cell = fa[:, active], fb[:, active], cos[active]
+    else:
+        nan = float("nan")
+        return {"cosine": nan, "global_cosine": nan, "rel_l2": nan}
+    ga, gb = fa_a.mean(1), fb_a.mean(1)
+    return {
+        "cosine": float(cell.mean()),
+        "global_cosine": float(F.cosine_similarity(ga, gb, dim=0, eps=1e-12)),
+        "rel_l2": float((fa_a - fb_a).norm() / torch.clamp(fa_a.norm(), min=1e-12)),
+    }
 
 
 def _pca_rgb(
@@ -222,14 +219,11 @@ class BEVEncoderMetric(LidarEvalMetric):
 
         cfg = BEVConfig(use_intensity=not getattr(args, "bev_no_intensity", False))
         self.cfg = cfg
-        # Which BEV cells the loss aggregates over. Default 'rendered' = cells the
-        # reconstruction (background Gaussians) actually populates, so far regions
-        # the scene has not built yet don't inflate the error.
+        # Which cells the "occupied" variant aggregates over (rendered/gt/…).
         self.active_cells = getattr(args, "bev_active_cells", "rendered")
         self.encoder = build_bev_encoder(args, cfg)
-        # Running history per (variant, metric) for the end-of-run summary.
         self._history: dict[tuple[str, str], list[float]] = {
-            (variant, key): [] for _, _, _, key, variant in _BEV_SERIES
+            (variant, key): [] for variant in _VARIANTS for key in _METRIC_KEYS
         }
         mx, my = cfg.meters_per_pixel
         print(
@@ -239,71 +233,74 @@ class BEVEncoderMetric(LidarEvalMetric):
             f"occupied={self.active_cells}"
         )
 
-    def _occupied_mask(self, frame: FrameData, device) -> torch.Tensor:
-        """(H, W) bool mask of reconstruction-occupied cells, per active_cells."""
+    def _occupied_mask(self, frame: FrameData) -> np.ndarray:
+        """(H, W) numpy bool mask of reconstruction-occupied cells.
+
+        Only the occupancy operand(s) the selected ``active_cells`` mode needs are
+        computed (single-cloud modes do one occupancy pass, not two).
+        """
+        mode = self.active_cells
+        if mode == "rendered":
+            return bev_occupancy(frame.rd_static_xyz, self.cfg)
+        if mode == "gt":
+            return bev_occupancy(frame.gt_static_xyz, self.cfg)
         occ_rd = bev_occupancy(frame.rd_static_xyz, self.cfg)
         occ_gt = bev_occupancy(frame.gt_static_xyz, self.cfg)
-        mask = {
-            "rendered": occ_rd,
-            "gt": occ_gt,
-            "intersection": occ_rd & occ_gt,
-            "union": occ_rd | occ_gt,
-        }[self.active_cells]
-        return torch.from_numpy(mask).to(device)
+        return occ_rd & occ_gt if mode == "intersection" else occ_rd | occ_gt
 
     def setup_rerun(self, rr, ctx: EvalContext) -> None:
-        for path, name, color, _, _ in _BEV_SERIES:
-            rr.log(path, rr.SeriesLines(names=[name], colors=[color]), static=True)
+        for path, name, color, _, variant in _BEV_SERIES:
+            # Reflect the actual occupancy region in the legend, not a fixed word.
+            label = (
+                name.replace("(occupied)", f"({self.active_cells})")
+                if variant == "occupied"
+                else name
+            )
+            rr.log(path, rr.SeriesLines(names=[label], colors=[color]), static=True)
 
     def update(self, rr, frame: FrameData, ctx: EvalContext) -> dict[str, float]:
-        gt_pts = _to_points(
-            frame.gt_static_xyz, frame.gt_intensity[~frame.gt_dynamic], self.cfg
-        )
-        rd_pts = _to_points(
-            frame.rd_static_xyz, frame.rd_intensity[~frame.rd_dynamic], self.cfg
-        )
+        gt_pts = _to_points(frame.gt_static_xyz, frame.gt_static_intensity, self.cfg)
+        rd_pts = _to_points(frame.rd_static_xyz, frame.rd_static_intensity, self.cfg)
         feat_gt = self.encoder.encode(gt_pts)  # (C, H, W) torch on device
         feat_rd = self.encoder.encode(rd_pts)
         h, w = feat_gt.shape[1:]
 
-        # Two aggregations: reconstruction-occupied cells vs every cell.
-        occupied = self._occupied_mask(frame, feat_gt.device)
-        masks = {
-            "occupied": occupied,
-            "all": torch.ones((h, w), dtype=torch.bool, device=feat_gt.device),
+        # Per-cell cosine once (dense); both aggregations derive from it.
+        fa, fb, cos = _per_cell_cosine(feat_gt, feat_rd)
+        occ_np = self._occupied_mask(frame)  # (H, W) numpy bool
+        occ_flat = torch.from_numpy(occ_np.reshape(-1)).to(feat_gt.device)
+        stats = {
+            "occupied": _variant_stats(fa, fb, cos, occ_flat),
+            "all": _variant_stats(fa, fb, cos, None),
         }
-        results = {v: _compare_features(feat_gt, feat_rd, m) for v, m in masks.items()}
-
         for path, _, _, key, variant in _BEV_SERIES:
-            log_scalar(rr, path, results[variant][0][key])
-            self._history[variant, key].append(results[variant][0][key])
+            value = stats[variant][key]
+            log_scalar(rr, path, value)
+            self._history[variant, key].append(value)
 
-        # Images: PCA-RGB over occupied cells + a cosine heatmap for each variant.
-        gt_rgb, rd_rgb = _pca_rgb(feat_gt, feat_rd, occupied)
+        # Images: PCA-RGB over occupied cells + a cosine heatmap per variant.
+        gt_rgb, rd_rgb = _pca_rgb(feat_gt, feat_rd, occ_flat.reshape(h, w))
         rr.log("bev/gt", rr.Image(gt_rgb))
         rr.log("bev/rendered", rr.Image(rd_rgb))
-        for variant, path in (
-            ("occupied", "bev/cosine_map"),
-            ("all", "bev/cosine_map_all"),
-        ):
-            cosine_map = results[variant][1]
-            heat = _colorize(((cosine_map + 1.0) * 0.5).cpu().numpy())
-            heat[~masks[variant].cpu().numpy()] = 0
-            rr.log(path, rr.Image(heat))
+        heat_all = _colorize(((cos.reshape(h, w) + 1.0) * 0.5).cpu().numpy())
+        heat_occ = heat_all.copy()
+        heat_occ[~occ_np] = 0
+        rr.log("bev/cosine_map", rr.Image(heat_occ))
+        rr.log("bev/cosine_map_all", rr.Image(heat_all))
 
         return {
-            "cos_occ": results["occupied"][0]["cosine"],
-            "cos_all": results["all"][0]["cosine"],
+            "cos_occ": stats["occupied"]["cosine"],
+            "cos_all": stats["all"]["cosine"],
         }
 
     def summarize(self) -> None:
         labels = {
             "cosine": "per-cell cosine",
-            "global_cosine": "global cosine ",
-            "rel_l2": "relative L2   ",
+            "global_cosine": "global cosine",
+            "rel_l2": "relative L2",
         }
-        for variant in ("occupied", "all"):
-            for key in ("cosine", "global_cosine", "rel_l2"):
+        for variant in _VARIANTS:
+            for key in _METRIC_KEYS:
                 summarize_series(
-                    f"bev {labels[key]} [{variant:8s}]", self._history[variant, key]
+                    f"bev {labels[key]:15s} [{variant:8s}]", self._history[variant, key]
                 )

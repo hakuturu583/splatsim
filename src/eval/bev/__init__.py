@@ -19,6 +19,6 @@ The backend is split so the pieces are independently testable / swappable:
 from __future__ import annotations
 
 from .config import BEVConfig
-from .encoder import BEVEncoder, build_bev_encoder
+from .encoder import BaseBEVEncoder, build_bev_encoder
 
-__all__ = ["BEVConfig", "BEVEncoder", "build_bev_encoder"]
+__all__ = ["BEVConfig", "BaseBEVEncoder", "build_bev_encoder"]

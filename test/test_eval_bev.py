@@ -99,32 +99,35 @@ def test_bev_config_grid_and_pitch():
 
 
 def test_compare_identical_features():
-    from eval.metrics.bev_encoder import _compare_features
+    from eval.metrics.bev_encoder import _per_cell_cosine, _variant_stats
 
     rng = np.random.default_rng(0)
     a = torch.from_numpy(rng.standard_normal((8, 6, 6)).astype(np.float32))
-    active = torch.ones((6, 6), dtype=torch.bool)
-    stats, cos_map = _compare_features(a, a.clone(), active)
+    fa, fb, cos = _per_cell_cosine(a, a.clone())
+    assert tuple(cos.shape) == (36,)  # H*W flat
+    active = torch.ones(36, dtype=torch.bool)
+    stats = _variant_stats(fa, fb, cos, active)
     assert stats["cosine"] == pytest.approx(1.0, abs=1e-5)
     assert stats["global_cosine"] == pytest.approx(1.0, abs=1e-5)
     assert stats["rel_l2"] == pytest.approx(0.0, abs=1e-6)
-    assert tuple(cos_map.shape) == (6, 6)
+    # active=None (all cells) matches the all-True mask.
+    assert _variant_stats(fa, fb, cos, None)["cosine"] == pytest.approx(1.0, abs=1e-5)
 
 
 def test_compare_orthogonal_and_scaled_features():
-    from eval.metrics.bev_encoder import _compare_features
+    from eval.metrics.bev_encoder import _per_cell_cosine, _variant_stats
 
     c, h, w = 4, 3, 3
     a = torch.zeros((c, h, w))
     b = torch.zeros((c, h, w))
     a[0] = 1.0  # channel-0 unit vectors
     b[1] = 1.0  # orthogonal channel-1 unit vectors
-    active = torch.ones((h, w), dtype=torch.bool)
-    stats, _ = _compare_features(a, b, active)
-    assert stats["cosine"] == pytest.approx(0.0, abs=1e-5)
+    fa, fb, cos = _per_cell_cosine(a, b)
+    assert _variant_stats(fa, fb, cos, None)["cosine"] == pytest.approx(0.0, abs=1e-5)
 
     # cosine is scale-invariant: scaling one map leaves per-cell cosine at 1.
-    stats2, _ = _compare_features(a, a * 5.0, active)
+    fa2, fb2, cos2 = _per_cell_cosine(a, a * 5.0)
+    stats2 = _variant_stats(fa2, fb2, cos2, None)
     assert stats2["cosine"] == pytest.approx(1.0, abs=1e-5)
     assert stats2["rel_l2"] > 0.0  # but L2 grows
 

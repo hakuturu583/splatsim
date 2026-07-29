@@ -60,6 +60,16 @@ class FrameData:
         """Static GT points inside the sim's range + FOV envelope."""
         return self.gt_xyz[self.gt_cover & ~self.gt_dynamic]
 
+    @cached_property
+    def gt_static_intensity(self) -> np.ndarray:
+        """GT intensity for the static (non-dynamic) points, row-aligned to xyz."""
+        return self.gt_intensity[~self.gt_dynamic]
+
+    @cached_property
+    def rd_static_intensity(self) -> np.ndarray:
+        """Rendered intensity for the static points, row-aligned to xyz."""
+        return self.rd_intensity[~self.rd_dynamic]
+
 
 def _dynamic_box_mask(pts_map: np.ndarray, boxes: list, margin: float) -> np.ndarray:
     """Boolean mask of ``pts_map`` (T4 map frame) lying inside any annotated box.

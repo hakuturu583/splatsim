@@ -27,14 +27,14 @@ The op<->spconv mapping (verified against spconv 2.3.8):
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 import torch
 from torch import nn
 
 from .config import BEVConfig
-from .voxelize import hard_voxelize
-
-_CONVERTERS_REGISTERED = False
+from .encoder import BaseBEVEncoder
 
 
 def _require_deps():
@@ -59,11 +59,9 @@ def _attr_map(node) -> dict:
     return out
 
 
+@functools.cache
 def _register_converters() -> None:
     """Register the two autoware sparse-conv ops as onnx2torch converters (once)."""
-    global _CONVERTERS_REGISTERED
-    if _CONVERTERS_REGISTERED:
-        return
     import spconv.pytorch.ops as spops
     from onnx2torch.node_converters.registry import add_converter
     from onnx2torch.utils.common import OnnxMapping, OperationConverterResult
@@ -160,48 +158,25 @@ def _register_converters() -> None:
             onnx_mapping=_mapping(node),
         )
 
-    _CONVERTERS_REGISTERED = True
 
-
-class SpconvBEVEncoder:
+class SpconvBEVEncoder(BaseBEVEncoder):
     """Runs ``oneplanner_bev_encoder.onnx`` via onnx2torch + spconv (no TensorRT)."""
 
     def __init__(self, onnx_path: str, cfg: BEVConfig, *, device: str = "cuda") -> None:
-        if not torch.cuda.is_available():
-            raise SystemExit("The spconv BEV backend requires a CUDA device.")
+        super().__init__(cfg, device)
         _require_deps()
         import onnx
         from onnx2torch import convert
 
-        # The graph's sparse ops use spatial_shape = [.., .., z], so voxel coords
-        # must be z-last; override the config's coors order for this backend.
-        self.cfg = cfg if cfg.coors_order == "xyz" else _with_coors_order(cfg, "xyz")
-        self.device = torch.device(device)
         _register_converters()
         print(f"[bev] converting {onnx_path} via onnx2torch + spconv (one-off)...")
         model = onnx.load(onnx_path)
         self.module = convert(model).to(self.device).eval()
         print("[bev] spconv BEV module ready")
 
-    @torch.no_grad()
-    def encode(self, points: np.ndarray) -> torch.Tensor:
-        """Voxelise + run the encoder. ``points`` (N, F) -> (C, H, W) on device."""
-        pts = torch.as_tensor(points, dtype=torch.float32, device=self.device)
-        voxels, num_points, coors = hard_voxelize(pts, self.cfg)
-        if voxels.shape[0] == 0:
-            h, w = self.cfg.bev_size
-            return torch.zeros(
-                (self.cfg.feature_channels, h, w),
-                dtype=torch.float32,
-                device=self.device,
-            )
-        out = self.module(voxels, num_points.to(torch.int32), coors.to(torch.int32))
+    def _run(self, voxels, num_points, coors) -> torch.Tensor:
+        # num_points / coors already come back int32 from hard_voxelize.
+        out = self.module(voxels, num_points, coors)
         if isinstance(out, (tuple, list)):
             out = out[0]
-        return out[0]  # drop batch -> (C, H, W)
-
-
-def _with_coors_order(cfg: BEVConfig, order: str) -> BEVConfig:
-    import dataclasses
-
-    return dataclasses.replace(cfg, coors_order=order)
+        return out[0]  # drop batch -> (C, H, W), still on device

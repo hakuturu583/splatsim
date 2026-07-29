@@ -21,11 +21,10 @@ import hashlib
 import os
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from .config import BEVConfig
-from .voxelize import hard_voxelize
+from .encoder import BaseBEVEncoder
 
 _INPUT_NAMES = ("voxels", "num_points_per_voxel", "coors")
 _OUTPUT_NAME = "bev_feature_map"
@@ -60,7 +59,7 @@ def _load_plugins(plugin_path: str, trt, logger) -> None:
     _LOADED_PLUGINS.add(real)
 
 
-class TensorRTBEVEncoder:
+class TensorRTBEVEncoder(BaseBEVEncoder):
     """Runs ``oneplanner_bev_encoder.onnx`` via TensorRT + autoware plugins."""
 
     def __init__(
@@ -74,10 +73,7 @@ class TensorRTBEVEncoder:
         fp16: bool = False,
         opt_voxels: int = 90000,
     ) -> None:
-        if not torch.cuda.is_available():
-            raise SystemExit("The BEV-encoder metric requires a CUDA device.")
-        self.cfg = cfg
-        self.device = torch.device(device)
+        super().__init__(cfg, device)
         self._onnx_path = onnx_path
         self._fp16 = fp16
         self._opt_voxels = opt_voxels
@@ -171,24 +167,7 @@ class TensorRTBEVEncoder:
                 f"engine has {sorted(names)}"
             )
 
-    @torch.no_grad()
-    def encode(self, points: np.ndarray) -> torch.Tensor:
-        """Voxelise + run the encoder.
-
-        ``points`` (N, F) -> (C, H, W) float32 tensor on ``self.device`` (kept
-        on-GPU so the metric's comparison avoids a host round-trip).
-        """
-        pts = torch.as_tensor(points, dtype=torch.float32, device=self.device)
-        voxels, num_points, coors = hard_voxelize(pts, self.cfg)
-        m = int(voxels.shape[0])
-        if m == 0:
-            h, w = self.cfg.bev_size
-            return torch.zeros(
-                (self.cfg.feature_channels, h, w),
-                dtype=torch.float32,
-                device=self.device,
-            )
-
+    def _run(self, voxels, num_points, coors) -> torch.Tensor:
         buffers = {
             "voxels": voxels.contiguous(),
             "num_points_per_voxel": num_points.contiguous(),

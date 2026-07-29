@@ -1,39 +1,57 @@
-"""The BEV-encoder interface + backend factory.
+"""The BEV-encoder base class + backend factory.
 
-A backend maps a raw point cloud to a BEV feature map. Only the TensorRT backend
-is implemented (the ONNX needs the ``autoware_tensorrt_plugins`` sparse-conv
-ops), but the indirection keeps the metric backend-agnostic and leaves room for
-an spconv/PyTorch backend later.
+A backend maps a raw point cloud to a BEV feature map. Two run the same ONNX:
+``spconv`` (onnx2torch + spconv) and ``tensorrt`` (autoware plugins). The shared
+:class:`BaseBEVEncoder` owns the scaffolding common to both -- CUDA guard, the
+voxelise + empty-cloud preamble of :meth:`~BaseBEVEncoder.encode` -- so each
+backend implements only its engine/module build and :meth:`_run`.
 """
 
 from __future__ import annotations
 
+import abc
 import os
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+import numpy as np
+import torch
 
 from .config import BEVConfig
-
-if TYPE_CHECKING:
-    import numpy as np
-    import torch
+from .voxelize import hard_voxelize
 
 
-@runtime_checkable
-class BEVEncoder(Protocol):
-    """Maps an (N, F) point cloud to a (C, H, W) BEV feature map."""
+class BaseBEVEncoder(abc.ABC):
+    """Maps an (N, F) point cloud to a (C, H, W) BEV feature map on the GPU."""
 
-    cfg: BEVConfig
+    def __init__(self, cfg: BEVConfig, device: str = "cuda") -> None:
+        if not torch.cuda.is_available():
+            raise SystemExit("The BEV-encoder metric requires a CUDA device.")
+        self.cfg = cfg
+        self.device = torch.device(device)
 
-    def encode(self, points: "np.ndarray") -> "torch.Tensor":
-        """Run the encoder. ``points`` is (N, F); returns a (C, H, W) tensor.
+    @torch.no_grad()
+    def encode(self, points: np.ndarray) -> torch.Tensor:
+        """Voxelise ``points`` (N, F) and run the encoder -> (C, H, W) on device."""
+        pts = torch.as_tensor(points, dtype=torch.float32, device=self.device)
+        voxels, num_points, coors = hard_voxelize(pts, self.cfg)
+        if voxels.shape[0] == 0:
+            return self._empty_bev()
+        return self._run(voxels, num_points, coors)
 
-        The feature map is returned on the encoder's CUDA device so downstream
-        comparison can stay on the GPU without a host round-trip.
-        """
-        ...
+    def _empty_bev(self) -> torch.Tensor:
+        """Zero BEV map for an empty cloud (no points survived voxelisation)."""
+        h, w = self.cfg.bev_size
+        return torch.zeros(
+            (self.cfg.feature_channels, h, w), dtype=torch.float32, device=self.device
+        )
+
+    @abc.abstractmethod
+    def _run(
+        self, voxels: torch.Tensor, num_points: torch.Tensor, coors: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the backend on the voxelised inputs -> (C, H, W) feature map."""
 
 
-def build_bev_encoder(args, cfg: BEVConfig | None = None) -> BEVEncoder:
+def build_bev_encoder(args, cfg: BEVConfig | None = None) -> BaseBEVEncoder:
     """Instantiate the BEV encoder backend selected by ``args.bev_backend``.
 
     Two backends run the same encoder ONNX:

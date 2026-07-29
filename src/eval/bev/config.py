@@ -17,9 +17,10 @@ class BEVConfig:
     """Voxelisation + output geometry for the BEV encoder.
 
     ``coors_order`` selects the axis order of the ``coors`` tensor fed to the
-    ONNX. The sparse encoder's ``sparse_shape`` is ``(z, y, x)``, so the deployed
-    graph expects ``"zyx"``; exposed as a knob only because it is the single
-    convention most likely to differ between exports.
+    ONNX. The graph's ``spatial_shape`` attribute is ``[1440, 1440, 41]`` (z last),
+    so the coordinates must be z-last -> ``"xyz"``. This is a property of the ONNX,
+    not of the backend, so both backends use it; exposed as a knob only because it
+    is the single convention most likely to differ between exports.
     """
 
     point_cloud_range: tuple[float, float, float, float, float, float] = (
@@ -35,7 +36,7 @@ class BEVConfig:
     max_voxels: int = 160000
     num_point_features: int = 5  # x, y, z, intensity, time_lag
     use_intensity: bool = True
-    coors_order: str = "zyx"
+    coors_order: str = "xyz"
     feature_channels: int = 512
     bev_size: tuple[int, int] = (180, 180)
 
