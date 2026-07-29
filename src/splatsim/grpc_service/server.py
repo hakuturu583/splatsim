@@ -18,6 +18,8 @@ from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
 from splatsim.cyclonedds.msg_types import Time
 from splatsim.cyclonedds.pointcloud2_publisher import PointCloud2Publisher
 from splatsim.dataclass.lidar_config import LidarConfig, sensor_defaults
+from splatsim.dataclass.lod_config import LodConfig
+from splatsim.lod import LodManager
 from splatsim.grpc_service._generated import (
     rendering_service_pb2 as pb2,
     rendering_service_pb2_grpc as pb2_grpc,
@@ -84,14 +86,30 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 device = torch.device(request.device or "cuda")
                 self._device = device
 
+                # Build the LoD manager unconditionally so the octree LoD
+                # index is pre-computed at load time, letting SetLod toggle LoD
+                # on/off at runtime without re-loading the scene. This is also
+                # what makes LoD active by default in the Docker / gRPC path,
+                # which loads scenes directly rather than via Scene.from_config.
+                lod_manager = LodManager(LodConfig())
+
                 logger.info("Loading scene: %s", request.scene_path)
                 background = Background(
                     request.scene_path,
                     device=device,
                     use_sh=request.use_sh,
+                    lod_manager=lod_manager,
                 )
-                self._scene = Scene(background=background)
-                logger.info("Scene loaded: %d Gaussians", background.num_gaussians)
+                # Scene enables LoD by default whenever a manager is present;
+                # only an explicit enable_lod=false overrides that initial state.
+                self._scene = Scene(background=background, lod_manager=lod_manager)
+                if request.HasField("enable_lod"):
+                    self._scene.lod_enabled = request.enable_lod
+                logger.info(
+                    "Scene loaded: %d Gaussians (LoD %s)",
+                    background.num_gaussians,
+                    "on" if self._scene.lod_enabled else "off",
+                )
 
                 intr = request.intrinsics
                 bg = request.background_color
@@ -164,6 +182,42 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             except Exception as exc:
                 logger.exception("Initialize failed")
                 return pb2.InitializeResponse(success=False, message=str(exc))
+
+    def SetLod(
+        self,
+        request: pb2.SetLodRequest,
+        context: grpc.ServicerContext,
+    ) -> pb2.SetLodResponse:
+        """Toggle Level-of-Detail filtering on the loaded scene at runtime.
+
+        The render loop reads ``scene.lod_enabled`` per frame, so the new
+        state takes effect on the next rendered frame. Enabling has no effect
+        when the scene carries no pre-computed LoD index (the setter guards on
+        the manager), in which case ``enabled`` in the response reflects the
+        actual — still off — state.
+        """
+        with self._lock:
+            if not self._initialized or self._scene is None:
+                return pb2.SetLodResponse(
+                    success=False,
+                    enabled=False,
+                    message="Scene not initialized. Call Initialize first.",
+                )
+            self._scene.lod_enabled = request.enabled
+            effective = self._scene.lod_enabled
+            logger.info(
+                "SetLod: requested=%s effective=%s",
+                request.enabled,
+                effective,
+            )
+            message = ""
+            if request.enabled and not effective:
+                message = "LoD unavailable: no LoD index pre-computed for this scene."
+            return pb2.SetLodResponse(
+                success=True,
+                enabled=effective,
+                message=message,
+            )
 
     def StreamCameraData(
         self,

@@ -179,9 +179,10 @@ include = ["src/scenarios/**"]
 unresolved-import = "ignore"
 
 # Generated protobuf/gRPC stubs are produced at build time and gitignored,
-# so they are absent during CI type-checking.
+# so they are absent during CI type-checking. This also covers tests that
+# import those stubs (e.g. test_grpc_lod.py's rendering_service_pb2 import).
 [[tool.ty.overrides]]
-include = ["src/splatsim/grpc_service/**"]
+include = ["src/splatsim/grpc_service/**", "test/test_grpc_lod.py"]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
 
