@@ -143,6 +143,65 @@ Packets are encoded with `torch` directly from the rendered range image, so when
 the renderer runs on CUDA the entire encode stays on the GPU and only the packed
 byte buffer crosses to the host (once per frame) for the UDP send.
 
+## LiDAR evaluation
+
+`src/eval` scores the LiDAR the simulator renders from a reconstructed `.usdz`
+scene against the ground-truth LiDAR of the matching WebAuto / T4 dataset, at the
+same ego pose, and logs everything to a single [Rerun](https://rerun.io) `.rrd`
+(both point clouds + every metric's time series on a shared timeline). It is a
+small metric-plugin framework — each evaluation item is its own class under
+`src/eval/metrics/` implementing `LidarEvalMetric`, so the per-frame render/mask
+happens once and is shared across metrics:
+
+- **`chamfer`** — symmetric Chamfer distance (raw + range-aware), in metres.
+- **`bev`** — OnePlanner **BEV-encoder** feature similarity: both clouds are
+  pushed through the BEV encoder and the resulting `[512, 180, 180]`
+  bird's-eye-view feature maps are compared (per-cell / global cosine, relative
+  L2). A shared-basis PCA(512→3) RGB view of each map and a cosine heatmap are
+  logged as images so the learned representations can be compared by eye. This
+  answers *"would a downstream planner perceive the reconstructed scene the same
+  way it perceives the real one?"* rather than raw geometric distance.
+
+```bash
+uv sync --extra eval                       # chamfer metric (t4-devkit + rerun)
+uv run python -m eval.eval_lidar \
+    --scene scene.usdz --data-root ~/.webauto/datasets --dataset-id <id> \
+    --metrics chamfer --output outputs/eval_lidar.rrd
+```
+
+### BEV-encoder metric
+
+The BEV encoder is the LiDAR branch of OnePlanner's BEVFusion, shipped as
+`oneplanner_bev_encoder.onnx`. Its ONNX embeds `autoware` sparse-convolution
+custom ops (`GetIndicePairsImplicitGemm` / `ImplicitGemm`) that **plain
+`onnxruntime` cannot execute** — their implementation lives only in the
+`autoware_tensorrt_plugins` (which wrap [spconv](https://github.com/traveller59/spconv)).
+Two backends run the ONNX:
+
+- **`spconv` (default).** `onnx2torch` converts the whole graph to a
+  `torch.nn.Module` and loads all weights from the ONNX; the two custom ops are
+  supplied by `spconv` (the same library the plugins wrap) via lightweight
+  converters. Pure-pip and CUDA-aligned with the project's torch — no TensorRT,
+  no plugin `.so`, no version matching. This is the recommended path.
+- **`tensorrt` (`--bev-backend tensorrt`).** Loads the `autoware_tensorrt_plugins`
+  `.so`, builds (and disk-caches) a TensorRT engine, and runs inference using
+  torch tensors as the CUDA buffers. The production path, but its `tensorrt`
+  wheel + CUDA must match the prebuilt plugin's `libnvinfer` (here the plugin
+  links `libnvinfer.so.10`, TensorRT 10.16.1), so install a matching `tensorrt`
+  yourself and pass `--bev-plugins`.
+
+```bash
+uv sync --extra eval --extra bev           # onnx2torch + spconv (default backend)
+export ONEPLANNER_BEV_ONNX=/path/to/oneplanner_bev_encoder.onnx
+uv run python -m eval.eval_lidar \
+    --scene scene.usdz --data-root ~/.webauto/datasets --dataset-id <id> \
+    --metrics chamfer,bev --output outputs/eval_lidar.rrd
+```
+
+The encoder ONNX is an environment-specific artifact supplied via `--bev-onnx`
+(or `$ONEPLANNER_BEV_ONNX`) rather than vendored. `spconv-cu126` pairs
+`cumm-cu126` (CUDA 12.6 wheels, compatible with the CUDA 12.8 torch here).
+
 ## Development
 
 ```bash

@@ -37,16 +37,35 @@ carla = [
     "python-dotenv>=1.0.0",
     "pyproj>=3.7.1",
 ]
-# Ground-truth LiDAR evaluation (src/eval/eval_lidar.py). Pulls a local
-# WebAuto / T4 dataset via t4-devkit for the GT trajectory + GT LiDAR scans,
-# and Rerun for logging the point clouds and Chamfer-distance time series to
-# an .rrd. Kept optional so the core simulator install stays lean.
+# Ground-truth LiDAR evaluation (src/eval, run as `python -m eval.eval_lidar`).
+# Pulls a local WebAuto / T4 dataset via t4-devkit for the GT trajectory + GT
+# LiDAR scans, and Rerun for logging the point clouds + per-metric time series
+# to an .rrd. Kept optional so the core simulator install stays lean. This
+# extra covers the geometric (`chamfer`) metric; the learned-representation
+# (`bev`) metric additionally needs the `bev` extra below.
 # t4-devkit is pinned to the v0.7.1 tag via [tool.uv.sources] (not published to
 # PyPI); rerun-sdk is a normal PyPI dep. Floor is 0.23 (unified set_time /
 # Scalars / SeriesLines API) within t4-devkit's supported <0.28 range.
 eval = [
     "t4-devkit",
     "rerun-sdk>=0.23,<0.28",
+]
+# BEV-encoder metric (src/eval/bev, src/eval/metrics/bev_encoder.py). The
+# OnePlanner BEV-encoder ONNX embeds `autoware` sparse-conv custom ops
+# (GetIndicePairsImplicitGemm / ImplicitGemm) that plain onnxruntime cannot run.
+# The default `spconv` backend converts the ONNX to a torch module with
+# onnx2torch and supplies those two ops via spconv (the exact library the
+# autoware_tensorrt_plugins wrap) -- pure-pip and CUDA-aligned with the project's
+# torch. spconv-cu126 pairs cumm-cu126 (CUDA 12.6 wheels, compatible with the
+# CUDA 12.8 torch here). The encoder ONNX is an environment-specific artifact
+# passed via --bev-onnx (or $ONEPLANNER_BEV_ONNX).
+# The alternative `--bev-backend tensorrt` (autoware plugin .so) additionally
+# needs a `tensorrt` wheel matching the plugin's libnvinfer; install it yourself
+# (e.g. `uv pip install "tensorrt-cu12"`), it is intentionally not pinned here.
+bev = [
+    "onnx>=1.16",
+    "onnx2torch>=1.5",
+    "spconv-cu126>=2.3,<2.4",
 ]
 all = [
     "splatsim[gui,carla]",
