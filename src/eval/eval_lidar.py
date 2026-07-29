@@ -222,6 +222,15 @@ def build_parser() -> argparse.ArgumentParser:
         "before scoring (default: on; --no-mask-dynamic to score raw clouds).",
     )
     ev.add_argument(
+        "--mask-occluded",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also drop points sitting in a dynamic object's occlusion shadow "
+        "(behind the box along the sensor ray) -- the GT sensor is blind there, "
+        "so the static reconstruction should not be scored against it (default: "
+        "on; --no-mask-occluded to keep shadowed points).",
+    )
+    ev.add_argument(
         "--dynamic-margin",
         type=float,
         default=0.25,

@@ -40,35 +40,51 @@ class FrameData:
     rd_intensity: np.ndarray
     gt_dynamic: np.ndarray
     rd_dynamic: np.ndarray
+    gt_occluded: np.ndarray
+    rd_occluded: np.ndarray
     gt_cover: np.ndarray
     base_to_world: np.ndarray
     boxes: tuple[np.ndarray, np.ndarray, np.ndarray]
 
+    # A point is *excluded* from scoring if it is a dynamic-object return OR sits
+    # in a dynamic object's occlusion shadow (behind the box along the sensor
+    # ray): GT is blind there, so the static reconstruction must not be scored
+    # against geometry the real sensor could never have seen.
+    @cached_property
+    def gt_keep(self) -> np.ndarray:
+        """Boolean mask of GT points kept for scoring (static, unoccluded)."""
+        return ~(self.gt_dynamic | self.gt_occluded)
+
+    @cached_property
+    def rd_keep(self) -> np.ndarray:
+        """Boolean mask of rendered points kept for scoring (static, unoccluded)."""
+        return ~(self.rd_dynamic | self.rd_occluded)
+
     # Masked subsets every metric shares, gathered once (cached on first access).
     @cached_property
     def gt_static_xyz(self) -> np.ndarray:
-        """GT points with dynamic-object returns removed."""
-        return self.gt_xyz[~self.gt_dynamic]
+        """GT points with dynamic-object and occlusion-shadow returns removed."""
+        return self.gt_xyz[self.gt_keep]
 
     @cached_property
     def rd_static_xyz(self) -> np.ndarray:
-        """Rendered points with dynamic-box returns removed."""
-        return self.rd_xyz[~self.rd_dynamic]
+        """Rendered points with dynamic-box and occlusion-shadow returns removed."""
+        return self.rd_xyz[self.rd_keep]
 
     @cached_property
     def gt_ranged_xyz(self) -> np.ndarray:
         """Static GT points inside the sim's range + FOV envelope."""
-        return self.gt_xyz[self.gt_cover & ~self.gt_dynamic]
+        return self.gt_xyz[self.gt_cover & self.gt_keep]
 
     @cached_property
     def gt_static_intensity(self) -> np.ndarray:
-        """GT intensity for the static (non-dynamic) points, row-aligned to xyz."""
-        return self.gt_intensity[~self.gt_dynamic]
+        """GT intensity for the kept (static, unoccluded) points, row-aligned to xyz."""
+        return self.gt_intensity[self.gt_keep]
 
     @cached_property
     def rd_static_intensity(self) -> np.ndarray:
-        """Rendered intensity for the static points, row-aligned to xyz."""
-        return self.rd_intensity[~self.rd_dynamic]
+        """Rendered intensity for the kept points, row-aligned to xyz."""
+        return self.rd_intensity[self.rd_keep]
 
 
 def _dynamic_box_mask(pts_map: np.ndarray, boxes: list, margin: float) -> np.ndarray:
@@ -96,6 +112,64 @@ def _dynamic_box_mask(pts_map: np.ndarray, boxes: list, margin: float) -> np.nda
         local = (pts_map - center) @ rot  # R^T (p - c): map -> box-local
         inside |= np.all(np.abs(local) <= half, axis=1)
     return inside
+
+
+def _occlusion_mask(
+    pts_map: np.ndarray,
+    origin: np.ndarray,
+    boxes: list,
+    margin: float,
+    eps: float = 0.1,
+) -> np.ndarray:
+    """Boolean mask of ``pts_map`` points sitting in a dynamic box's shadow.
+
+    A spinning LiDAR cannot see *through* a dynamic object: everything behind the
+    object along the same ray is occluded, so the GT scan has no returns there.
+    The static reconstruction has no such object, so its rays pass straight
+    through and paint the background behind -- points the real sensor could never
+    have observed. Scoring them would penalise the reconstruction for geometry
+    that is simply invisible in the GT, so they are dropped from both clouds.
+
+    A point is flagged when the ray from the sensor ``origin`` (T4 map frame) to
+    the point enters an annotated box *before* reaching the point, i.e. the box
+    lies between the sensor and the point (points strictly inside a box are also
+    flagged, but those are already caught by :func:`_dynamic_box_mask`). This is a
+    per-ray slab/OBB intersection. ``origin`` is taken as base_link (the ego
+    reference), an approximation of the true per-beam mount that is adequate
+    because the shadow is dominated by azimuth.
+    """
+    occluded = np.zeros(pts_map.shape[0], dtype=bool)
+    if pts_map.shape[0] == 0 or not boxes:
+        return occluded
+    rel = pts_map - origin
+    rng = np.linalg.norm(rel, axis=1)
+    safe = rng > 1e-6
+    dirs = np.zeros_like(rel)
+    dirs[safe] = rel[safe] / rng[safe, None]  # unit ray directions
+    for box in boxes:
+        center = np.asarray(box.position, dtype=np.float64)
+        rot = np.asarray(box.rotation.rotation_matrix, dtype=np.float64)  # local->map
+        width, length, height = (float(v) for v in box.shape.size)
+        half = np.array([length, width, height], dtype=np.float64) / 2.0 + margin
+        o_local = (origin - center) @ rot  # sensor in box-local frame
+        d_local = dirs @ rot  # ray directions in box-local frame
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inv = 1.0 / d_local
+            t1 = (-half - o_local) * inv
+            t2 = (half - o_local) * inv
+        t_lo = np.minimum(t1, t2)
+        t_hi = np.maximum(t1, t2)
+        # Rays parallel to a slab (d_local ~ 0) hit that slab for all t iff the
+        # sensor is already within it, else never.
+        parallel = np.abs(d_local) < 1e-9
+        inside = np.abs(o_local) <= half  # (3,), same for every point
+        t_lo = np.where(parallel, np.where(inside, -np.inf, np.inf), t_lo)
+        t_hi = np.where(parallel, np.where(inside, np.inf, -np.inf), t_hi)
+        t_near = np.max(t_lo, axis=1)
+        t_far = np.min(t_hi, axis=1)
+        hit = (t_near <= t_far) & (t_far > eps)
+        occluded |= hit & (t_near < rng - eps) & safe
+    return occluded
 
 
 def _world_boxes(
@@ -189,19 +263,27 @@ def eval_frame(ctx: EvalContext, sample, index: int) -> FrameData:
         rd_intensity = np.empty((0,), np.float32)
 
     # Dynamic-object masking: drop GT and rendered points inside the frame's
-    # annotated 3D boxes (a static scene cannot reproduce moving objects). Boxes
-    # come back in the T4 map frame, so test the clouds there.
-    boxes = ctx.t4.get_box3ds(sd.token) if args.mask_dynamic else []
+    # annotated 3D boxes (a static scene cannot reproduce moving objects), plus --
+    # when occlusion masking is on -- the points sitting in each box's shadow
+    # (behind it along the sensor ray), which the GT sensor could never observe.
+    # Boxes come back in the T4 map frame, so test the clouds there.
+    need_boxes = args.mask_dynamic or args.mask_occluded
+    boxes = ctx.t4.get_box3ds(sd.token) if need_boxes else []
+
+    gt_dynamic = np.zeros(gt_base.shape[0], dtype=bool)
+    rd_dynamic = np.zeros(rd_base.shape[0], dtype=bool)
+    gt_occluded = np.zeros(gt_base.shape[0], dtype=bool)
+    rd_occluded = np.zeros(rd_base.shape[0], dtype=bool)
     if boxes:
-        gt_dynamic = _dynamic_box_mask(
-            transform(ego_in_map, gt_base), boxes, args.dynamic_margin
-        )
-        rd_dynamic = _dynamic_box_mask(
-            transform(ego_in_map, rd_base), boxes, args.dynamic_margin
-        )
-    else:
-        gt_dynamic = np.zeros(gt_base.shape[0], dtype=bool)
-        rd_dynamic = np.zeros(rd_base.shape[0], dtype=bool)
+        gt_map = transform(ego_in_map, gt_base)
+        rd_map = transform(ego_in_map, rd_base)
+        if args.mask_dynamic:
+            gt_dynamic = _dynamic_box_mask(gt_map, boxes, args.dynamic_margin)
+            rd_dynamic = _dynamic_box_mask(rd_map, boxes, args.dynamic_margin)
+        if args.mask_occluded:
+            origin = ego_in_map[:3, 3].astype(np.float64)
+            gt_occluded = _occlusion_mask(gt_map, origin, boxes, args.dynamic_margin)
+            rd_occluded = _occlusion_mask(rd_map, origin, boxes, args.dynamic_margin)
 
     gt_cover = coverage_mask(gt_base, ctx.lidars)
 
@@ -214,6 +296,8 @@ def eval_frame(ctx: EvalContext, sample, index: int) -> FrameData:
         rd_intensity=rd_intensity,
         gt_dynamic=gt_dynamic,
         rd_dynamic=rd_dynamic,
+        gt_occluded=gt_occluded,
+        rd_occluded=rd_occluded,
         gt_cover=gt_cover,
         base_to_world=base_to_world.cpu().numpy(),
         boxes=_world_boxes(ctx, boxes),
