@@ -15,6 +15,7 @@ GT_COLOR = (80, 200, 120)  # GT, in-range static
 RENDER_COLOR = (255, 130, 40)  # rendered static
 DYNAMIC_COLOR = (230, 60, 60)  # GT dynamic / dynamic boxes
 RENDER_DYNAMIC_COLOR = (150, 40, 40)  # rendered points inside a dynamic box
+OCCLUDED_COLOR = (170, 90, 200)  # points in a dynamic object's occlusion shadow
 OUT_OF_RANGE_COLOR = (120, 120, 120)  # GT outside the sim envelope
 TRAJ_COLOR = (120, 160, 255)  # ego trajectory
 

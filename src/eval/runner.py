@@ -18,6 +18,7 @@ from .metrics import build_metrics
 from .rerun_io import (
     DYNAMIC_COLOR,
     GT_COLOR,
+    OCCLUDED_COLOR,
     OUT_OF_RANGE_COLOR,
     RENDER_COLOR,
     RENDER_DYNAMIC_COLOR,
@@ -31,35 +32,47 @@ def _log_geometry(rr, frame: FrameData, radius: float) -> None:
     b2w = frame.base_to_world
     gt_world = transform(b2w, frame.gt_xyz)
     rd_world = transform(b2w, frame.rd_xyz)
-    static_gt = ~frame.gt_dynamic
+    gt_keep = frame.gt_keep
     cover = frame.gt_cover
+    # Occlusion-shadow points shown on their own (not double-counted as dynamic).
+    gt_shadow = frame.gt_occluded & ~frame.gt_dynamic
+    rd_shadow = frame.rd_occluded & ~frame.rd_dynamic
 
     # GT: dynamic (red, masked out), static in-range (green, scored by ranged),
-    # static out-of-range (grey, only the raw metric counts it).
+    # static out-of-range (grey, only the raw metric counts it), shadow (purple).
     rr.log(
         "world/gt_dynamic",
         rr.Points3D(gt_world[frame.gt_dynamic], colors=DYNAMIC_COLOR, radii=radius),
     )
     rr.log(
+        "world/gt_occluded",
+        rr.Points3D(gt_world[gt_shadow], colors=OCCLUDED_COLOR, radii=radius),
+    )
+    rr.log(
         "world/gt_lidar",
-        rr.Points3D(gt_world[cover & static_gt], colors=GT_COLOR, radii=radius),
+        rr.Points3D(gt_world[cover & gt_keep], colors=GT_COLOR, radii=radius),
     )
     rr.log(
         "world/gt_out_of_range",
         rr.Points3D(
-            gt_world[~cover & static_gt], colors=OUT_OF_RANGE_COLOR, radii=radius
+            gt_world[~cover & gt_keep], colors=OUT_OF_RANGE_COLOR, radii=radius
         ),
     )
-    # Rendered: static (orange, scored) vs fell-in-a-dynamic-box (dark red).
+    # Rendered: static (orange, scored), fell-in-a-dynamic-box (dark red), or in a
+    # dynamic object's occlusion shadow (purple, dropped as GT-invisible).
     rr.log(
         "world/rendered_lidar",
-        rr.Points3D(rd_world[~frame.rd_dynamic], colors=RENDER_COLOR, radii=radius),
+        rr.Points3D(rd_world[frame.rd_keep], colors=RENDER_COLOR, radii=radius),
     )
     rr.log(
         "world/rendered_dynamic",
         rr.Points3D(
             rd_world[frame.rd_dynamic], colors=RENDER_DYNAMIC_COLOR, radii=radius
         ),
+    )
+    rr.log(
+        "world/rendered_occluded",
+        rr.Points3D(rd_world[rd_shadow], colors=OCCLUDED_COLOR, radii=radius),
     )
     centers, half_sizes, quats = frame.boxes
     rr.log(
@@ -117,10 +130,12 @@ def run(args) -> None:
         print(
             f"  [{i + 1}/{len(selected)}] t={frame.seconds:.2f}s "
             f"gt={frame.gt_xyz.shape[0]:>7d} "
-            f"({int((frame.gt_cover & ~frame.gt_dynamic).sum())} in-range, "
-            f"{int(frame.gt_dynamic.sum())} dynamic) "
+            f"({int((frame.gt_cover & frame.gt_keep).sum())} in-range, "
+            f"{int(frame.gt_dynamic.sum())} dynamic, "
+            f"{int((frame.gt_occluded & ~frame.gt_dynamic).sum())} shadow) "
             f"render={frame.rd_xyz.shape[0]:>7d} "
-            f"({int(frame.rd_dynamic.sum())} dynamic) | {metric_str}"
+            f"({int(frame.rd_dynamic.sum())} dynamic, "
+            f"{int((frame.rd_occluded & ~frame.rd_dynamic).sum())} shadow) | {metric_str}"
         )
 
     # The full ego path is logged once (static) rather than re-serialising the
