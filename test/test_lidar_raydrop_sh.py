@@ -217,13 +217,12 @@ def _concat(sh_list, counts):
 
 
 def test_concat_raydrop_sh_scalar_only_when_no_group_has_bands() -> None:
-    assert _concat([None, None], [2, 3]) == (None, 0)
+    assert _concat([None, None], [2, 3]) is None
 
 
 def test_concat_raydrop_sh_pads_scalar_only_groups_with_zeros() -> None:
     bands = torch.ones(2, 3)
-    out, degree = _concat([bands, None], [2, 3])
-    assert degree == 1
+    out = _concat([bands, None], [2, 3])
     assert out is not None and out.shape == (5, 3)
     # First group keeps its bands; the scalar-only group is zero-padded.
     assert torch.equal(out[:2], bands)
@@ -251,10 +250,10 @@ class _FakeScene:
 
 
 @cuda
-def test_eval_degree0_returns_scalar_unchanged() -> None:
+def test_eval_no_bands_returns_scalar_unchanged() -> None:
     means = torch.randn(5, 3, device="cuda")
     logit = torch.randn(5, device="cuda")
-    out = _eval_view_dependent_raydrop(means, means[0], logit, None, 0)
+    out = _eval_view_dependent_raydrop(means, means[0], logit, None)
     assert torch.equal(out, logit)
 
 
@@ -265,9 +264,7 @@ def test_eval_zero_bands_reproduces_scalar() -> None:
     means = torch.randn(6, 3, device="cuda")
     logit = torch.randn(6, device="cuda")
     sh = torch.zeros(6, 3, device="cuda")  # degree 1, all-zero higher bands
-    out = _eval_view_dependent_raydrop(
-        means, torch.zeros(3, device="cuda"), logit, sh, 1
-    )
+    out = _eval_view_dependent_raydrop(means, torch.zeros(3, device="cuda"), logit, sh)
     assert torch.allclose(out, logit, atol=1e-4)
 
 
@@ -279,13 +276,13 @@ def test_eval_is_view_dependent() -> None:
     logit = torch.zeros(1, device="cuda")
     sh = torch.tensor([[1.0, 0.0, 0.0]], device="cuda")  # band-1 (m=-1, y) active
     front = _eval_view_dependent_raydrop(
-        mean, torch.tensor([0.0, -5.0, 0.0], device="cuda"), logit, sh, 1
+        mean, torch.tensor([0.0, -5.0, 0.0], device="cuda"), logit, sh
     )
     back = _eval_view_dependent_raydrop(
-        mean, torch.tensor([0.0, 15.0, 0.0], device="cuda"), logit, sh, 1
+        mean, torch.tensor([0.0, 15.0, 0.0], device="cuda"), logit, sh
     )
     assert not torch.allclose(front, back, atol=1e-3)
-    # Band-0 basis is 1/_SH_C0 * _SH_C0 = 1, so the average across opposite rays
+    # Band-0 basis is 1/SH_C0 * SH_C0 = 1, so the average across opposite rays
     # stays near the scalar (0 here) — the higher band is a pure view delta.
     assert abs(float(front + back) / 2.0) < 1.0
 

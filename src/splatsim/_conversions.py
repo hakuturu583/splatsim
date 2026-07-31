@@ -8,7 +8,7 @@ from torch import Tensor
 
 import spz
 
-SH_C0 = 0.2820947917738781  # 1 / (2 * sqrt(pi))
+SH_C0 = 0.28209479177387814  # 1 / (2 * sqrt(pi))
 
 
 @dataclass
