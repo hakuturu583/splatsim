@@ -35,6 +35,14 @@ class GaussianTensors:
     # with old 2-channel sidecars). Consumed only by the LiDAR renderer; the
     # RGB/camera path ignores it.
     lidar_mask: Tensor | None = None  # [N] bool; True = participates in LiDAR
+    # Optional per-Gaussian view-dependent (spherical-harmonics) raydrop bands.
+    # Emitted by 3dgs_io >= v1.2.0 as the sidecar's `raydrop_sh` trailing block:
+    # the *higher-order* SH bands only (`[N, (deg+1)**2 - 1]`), while the band-0
+    # (DC) term stays in the scalar `raydrop_logit`. The LiDAR renderer evaluates
+    # these at each Gaussian's sensor-view direction (exactly like colour SH) to
+    # get a view-dependent raydrop logit. ``None`` means no higher bands, i.e.
+    # the scalar `raydrop_logit` is used directly (backward compatible).
+    raydrop_sh: Tensor | None = None  # [N, (deg+1)**2 - 1] higher-order SH bands
 
     def __getitem__(self, idx: Tensor | slice) -> GaussianTensors:
         """Return a new instance with all tensor fields indexed/sliced by *idx*."""
@@ -52,6 +60,7 @@ class GaussianTensors:
             if self.raydrop_logit is None
             else self.raydrop_logit[idx],
             lidar_mask=None if self.lidar_mask is None else self.lidar_mask[idx],
+            raydrop_sh=None if self.raydrop_sh is None else self.raydrop_sh[idx],
         )
 
 
@@ -199,4 +208,7 @@ def apply_rigid_transform(
         intensity_raw=tensors.intensity_raw,
         raydrop_logit=tensors.raydrop_logit,
         lidar_mask=tensors.lidar_mask,
+        # SH raydrop coefficients are carried through unchanged, mirroring how
+        # `colors` (the colour SH coefficients) are left un-rotated here.
+        raydrop_sh=tensors.raydrop_sh,
     )

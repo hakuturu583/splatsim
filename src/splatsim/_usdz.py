@@ -149,6 +149,19 @@ def load_spz_scene(
                             f"{usdz_path}: LiDAR sidecar count does not match {name}"
                         )
                     tensors.lidar_mask = torch.as_tensor(mask, device=device) > 0.5
+                # Optional view-dependent (SH) raydrop bands (3dgs_io >= v1.2.0,
+                # version-2 sidecar). Shape (num_points, (deg+1)**2 - 1): the
+                # higher-order bands only; the DC term is in lidar_raydrop_logit.
+                # Absent for version-1 sidecars → leave None (scalar raydrop).
+                raydrop_sh = attrs.get("raydrop_sh")
+                if raydrop_sh is not None:
+                    if raydrop_sh.shape[0] != cloud.num_points:
+                        raise ValueError(
+                            f"{usdz_path}: LiDAR sidecar count does not match {name}"
+                        )
+                    tensors.raydrop_sh = torch.from_numpy(
+                        np.ascontiguousarray(raydrop_sh)
+                    ).to(device)
             tensor_list.append(tensors)
 
     if not tensor_list:
@@ -542,6 +555,9 @@ def _concat_tensors(tensors: list[GaussianTensors]) -> GaussianTensors:
     intensity_raw = _cat_optional(tensors, "intensity_raw")
     raydrop_logit = _cat_optional(tensors, "raydrop_logit")
     lidar_mask = _cat_optional(tensors, "lidar_mask")
+    # SH raydrop bands concatenate all-or-nothing like the other LiDAR fields;
+    # torch.cat additionally enforces a consistent SH degree across chunks.
+    raydrop_sh = _cat_optional(tensors, "raydrop_sh")
     return GaussianTensors(
         means=torch.cat([t.means for t in tensors], dim=0),
         quats=torch.cat([t.quats for t in tensors], dim=0),
@@ -552,4 +568,5 @@ def _concat_tensors(tensors: list[GaussianTensors]) -> GaussianTensors:
         intensity_raw=intensity_raw,
         raydrop_logit=raydrop_logit,
         lidar_mask=lidar_mask,
+        raydrop_sh=raydrop_sh,
     )

@@ -423,6 +423,61 @@ def build_lidar_sensors_from_config(cfg_sensors) -> list[LidarSensorSpec]:
 # sigmoid(-6.0) ≈ 0.0025 → very low drop probability.
 DEFAULT_RAYDROP_LOGIT: float = -6.0
 
+# SH band-0 normalization constant (1 / (2 * sqrt(pi))). gsplat's
+# ``spherical_harmonics`` returns ``_SH_C0 * dc + Σ_{l≥1} basis_l · coeff_l``,
+# so placing ``raydrop_logit / _SH_C0`` in the band-0 slot reproduces the scalar
+# raydrop logit exactly at degree 0 (backward compatible) while letting the
+# higher bands add the view dependence a scalar cannot express.
+_SH_C0: float = 0.28209479177387814
+
+
+def _raydrop_sh_degree_from_coefs(coefs: int) -> int:
+    """Return the SH degree for ``coefs`` higher-order raydrop bands.
+
+    ``coefs == (degree + 1)**2 - 1`` (the DC/band-0 term is excluded — it lives
+    in the scalar ``raydrop_logit``). Raises ``ValueError`` if ``coefs`` is not
+    of that form for any non-negative integer degree.
+    """
+    root = math.isqrt(coefs + 1)
+    if root * root != coefs + 1:
+        raise ValueError(
+            f"raydrop_sh coefs {coefs} is not (deg+1)**2 - 1 for any integer degree"
+        )
+    return root - 1
+
+
+def _eval_view_dependent_raydrop(
+    means: torch.Tensor,  # (N, 3) world
+    view_pos: torch.Tensor,  # (3,) sensor origin in world
+    raydrop_logit: torch.Tensor,  # (N,) scalar band-0 (DC) logit
+    raydrop_sh: torch.Tensor | None,  # (N, coefs) higher-order bands, or None
+    degree: int,
+) -> torch.Tensor:
+    """Evaluate the view-dependent raydrop logit at each Gaussian's view ray.
+
+    Mirrors colour SH: the drop logit is evaluated along the direction from the
+    sensor origin to the Gaussian, exactly like gsplat evaluates colour SH along
+    the camera→Gaussian direction. The scalar ``raydrop_logit`` is the band-0
+    (DC) contribution and ``raydrop_sh`` carries the higher bands; when there are
+    no higher bands the scalar is returned unchanged (backward compatible).
+    """
+    if raydrop_sh is None or degree == 0:
+        return raydrop_logit
+
+    import gsplat
+
+    n = means.shape[0]
+    k = (degree + 1) ** 2
+    # gsplat.spherical_harmonics wants coeffs shaped (..., K, 3). We only need a
+    # scalar channel, so pack the raydrop coefficients into channel 0 (zeros
+    # elsewhere) and read channel 0 back. Band 0 is scaled by 1/_SH_C0 so the DC
+    # contribution equals the scalar raydrop_logit.
+    coeffs = torch.zeros((n, k, 3), dtype=torch.float32, device=means.device)
+    coeffs[:, 0, 0] = raydrop_logit.float() / _SH_C0
+    coeffs[:, 1:k, 0] = raydrop_sh.float()
+    dirs = means.float() - view_pos.to(means.device, torch.float32).reshape(3)
+    return gsplat.spherical_harmonics(degree, dirs, coeffs)[:, 0]
+
 
 @lru_cache(maxsize=32)
 def _lidar_intrinsics(h: int, w: int, device_str: str) -> torch.Tensor:
@@ -551,9 +606,11 @@ def render_lidar_panorama(
     scales: torch.Tensor,  # (N, 3) post-exp (positive)
     opacities: torch.Tensor,  # (N,) post-sigmoid in [0, 1]
     intensity_sig: torch.Tensor,  # (N,) sigmoid(lidar_intensity_raw)
-    raydrop_logit: torch.Tensor,  # (N,) raw lidar_raydrop_logit
+    raydrop_logit: torch.Tensor,  # (N,) raw lidar_raydrop_logit (SH band-0/DC)
     sensor_to_world: torch.Tensor,  # (4, 4) sweep-start pose, same device
     lidar_spec: LidarSensorSpec,
+    raydrop_sh: torch.Tensor | None = None,  # (N, (deg+1)**2-1) higher SH bands
+    raydrop_sh_degree: int = 0,  # SH degree of raydrop_sh (0 = scalar only)
     sensor_to_world_end: torch.Tensor | None = None,  # (4, 4) sweep-end pose
     min_range_m: float = 0.3,
     max_range_m: float | None = 120.0,
@@ -575,6 +632,16 @@ def render_lidar_panorama(
     alpha-weighted expected hit distance from the sensor origin (so it
     matches the canonical LiDAR "range" reading); the value is 0 where
     no Gaussians intersect that bin.
+
+    View-dependent raydrop
+    ----------------------
+    ``raydrop_logit`` is the band-0 (DC) drop logit. When ``raydrop_sh`` (the
+    higher-order SH bands, shape ``(N, (raydrop_sh_degree+1)**2 - 1)``) is given
+    with a positive ``raydrop_sh_degree``, the drop logit is re-evaluated per
+    Gaussian along the sensor→Gaussian ray — exactly like colour SH — so a
+    Gaussian can drop for one sensor view and return for another. With
+    ``raydrop_sh=None`` / ``raydrop_sh_degree=0`` the scalar logit is used
+    directly (the previous behaviour).
 
     Acceleration knobs
     ------------------
@@ -674,6 +741,24 @@ def render_lidar_panorama(
         opacities = opacities.index_select(0, idx)
         intensity_sig = intensity_sig.index_select(0, idx)
         raydrop_logit = raydrop_logit.index_select(0, idx)
+        if raydrop_sh is not None:
+            raydrop_sh = raydrop_sh.index_select(0, idx)
+
+    # View-dependent raydrop: fold the higher SH bands into the per-Gaussian
+    # scalar logit before it is composited by the rasterizer. Evaluated after
+    # culling so the (potentially large) SH matmul only runs over kept Gaussians.
+    # The view ray uses the sweep-midpoint sensor origin (matching the cull) so a
+    # single evaluation approximates the whole rolling-shutter spin.
+    if raydrop_sh is not None and raydrop_sh_degree > 0 and means.shape[0] > 0:
+        view_pos = sensor_to_world[:3, 3]
+        if sensor_to_world_end is not None:
+            view_pos = 0.5 * (
+                view_pos
+                + sensor_to_world_end.to(view_pos.device, view_pos.dtype)[:3, 3]
+            )
+        raydrop_logit = _eval_view_dependent_raydrop(
+            means, view_pos, raydrop_logit, raydrop_sh, raydrop_sh_degree
+        )
 
     coeffs = lidar_spec.coeffs(device)
     H, W = coeffs.n_rows, coeffs.n_columns
@@ -995,13 +1080,17 @@ class LidarRenderer:
 
         means_list, quats_list, scales_list, opacities_list = [], [], [], []
         intensity_list, raydrop_list = [], []
+        # Per-group SH raydrop bands (or None). Collected verbatim, then reconciled
+        # to a single scene-wide degree below so groups that lack the higher bands
+        # contribute only their scalar (DC) logit.
+        raydrop_sh_list: list[torch.Tensor | None] = []
         for t in tensor_list:
             # Hard-exclude appearance-only / far-field Gaussians (lidar_mask == False)
             # from the LiDAR geometry pass BEFORE resolving attrs, so the sigmoid /
             # luminance fallback only runs over kept Gaussians. __getitem__ filters
-            # every field (geometry + intensity_raw/raydrop_logit) consistently, so it
-            # also carries any future per-Gaussian field. ``None`` (or the
-            # ``ignore_lidar_mask`` override) keeps every Gaussian.
+            # every field (geometry + intensity_raw/raydrop_logit/raydrop_sh)
+            # consistently, so it also carries any future per-Gaussian field.
+            # ``None`` (or the ``ignore_lidar_mask`` override) keeps every Gaussian.
             if not self.ignore_lidar_mask and t.lidar_mask is not None:
                 t = t[t.lidar_mask]
             i_sig, r_logit = _resolve_lidar_attrs(t)
@@ -1011,6 +1100,7 @@ class LidarRenderer:
             opacities_list.append(t.opacities)
             intensity_list.append(i_sig)
             raydrop_list.append(r_logit)
+            raydrop_sh_list.append(t.raydrop_sh)
 
         means = torch.cat(means_list, dim=0).to(self.device)
         quats = torch.cat(quats_list, dim=0).to(self.device)
@@ -1018,6 +1108,9 @@ class LidarRenderer:
         opacities = torch.cat(opacities_list, dim=0).to(self.device)
         intensity_sig = torch.cat(intensity_list, dim=0)
         raydrop_logit = torch.cat(raydrop_list, dim=0)
+        raydrop_sh, raydrop_sh_degree = self._concat_raydrop_sh(
+            raydrop_sh_list, [m.shape[0] for m in means_list], self.device
+        )
 
         # Every Gaussian masked out of the LiDAR pass -> zero-output panorama.
         if means.shape[0] == 0:
@@ -1032,6 +1125,8 @@ class LidarRenderer:
             raydrop_logit=raydrop_logit,
             sensor_to_world=sensor_to_world,
             lidar_spec=self.sensor_spec,
+            raydrop_sh=raydrop_sh,
+            raydrop_sh_degree=raydrop_sh_degree,
             sensor_to_world_end=sensor_to_world_end,
             min_range_m=self.min_range_m,
             max_range_m=self.max_range_m,
@@ -1043,6 +1138,40 @@ class LidarRenderer:
             with_ut=self.with_ut,
             with_eval3d=self.with_eval3d,
         )
+
+    @staticmethod
+    def _concat_raydrop_sh(
+        raydrop_sh_list: list[torch.Tensor | None],
+        counts: list[int],
+        device: torch.device,
+    ) -> tuple[torch.Tensor | None, int]:
+        """Concatenate per-group SH raydrop bands into a single scene tensor.
+
+        Returns ``(raydrop_sh, degree)``. Groups that lack the higher bands are
+        padded with zeros (so they contribute only their scalar DC logit), which
+        lets a scene mix SH-trained Gaussians (e.g. the background) with groups
+        that carry only the scalar raydrop (e.g. dynamic objects). When no group
+        carries SH bands the scene is scalar-only: ``(None, 0)``. All groups that
+        do carry bands must share the same coefficient count (SH degree).
+        """
+        widths = {t.shape[1] for t in raydrop_sh_list if t is not None}
+        if not widths:
+            return None, 0
+        if len(widths) != 1:
+            raise ValueError(
+                f"Mixed raydrop_sh SH widths across scene sources: {widths}"
+            )
+        coefs = widths.pop()
+        degree = _raydrop_sh_degree_from_coefs(coefs)
+        parts: list[torch.Tensor] = []
+        for t, n in zip(raydrop_sh_list, counts):
+            if t is None:
+                parts.append(
+                    torch.zeros((n, coefs), dtype=torch.float32, device=device)
+                )
+            else:
+                parts.append(t.to(device, torch.float32))
+        return torch.cat(parts, dim=0), degree
 
     def _validity_mask(
         self,
