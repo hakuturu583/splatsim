@@ -105,15 +105,19 @@ torchvision = [
   { index = "pytorch-cu128" },
 ]
 
-# 3dgs_io v1.1.0: adds an optional per-Gaussian `lidar_mask` channel to the
-# EXT_gaussian_lidar sidecar (decode_lidar_sidecar may now return a "lidar_mask"
-# (N,) float32 array in {0,1}; 1 = participates in LiDAR / near-field, 0 =
-# appearance-only / far-field; absent for old 2-channel sidecars). v1.0.0 was
-# the first tagged release with the frame-explicit v2 scene USDZ work (issue
-# #39). Only the scene USDZ readers (load_spz, decode_lidar_sidecar,
-# parse_rig_trajectories, ...) are used; splatsim no longer loads 3D Tiles
-# tilesets.
-3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v1.1.0" }
+# 3dgs_io v1.2.0: adds an optional view-dependent (SH) per-Gaussian raydrop
+# trailing block to the EXT_gaussian_lidar sidecar (version-2 sidecar;
+# decode_lidar_sidecar may now return a "raydrop_sh" (N, (deg+1)**2-1) float32
+# array of the higher-order SH bands — the DC term stays in
+# lidar_raydrop_logit; absent for version-1 sidecars). v1.1.0 added the optional
+# per-Gaussian `lidar_mask` channel (decode_lidar_sidecar may return a
+# "lidar_mask" (N,) float32 array in {0,1}; 1 = participates in LiDAR /
+# near-field, 0 = appearance-only / far-field; absent for old 2-channel
+# sidecars). v1.0.0 was the first tagged release with the frame-explicit v2
+# scene USDZ work (issue #39). Only the scene USDZ readers (load_spz,
+# decode_lidar_sidecar, parse_rig_trajectories, ...) are used; splatsim no
+# longer loads 3D Tiles tilesets.
+3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v1.2.0" }
 
 # t4-devkit: WebAuto / T4 dataset devkit, used by the optional 'eval' extra to
 # pull the GT ego trajectory + GT LiDAR scans. Not published to PyPI; pin to the
