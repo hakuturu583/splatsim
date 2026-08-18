@@ -539,7 +539,9 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         )
         with torch.no_grad():
             panorama = self._lidar_renderer.render(base_to_world, scene=self._scene)
-            point_cloud = self._lidar_renderer.panorama_to_point_cloud(
+            # Fast path: the point records are packed on the GPU and cross to
+            # the host as one contiguous buffer (see panorama_to_pointcloud2_data).
+            records, n_points = self._lidar_renderer.panorama_to_pointcloud2_data(
                 panorama,
                 drop_threshold=self._lidar_drop_threshold,
                 alpha_threshold=self._lidar_alpha_threshold,
@@ -548,12 +550,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
 
         sec, nanosec = divmod(render_time_ns, 1_000_000_000)
         stamp = Time(sec=sec, nanosec=nanosec)
-        self._pointcloud_pub.publish(
-            point_cloud["xyz"],
-            point_cloud["intensity"],
-            channel=point_cloud["channel"],
-            stamp=stamp,
-        )
+        self._pointcloud_pub.publish_packed(records, n_points, stamp=stamp)
         t_publish = time.monotonic()
 
         self._lidar_render_count += 1
@@ -561,7 +558,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             logger.info(
                 "LiDAR render #%d: %d points total=%.1fms (render=%.1f publish=%.1f)",
                 self._lidar_render_count,
-                point_cloud["xyz"].shape[0],
+                n_points,
                 (t_publish - t0) * 1000,
                 (t_render - t0) * 1000,
                 (t_publish - t_render) * 1000,

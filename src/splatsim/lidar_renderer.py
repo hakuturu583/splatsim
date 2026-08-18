@@ -36,7 +36,7 @@ import math
 import os
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, NamedTuple, Sequence
 
 import numpy as np
 import torch
@@ -596,11 +596,100 @@ def _rigid_inverse_4x4(m: torch.Tensor) -> torch.Tensor:
 
 
 # ── SplatAD spherical LiDAR kernel (vendored) ───────────────────────
-# Non-uniform elevation tile geometry for the SplatAD rasterizer. These match
-# the validated gaussian_factory configuration (tile_height beams per tile).
-_SPLATAD_TILE_HEIGHT = 4
-_SPLATAD_TILE_WIDTH = 64
+# Non-uniform elevation tile geometry for the SplatAD rasterizer.
+# 2x16 (32 threads = 1 warp per block) measured fastest across all five rig
+# sensors on a 27M-Gaussian driving scene (RTX 3090, sm_86): the rasterizer is
+# tail-bound by a few very long per-tile Gaussian lists (p95 ~66k, max ~480k at
+# 4x64), so many small tiles balance far better than fewer 256-thread blocks:
+# lidar_top 39->26 ms, corner LiDARs 52->29 ms end-to-end. Tiling only changes
+# how Gaussians are grouped, never the per-pixel front-to-back order, so the
+# rendered output is bit-identical to 4x64.
+_SPLATAD_TILE_HEIGHT = 2
+_SPLATAD_TILE_WIDTH = 16
 _SPLATAD_RAST = None
+
+# Static per-(sensor, device) rasterization geometry. Everything here depends
+# only on the sensor spec (beam tables) and the tile constants, so rebuilding it
+# per frame (meshgrid + stack + two .item() device syncs per render) was pure
+# overhead in the streaming path. Keyed by the spec's hashable geometry fields.
+_PANO_GEOM_CACHE: dict = {}
+
+
+class _PanoGeom(NamedTuple):
+    elevs_desc: torch.Tensor  # (H,) descending beam elevations [rad], device
+    azs_cw: torch.Tensor  # (W,) clockwise column azimuths [rad], device
+    raster_pts: torch.Tensor  # (1, H, W, 4) ascending az/el grid, device
+    tile_boundaries: torch.Tensor  # (H//th + 1,) ascending deg, device
+    dirs: torch.Tensor  # (H, W, 3) unit beam directions (desc/CW grid), device
+    min_el_deg: float  # ascending-grid elevation bounds (CPU floats,
+    max_el_deg: float  # cached to avoid per-frame .item() syncs)
+
+
+def _panorama_geometry(lidar_spec: LidarSensorSpec, device) -> _PanoGeom:
+    key = (
+        str(device),
+        lidar_spec.name,
+        lidar_spec.sensor_type,
+        lidar_spec.n_columns,
+        lidar_spec.row_elevations_rad,
+        lidar_spec.el_lo_rad,
+        lidar_spec.el_hi_rad,
+        lidar_spec.n_rows_uniform,
+        _SPLATAD_TILE_HEIGHT,
+        _SPLATAD_TILE_WIDTH,
+    )
+    geom = _PANO_GEOM_CACHE.get(key)
+    if geom is not None:
+        return geom
+
+    elevs_desc_cpu = _sensor_row_elevations(lidar_spec)
+    elevs_desc = elevs_desc_cpu.to(device)  # (H,) desc rad
+    azs_cw = _sensor_column_azimuths(lidar_spec).to(device)  # (W,) CW rad
+
+    # SplatAD requires ASCENDING elevation + ASCENDING azimuth. Build the
+    # panorama grid in that order (the render output is flipped back).
+    el_deg = torch.rad2deg(torch.flip(elevs_desc, [0]))  # (H,) ascending deg
+    az_deg = torch.rad2deg(torch.flip(azs_cw, [0]))  # (W,) ascending deg
+    grid_el, grid_az = torch.meshgrid(el_deg, az_deg, indexing="ij")  # (H, W)
+    raster_pts = torch.stack(
+        [grid_az, grid_el, torch.ones_like(grid_az), torch.zeros_like(grid_az)],
+        dim=-1,
+    ).unsqueeze(0)  # (1, H, W, 4) = [azimuth_deg, elevation_deg, range=1, time=0]
+
+    # Non-uniform elevation tile boundaries (tile_height beams/tile), asc deg.
+    th = _SPLATAD_TILE_HEIGHT
+    tile_boundaries = torch.cat(
+        [
+            el_deg[0:1] - 1.0,
+            (el_deg[th::th] + el_deg[th - 1 : -1 : th]) / 2,
+            el_deg[-1:] + 1.0,
+        ]
+    )
+
+    # Unit beam directions on the output (descending-elevation, CW-azimuth)
+    # grid -- the same values _panorama_to_points recomputed per frame.
+    g_el, g_az = torch.meshgrid(elevs_desc, azs_cw, indexing="ij")
+    dirs = torch.stack(
+        [
+            torch.cos(g_el) * torch.cos(g_az),
+            torch.cos(g_el) * torch.sin(g_az),
+            torch.sin(g_el),
+        ],
+        dim=-1,
+    )  # (H, W, 3)
+
+    el_deg_cpu = torch.rad2deg(torch.flip(elevs_desc_cpu, [0]))
+    geom = _PanoGeom(
+        elevs_desc=elevs_desc,
+        azs_cw=azs_cw,
+        raster_pts=raster_pts,
+        tile_boundaries=tile_boundaries,
+        dirs=dirs,
+        min_el_deg=float(el_deg_cpu.min()),
+        max_el_deg=float(el_deg_cpu.max()),
+    )
+    _PANO_GEOM_CACHE[key] = geom
+    return geom
 
 
 def _splatad_lidar_rasterization():
@@ -730,7 +819,7 @@ def render_lidar_panorama(
     with_ut: bool = True,
     with_eval3d: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """Run gsplat's lidar raster once for one sensor at one frame.
+    """Run the SplatAD spherical lidar raster once for one sensor at one frame.
 
     Returns:
         ``{"alpha": (H, W), "distance": (H, W),
@@ -757,11 +846,9 @@ def render_lidar_panorama(
     so Gaussians outside the sensor's usable shell are dropped inside
     the projection kernel. ``max_range_m=None`` disables the far cut.
 
-    ``packed`` toggles gsplat's packed rasterization path. gsplat
-    currently disallows packed whenever ``with_ut`` or ``with_eval3d``
-    is on, and the ``RGB-Ed`` hit-distance render mode we use requires
-    ``with_eval3d=True``. As a result ``packed=True`` is not usable
-    with the default output and it stays off by default.
+    ``packed`` is inert: it selected gsplat's packed rasterization path,
+    which the vendored SplatAD kernel does not have. Kept for call-site
+    compatibility with the gsplat-backed signature.
 
     ``radius_clip`` drops Gaussians whose projected 2D radius is below
     the given pixel count; useful for skipping sub-pixel dust.
@@ -779,20 +866,25 @@ def render_lidar_panorama(
     dropping them shrinks what gsplat needs to project. Cheap
     (one 3×N matmul + an ``atan2``) and orthogonal to the radial cull.
 
-    ``with_ut``/``with_eval3d`` toggle gsplat's unscented-transform
-    projection and 3D-evaluated blending. Both default to True (the
-    correct choice under the spherical lidar camera model). Turn them
-    off in exchange for ``packed=True`` when speed matters more than
-    covariance fidelity.
+    ``with_ut``/``with_eval3d`` are likewise inert. They toggled gsplat's
+    unscented-transform projection and 3D-evaluated blending; the SplatAD
+    kernel projects and blends unconditionally in its own spherical model,
+    so neither flag reaches a kernel argument. Kept (defaulting to True, the
+    behaviour they described) so existing call sites keep working.
 
-    ``sensor_to_world_end`` enables rolling-shutter (motion-during-sweep)
-    rendering: ``sensor_to_world`` is the pose at the first azimuth column and
-    ``sensor_to_world_end`` the pose at the last, with gsplat interpolating the
-    sensor pose across the spin. This reproduces the skew a real spinning LiDAR
-    accumulates while the vehicle moves (and, conversely, lets a consumer feed
-    de-skewing poses). Requires ``with_ut=True``. When ``None`` (default) the
-    whole panorama is rendered from the single ``sensor_to_world`` pose
-    (``RollingShutterType.GLOBAL``), i.e. the previous behaviour.
+    ``sensor_to_world_end`` is a motion-during-sweep *approximation*, NOT true
+    rolling shutter. ``sensor_to_world`` is the pose at the first azimuth column
+    and ``sensor_to_world_end`` the pose at the last, and the whole panorama is
+    rendered from the translational midpoint of the two (the frustum cull and
+    the view-dependent raydrop evaluation use that same midpoint, so all three
+    stay consistent). Every column therefore shares one pose: the intra-sweep
+    skew a real spinning LiDAR accumulates is NOT reproduced — only the average
+    displacement over the sweep is. The gsplat backend modelled this properly
+    via ``viewmats_rs`` + ``RollingShutterType``; the vendored SplatAD kernel
+    instead expects per-Gaussian ``velocities``, which this path does not yet
+    supply (it passes ``velocities=None``). Wiring that up is what would make
+    this real rolling shutter. When ``None`` (default) the panorama is rendered
+    from the single ``sensor_to_world`` pose.
     """
     device = means.device
 
@@ -868,8 +960,11 @@ def render_lidar_panorama(
     # Beam table straight from the sensor spec (gsplat-independent): rows are the
     # descending elevations, columns sweep +pi -> -pi (clockwise) -- the exact
     # panorama layout the point-cloud / range-image back-projection expects.
-    elevs_desc = _sensor_row_elevations(lidar_spec).to(device)  # (H,) desc rad
-    azs_cw = _sensor_column_azimuths(lidar_spec).to(device)  # (W,) CW rad
+    # All static per-sensor geometry (raster grid, tile boundaries, beam
+    # directions) comes from the per-(spec, device) cache.
+    geom = _panorama_geometry(lidar_spec, device)
+    elevs_desc = geom.elevs_desc  # (H,) desc rad
+    azs_cw = geom.azs_cw  # (W,) CW rad
     H, W = int(elevs_desc.shape[0]), int(azs_cw.shape[0])
 
     if means.shape[0] == 0:
@@ -884,26 +979,12 @@ def render_lidar_panorama(
             "raydrop_logit": torch.full_like(zero, DEFAULT_RAYDROP_LOGIT),
         }
 
-    # SplatAD requires ASCENDING elevation + ASCENDING azimuth. Build the panorama
-    # in that order, then flip rows+cols back to our (descending-elevation,
-    # CW-azimuth) grid so every downstream consumer is unchanged.
-    el_deg = torch.rad2deg(torch.flip(elevs_desc, [0]))  # (H,) ascending deg
-    az_deg = torch.rad2deg(torch.flip(azs_cw, [0]))  # (W,) ascending deg
-    grid_el, grid_az = torch.meshgrid(el_deg, az_deg, indexing="ij")  # (H, W)
-    raster_pts = torch.stack(
-        [grid_az, grid_el, torch.ones_like(grid_az), torch.zeros_like(grid_az)],
-        dim=-1,
-    ).unsqueeze(0)  # (1, H, W, 4) = [azimuth_deg, elevation_deg, range=1, time=0]
-
-    # Non-uniform elevation tile boundaries (tile_height beams per tile), asc deg.
+    # SplatAD renders on an ASCENDING elevation/azimuth grid; the cached
+    # raster_pts/tile_boundaries are in that order and the panorama is flipped
+    # back to our (descending-elevation, CW-azimuth) grid after the raster.
     th, tw = _SPLATAD_TILE_HEIGHT, _SPLATAD_TILE_WIDTH
-    tile_boundaries = torch.cat(
-        [
-            el_deg[0:1] - 1.0,
-            (el_deg[th::th] + el_deg[th - 1 : -1 : th]) / 2,
-            el_deg[-1:] + 1.0,
-        ]
-    )
+    raster_pts = geom.raster_pts
+    tile_boundaries = geom.tile_boundaries
 
     # Rolling shutter: SplatAD models intra-sweep skew via per-Gaussian
     # velocities, not a sweep-end pose. Until that path is wired, approximate the
@@ -939,8 +1020,8 @@ def render_lidar_panorama(
         tile_elevation_boundaries=tile_boundaries.clone(),
         min_azimuth=-180.0,
         max_azimuth=180.0,
-        min_elevation=float(el_deg.min().item()),
-        max_elevation=float(el_deg.max().item()) + 1e-3,
+        min_elevation=geom.min_el_deg,
+        max_elevation=geom.max_el_deg + 1e-3,
         n_elevation_channels=H,
         azimuth_resolution=360.0 / float(W),
         tile_width=tw,
@@ -948,6 +1029,10 @@ def render_lidar_panorama(
         near_plane=float(min_range_m),
         far_plane=1e10 if max_range_m is None else float(max_range_m),
         radius_clip=float(radius_clip),
+        # The alpha-sum-until-point map is a training-time feature (raydrop
+        # supervision against real returns); this inference path discards it,
+        # so skip its per-Gaussian-per-pixel accumulation in the kernel.
+        compute_alpha_sum_until_points=False,
         use_depth_compensation=False,
     )
 
@@ -962,8 +1047,8 @@ def render_lidar_panorama(
         "alpha": _to_grid(alpha[0, ..., 0] if alpha.dim() == 4 else alpha[0]),
         "distance": dist_grid,
         # (H, W, 3) sensor-frame point cloud from the median range, back-projected
-        # along the beam directions.
-        "points": _panorama_to_points(dist_grid, elevs_desc, azs_cw),
+        # along the (cached) unit beam directions.
+        "points": dist_grid.unsqueeze(-1) * geom.dirs,
         "intensity": _to_grid(render[0, ..., 0]),
         "raydrop_logit": _to_grid(render[0, ..., 1]),
     }
@@ -1192,8 +1277,9 @@ class LidarRenderer:
                 the azimuth sweep (the whole panorama when no end pose is given).
             scene: The splatsim Scene providing Gaussians.
             base_to_world_end: Optional (4, 4) ego/base pose at the end of the
-                sweep. When given, enables rolling-shutter (motion-during-sweep)
-                rendering — gsplat interpolates the sensor pose across the spin.
+                sweep. When given, the panorama is rendered from the midpoint of
+                the two poses — a motion-during-sweep approximation, not true
+                rolling shutter (see :func:`render_lidar_panorama`).
 
         Returns:
             ``{"alpha", "distance", "intensity", "raydrop_logit"}`` — each an
@@ -1217,7 +1303,28 @@ class LidarRenderer:
         # dropped Gaussians are the least important per cell). Set to 1.0 to keep
         # every Gaussian, or lower (0.25) for more headroom / speed.
         lod_scale = float(os.environ.get("SPLATSIM_LIDAR_LOD_SCALE", "0.5"))
-        tensor_list = scene.collect_tensors(cam_pos, lod_count_scale=lod_scale)
+        # lidar_view fuses the static lidar_mask into the LOD gather and skips
+        # the colors block (one gather instead of two); sources that bypass the
+        # LOD filter still carry their mask and are handled per-source below.
+        # Whole-cell LOD max-range cull: drop octree cells provably beyond the
+        # sensor's radial cull before the gather. Under a sweep-end pose the
+        # render/cull origin is the sweep midpoint, up to half the base motion
+        # away from cam_pos — widen the bound by that slack so the cell cull
+        # stays a strict superset of the per-Gaussian cull.
+        lod_max_dist = self.max_range_m
+        if lod_max_dist is not None and base_to_world_end is not None:
+            lod_max_dist = lod_max_dist + 0.5 * float(
+                torch.norm(
+                    base_to_world_end.to(self.device)[:3, 3]
+                    - base_to_world.to(self.device)[:3, 3]
+                )
+            )
+        tensor_list = scene.collect_tensors(
+            cam_pos,
+            lod_count_scale=lod_scale,
+            lidar_view=not self.ignore_lidar_mask,
+            lod_max_distance=lod_max_dist,
+        )
         if not tensor_list:
             return self._empty_panorama()
 
@@ -1368,18 +1475,14 @@ class LidarRenderer:
             panorama, drop_threshold=drop_threshold, alpha_threshold=alpha_threshold
         )
 
-        el_grid = self._elevs[:, None].expand(-1, self.n_columns)  # (H, W)
-        az_grid = self._azimuths[None, :].expand(self.n_rows, -1)  # (H, W)
         row_grid = torch.arange(self.n_rows, device=distance.device)[:, None].expand(
             -1, self.n_columns
         )  # (H, W) ring / laser-beam index
 
-        cos_el = torch.cos(el_grid)
-        x = distance * cos_el * torch.cos(az_grid)
-        y = distance * cos_el * torch.sin(az_grid)
-        z = distance * torch.sin(el_grid)
-
-        xyz = torch.stack([x, y, z], dim=-1)[valid]
+        # ``panorama["points"]`` is the same back-projection (range x unit beam
+        # direction) already produced by the render, so reuse it instead of
+        # re-deriving the trig grids per frame.
+        xyz = panorama["points"][valid]
         intensity_valid = intensity[valid]
         channel_valid = row_grid[valid]
 
@@ -1388,6 +1491,48 @@ class LidarRenderer:
             "intensity": intensity_valid.detach().cpu().numpy().astype(np.float32),
             "channel": channel_valid.detach().cpu().numpy().astype(np.uint16),
         }
+
+    def panorama_to_pointcloud2_data(
+        self,
+        panorama: dict[str, torch.Tensor],
+        *,
+        drop_threshold: float = 0.5,
+        alpha_threshold: float = 0.1,
+    ) -> tuple[np.ndarray, int]:
+        """Pack the valid returns straight into PointCloud2 point records.
+
+        Produces the exact 16-byte little-endian record layout used by
+        :mod:`splatsim.cyclonedds.pointcloud2_publisher` (x, y, z float32 |
+        intensity uint8 | return_type uint8 = 0 | channel uint16) — but packs
+        it on the GPU and moves ONE contiguous buffer to the host, instead of
+        transferring xyz / intensity / channel separately and re-packing them
+        on the CPU per frame.
+
+        Returns:
+            ``(records, count)`` — ``records`` is a ``(count * 16,)`` uint8
+            array viewing the packed points, ready for ``PointCloud2.data``.
+        """
+        valid = self._validity_mask(
+            panorama, drop_threshold=drop_threshold, alpha_threshold=alpha_threshold
+        )
+        xyz = panorama["points"][valid]  # (N, 3) float32, sensor frame
+        n = int(xyz.shape[0])
+
+        intensity_u8 = (
+            (panorama["intensity"][valid].clamp(0.0, 1.0) * 255.0)
+            .to(torch.uint8)
+            .to(torch.int32)
+        )
+        row_grid = torch.arange(self.n_rows, device=xyz.device, dtype=torch.int32)[
+            :, None
+        ].expand(-1, self.n_columns)
+        channel = row_grid[valid]
+        # Little-endian byte layout 12..15: [intensity, return_type=0, ch_lo,
+        # ch_hi] == int32 word (intensity | channel << 16), bit-cast to float32
+        # so it can ride in the same (N, 4) float32 record tensor.
+        word = intensity_u8 | (channel << 16)
+        rec = torch.cat([xyz, word.view(torch.float32).unsqueeze(1)], dim=1)
+        return rec.contiguous().cpu().numpy().view(np.uint8).reshape(-1), n
 
     def panorama_to_range_image(
         self,

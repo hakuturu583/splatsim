@@ -36,6 +36,14 @@ class LodIndex:
     cell_tier_counts: Tensor = field(repr=False)
     """[C, T] int64 per-cell Gaussian count for each tier."""
 
+    cell_radius: Tensor = field(repr=False)
+    """[C] float32 half-diagonal of each leaf cell's AABB (bounds every member
+    Gaussian center's distance from the cell center)."""
+
+    cell_max_scale: Tensor = field(repr=False)
+    """[C] float32 max per-Gaussian ``scales.max(dim=1)`` within the cell (used
+    to bound the 3-sigma cull margin for whole-cell max-range culling)."""
+
 
 class LodManager:
     """Manages LOD pre-computation and per-frame tier selection."""
@@ -73,6 +81,9 @@ class LodManager:
         cell_ranges_list: list[tuple[int, int]] = []
         offset = 0
 
+        max_scale_cpu = max_scale.detach().cpu()
+        cell_radius_list: list[float] = []
+        cell_max_scale_list: list[float] = []
         for leaf_indices, lo, hi in leaves:
             leaf_imp = importance_cpu[leaf_indices]
             local_order = leaf_imp.argsort(descending=True)
@@ -82,6 +93,8 @@ class LodManager:
             count = len(ordered)
             cell_ranges_list.append((offset, offset + count))
             cell_centers_list.append((lo + hi) / 2.0)
+            cell_radius_list.append(float(torch.norm((hi - lo) / 2.0)))
+            cell_max_scale_list.append(float(max_scale_cpu[leaf_indices].max()))
             offset += count
 
         final_order = torch.cat(ordered_indices).to(device)
@@ -118,6 +131,12 @@ class LodManager:
             cell_centers=cell_centers,
             cell_ranges=cell_ranges,
             cell_tier_counts=cell_tier_counts,
+            cell_radius=torch.tensor(
+                cell_radius_list, device=device, dtype=torch.float32
+            ),
+            cell_max_scale=torch.tensor(
+                cell_max_scale_list, device=device, dtype=torch.float32
+            ),
         )
 
     def _subdivide(
@@ -172,11 +191,39 @@ class LodManager:
         tensors: GaussianTensors,
         lod_index: LodIndex,
         camera_position: Tensor,
+        count_scale: float = 1.0,
+        lidar_view: bool = False,
+        max_distance: float | None = None,
+        max_distance_sigmas: float = 3.0,
     ) -> GaussianTensors:
         """Select the appropriate LOD tier per cell and return filtered tensors.
 
         Args:
             camera_position: [3] float32 tensor on the same device.
+            count_scale: Extra per-cell decimation applied on top of the tier
+                selection (``<1`` keeps that fraction of each cell's
+                importance-sorted Gaussians, min 1). Lets a memory/throughput
+                constrained consumer (e.g. the 360° LiDAR, which cannot azimuth-
+                cull) thin the scene further than the camera-tuned tiers without
+                changing the shared LOD config. ``1.0`` = no change.
+            lidar_view: Gather a LiDAR-minimal view: the source's static
+                ``lidar_mask`` is intersected with the LOD selection *before*
+                the gather (one fused gather instead of LOD-gather followed by
+                a second full mask-gather in the renderer), and the ``colors``
+                SH block — untouched by the LiDAR path whenever per-Gaussian
+                ``intensity_raw`` exists — is replaced by a zero-copy expanded
+                placeholder. The returned tensors carry ``lidar_mask=None``
+                (already applied).
+            max_distance: When set, whole cells provably beyond this camera
+                distance are dropped before the gather: a cell is culled when
+                ``dist(cell_center) - cell_radius > max_distance +
+                max_distance_sigmas * cell_max_scale`` — exactly the Gaussians
+                the LiDAR renderer's per-Gaussian radial cull (same sigma
+                margin) would discard afterwards, so the final render is
+                unchanged while the gather shrinks to the in-range half of the
+                scene.
+            max_distance_sigmas: Sigma margin matching the downstream
+                per-Gaussian cull (``cull_scale_sigmas``).
         """
         device = lod_index.cell_centers.device
         num_cells = lod_index.cell_centers.shape[0]
@@ -198,6 +245,20 @@ class LodManager:
         selected_counts = lod_index.cell_tier_counts[
             torch.arange(num_cells, device=device), tier_idx
         ]  # [C]
+
+        # 3b. Optional extra decimation (keeps each cell's top-`count_scale`
+        # fraction; cells stay populated via the min-1 floor).
+        if count_scale < 1.0:
+            selected_counts = (
+                (selected_counts.float() * count_scale).clamp(min=1.0).long()
+            )
+
+        # 3c. Whole-cell max-range cull (see the ``max_distance`` docstring).
+        if max_distance is not None:
+            reachable = (dists - lod_index.cell_radius) <= (
+                max_distance + max_distance_sigmas * lod_index.cell_max_scale
+            )
+            selected_counts = selected_counts * reachable.long()
 
         # Log tier distribution changes
         if logger.isEnabledFor(logging.INFO):
@@ -233,6 +294,46 @@ class LodManager:
         mask = offsets < selected_counts.unsqueeze(1)  # [C, max_count]
         selected_indices = abs_indices[mask]  # [total_selected]
 
+        if lidar_view:
+            return _gather_lidar_view(tensors, selected_indices)
         if selected_indices.shape[0] >= tensors.means.shape[0]:
             return tensors
         return tensors[selected_indices]
+
+
+def _gather_lidar_view(tensors: GaussianTensors, idx: Tensor) -> GaussianTensors:
+    """One fused gather of the LiDAR-relevant fields at ``idx`` ∩ ``lidar_mask``.
+
+    The renderer previously did tensors[lod_idx] (all fields, colors included)
+    followed by tensors[lidar_mask] (all fields again). Intersecting the mask
+    into the index first and skipping the colors block (unused by the LiDAR
+    path when ``intensity_raw`` is present) roughly halves the per-frame gather
+    bandwidth on SH scenes.
+    """
+    if tensors.lidar_mask is not None:
+        idx = idx[tensors.lidar_mask[idx]]
+    n = int(idx.shape[0])
+    skip_colors = tensors.intensity_raw is not None
+    if skip_colors:
+        # Zero-copy placeholder with the right shape/dtype; the LiDAR path only
+        # reads ``sh_degree`` and falls back to colors solely when
+        # ``intensity_raw`` is absent, which is excluded here.
+        colors = tensors.colors[:1].expand(n, *tensors.colors.shape[1:])
+    else:
+        colors = tensors.colors[idx]
+    return GaussianTensors(
+        means=tensors.means[idx],
+        quats=tensors.quats[idx],
+        scales=tensors.scales[idx],
+        opacities=tensors.opacities[idx],
+        colors=colors,
+        sh_degree=tensors.sh_degree,
+        intensity_raw=None
+        if tensors.intensity_raw is None
+        else tensors.intensity_raw[idx],
+        raydrop_logit=None
+        if tensors.raydrop_logit is None
+        else tensors.raydrop_logit[idx],
+        lidar_mask=None,
+        raydrop_sh=None if tensors.raydrop_sh is None else tensors.raydrop_sh[idx],
+    )

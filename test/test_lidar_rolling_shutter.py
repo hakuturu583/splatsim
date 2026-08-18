@@ -1,8 +1,11 @@
-"""Rolling-shutter (motion-during-sweep / deskew) LiDAR rendering.
+"""Motion-during-sweep (``sensor_to_world_end``) LiDAR rendering.
 
-Exercises the ``sensor_to_world_end`` path of :func:`render_lidar_panorama`,
-which forwards gsplat's ``viewmats_rs`` + ``RollingShutterType`` so the sensor
-pose is interpolated across the azimuth spin.
+Exercises the ``sensor_to_world_end`` path of :func:`render_lidar_panorama`.
+Note this is a midpoint-pose *approximation*, not true rolling shutter: the
+vendored SplatAD kernel has no per-column pose interpolation (the gsplat
+backend had, via ``viewmats_rs`` + ``RollingShutterType``), so the panorama is
+rendered from the translational midpoint of the start/end poses and every
+column shares that one pose. These tests pin that documented behaviour.
 """
 
 from __future__ import annotations
@@ -75,7 +78,11 @@ def test_static_end_pose_matches_global() -> None:
 
 
 def test_motion_changes_the_scan() -> None:
-    """A moving end pose must skew the scan away from the static render."""
+    """A moving end pose must shift the scan away from the static render.
+
+    With the midpoint approximation this measures the average displacement over
+    the sweep, not intra-sweep skew (see the module docstring).
+    """
     s2w = torch.eye(4, device="cuda")
     s2w_end = torch.eye(4, device="cuda")
     s2w_end[0, 3] = 2.0  # +2 m forward across the sweep
@@ -87,8 +94,36 @@ def test_motion_changes_the_scan() -> None:
     assert diff.mean().item() > 0.01, "rolling shutter had no effect under motion"
 
 
-def test_rolling_shutter_requires_ut() -> None:
-    """with_ut=False is incompatible with the pose-interpolating path."""
+def test_end_pose_renders_from_the_midpoint() -> None:
+    """A start/end pair renders exactly like a single pose at their midpoint.
+
+    This is the whole content of the approximation: no per-column interpolation
+    happens, so the (start, end) render is bit-identical to a single-pose render
+    at the translational midpoint. If real rolling shutter is ever wired up (via
+    the SplatAD kernel's per-Gaussian ``velocities``), this test is the one that
+    must change.
+    """
+    start = torch.eye(4, device="cuda")
+    end = torch.eye(4, device="cuda")
+    end[0, 3] = 4.0
+    mid = torch.eye(4, device="cuda")
+    mid[0, 3] = 2.0
+
+    swept = _render(start, sensor_to_world_end=end)
+    at_mid = _render(mid)
+    for key in ("alpha", "distance", "intensity", "raydrop_logit"):
+        assert torch.equal(swept[key], at_mid[key]), f"{key} differs from midpoint"
+
+
+def test_inert_kernel_flags_are_accepted() -> None:
+    """``with_ut``/``with_eval3d``/``packed`` no longer reach a kernel argument.
+
+    They are gsplat-era knobs the SplatAD path ignores; they stay in the
+    signature for call-site compatibility, so passing them must be a no-op
+    rather than an error or a behaviour change.
+    """
     s2w = torch.eye(4, device="cuda")
-    with pytest.raises(ValueError, match="with_ut=True"):
-        _render(s2w, sensor_to_world_end=s2w.clone(), with_ut=False)
+    base = _render(s2w)
+    off = _render(s2w, with_ut=False, with_eval3d=False, packed=True)
+    for key in ("alpha", "distance", "intensity", "raydrop_logit"):
+        assert torch.equal(base[key], off[key]), f"{key} changed by an inert flag"

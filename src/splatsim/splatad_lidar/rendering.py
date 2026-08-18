@@ -721,10 +721,15 @@ def lidar_rasterization(
         radii, means2d, depths, conics, compensations, pix_vels, depth_compensations = (
             proj_results
         )
-        opacities = opacities.repeat(C, 1)  # [C, N]
+        # [C, N]; for the single-lidar case an unsqueeze view is contiguous
+        # already, so skip the repeat's full copy of the opacity buffer.
+        opacities = opacities.unsqueeze(0) if C == 1 else opacities.repeat(C, 1)
         camera_ids, gaussian_ids = None, None
 
-    if not use_depth_compensation:
+    if not use_depth_compensation and not static_render:
+        # Zeroing matters only when the kernel actually reads the depth-comp
+        # batch (non-static path); the STATIC kernel never touches it, so the
+        # [C, N, 2] zeroing launch would be pure overhead there.
         depth_compensations = depth_compensations * 0
 
     if compensations is not None:
