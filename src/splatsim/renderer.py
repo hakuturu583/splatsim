@@ -238,8 +238,12 @@ def render_cameras_concurrent(
         return [_one(i) for i in range(len(renderers))]
 
     try:
+        from splatsim.lidar_renderer import _side_streams
+
         current = torch.cuda.current_stream()
-        streams = [torch.cuda.Stream() for _ in renderers]
+        # Cached side streams — see _side_streams: allocating them per frame
+        # costs a bimodal multi-hundred-ms stall on large scenes.
+        streams = _side_streams(len(renderers), renderers[0].device)
         # Side streams do not inherit the current stream's pending work, so they
         # must wait for the shared gather explicitly (see the LiDAR rig path for
         # what happens otherwise: the first camera reads a half-written buffer).

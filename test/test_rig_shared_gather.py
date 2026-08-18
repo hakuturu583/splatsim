@@ -267,6 +267,9 @@ def test_side_streams_wait_for_the_shared_gather() -> None:
             return super().wait_stream(other)
 
     real_stream = torch.cuda.Stream
+    # The rig caches its side streams, so the pool must be (re)built from the
+    # recording subclass for this test to observe the waits.
+    lr_mod._STREAM_POOL.clear()
     torch.cuda.Stream = _RecordingStream  # type: ignore[misc]
     try:
         rends = [
@@ -303,3 +306,62 @@ def test_side_streams_wait_for_the_shared_gather() -> None:
         )
     finally:
         torch.cuda.Stream = real_stream  # type: ignore[misc]
+        lr_mod._STREAM_POOL.clear()
+
+
+@cuda
+def test_side_streams_are_reused_across_frames() -> None:
+    """The rig must not allocate fresh CUDA streams per frame.
+
+    Creating torch.cuda.Stream objects every frame churns the caching
+    allocator's per-stream blocks, and the cost shows up as a bimodal stall:
+    measured on a 27M-Gaussian scene with 5 sensors, every other frame jumped
+    151 -> 498 ms (13x on a light frame). Reusing a pool removes it (spread
+    1.02x) and is what makes the concurrent path beat sequential at all.
+    """
+    device = torch.device("cuda")
+    scene = _scene(device)
+    rends = [
+        LidarRenderer(_spec("a", (0.0, 0.0, 1.5)), device=device, max_range_m=120.0),
+        LidarRenderer(_spec("b", (1.0, 0.5, 1.0)), device=device, max_range_m=120.0),
+    ]
+    b2w = torch.eye(4, device=device)
+
+    seen: list[tuple[int, ...]] = []
+    real_wait = torch.cuda.Stream.wait_stream
+
+    def _spy(self, other):
+        seen.append(self.cuda_stream)
+        return real_wait(self, other)
+
+    torch.cuda.Stream.wait_stream = _spy  # type: ignore[assignment]
+    try:
+        rounds = []
+        for _ in range(4):
+            seen.clear()
+            render_lidars_concurrent(rends, b2w, scene)
+            # wait_stream is called on each side stream (before) and on the
+            # current stream (after); the side-stream handles are what matter.
+            rounds.append(sorted(set(seen)))
+    finally:
+        torch.cuda.Stream.wait_stream = real_wait  # type: ignore[assignment]
+
+    assert all(r == rounds[0] for r in rounds), (
+        f"the rig used different CUDA streams across frames: {rounds}; "
+        "it should reuse a cached pool"
+    )
+    assert len(rounds[0]) >= len(rends)
+
+
+@cuda
+def test_stream_pool_grows_for_a_bigger_rig() -> None:
+    """The cache must serve a larger rig, not hand back too few streams."""
+    from splatsim.lidar_renderer import _side_streams
+
+    device = torch.device("cuda")
+    small = _side_streams(2, device)
+    big = _side_streams(6, device)
+    assert len(small) == 2 and len(big) == 6
+    # Existing streams are kept (the pool grows, it does not reallocate).
+    assert [s.cuda_stream for s in big[:2]] == [s.cuda_stream for s in small]
+    assert len({s.cuda_stream for s in big}) == 6, "pooled streams must be distinct"

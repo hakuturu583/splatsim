@@ -894,6 +894,25 @@ def gather_lidar_rig(
     )
 
 
+# Side streams for the rig paths, reused across frames. Allocating fresh
+# torch.cuda.Stream objects per frame is NOT free: their per-stream blocks churn
+# the caching allocator, and the cost lands as a bimodal stall -- measured on a
+# 27M-Gaussian scene at 5 sensors, every other frame jumped 151 -> 498 ms (and on
+# a light frame 37 -> 479 ms, 13x). Holding the streams removes it entirely
+# (frame-to-frame spread 1.02x) and is what makes the concurrent path actually
+# beat sequential: 383 -> 151 ms on that same heavy frame.
+_STREAM_POOL: dict = {}
+
+
+def _side_streams(count: int, device) -> "list[torch.cuda.Stream]":
+    """Return ``count`` cached side streams for *device*, growing the pool."""
+    key = torch.device(device).index if torch.device(device).index is not None else 0
+    pool = _STREAM_POOL.setdefault(key, [])
+    while len(pool) < count:
+        pool.append(torch.cuda.Stream(device=device))
+    return pool[:count]
+
+
 def render_lidars_concurrent(
     renderers: "Sequence[LidarRenderer]",
     base_to_world: torch.Tensor,
@@ -953,7 +972,7 @@ def render_lidars_concurrent(
 
     try:
         current = torch.cuda.current_stream()
-        streams = [torch.cuda.Stream() for _ in renderers]
+        streams = _side_streams(len(renderers), renderers[0].device)
         # The shared gather was produced on the CURRENT stream; entering a side
         # stream does not inherit that dependency, so each side stream must wait
         # for it explicitly. Without this the first (and largest) sensor races
