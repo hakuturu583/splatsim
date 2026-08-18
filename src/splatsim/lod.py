@@ -199,7 +199,13 @@ class LodManager:
         """Select the appropriate LOD tier per cell and return filtered tensors.
 
         Args:
-            camera_position: [3] float32 tensor on the same device.
+            camera_position: ``[3]`` float32 tensor on the same device, or
+                ``[S, 3]`` for a rig of S sensors. With several positions each
+                cell takes its distance to the NEAREST of them, so the selected
+                tier is never coarser than any individual sensor would have
+                chosen — the gathered set is a superset of every sensor's own
+                per-sensor selection. That is what lets one gather serve a whole
+                rig without silently decimating a sensor's near field.
             count_scale: Extra per-cell decimation applied on top of the tier
                 selection (``<1`` keeps that fraction of each cell's
                 importance-sorted Gaussians, min 1). Lets a memory/throughput
@@ -228,10 +234,17 @@ class LodManager:
         device = lod_index.cell_centers.device
         num_cells = lod_index.cell_centers.shape[0]
 
-        # 1. Camera-to-cell distances
-        dists = torch.norm(
-            lod_index.cell_centers - camera_position.unsqueeze(0), dim=1
-        )  # [C]
+        # 1. Camera-to-cell distances. For a rig ([S, 3]) take the nearest
+        # sensor per cell so no sensor ends up with a coarser tier than it would
+        # have picked alone.
+        if camera_position.dim() == 2:
+            dists = torch.cdist(
+                lod_index.cell_centers, camera_position.to(lod_index.cell_centers)
+            ).amin(dim=1)  # [C]
+        else:
+            dists = torch.norm(
+                lod_index.cell_centers - camera_position.reshape(1, 3), dim=1
+            )  # [C]
 
         # 2. Tier selection per cell
         max_d = lod_index.tier_max_distances_t  # [T]

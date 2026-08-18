@@ -123,7 +123,58 @@ message LidarSensorConfig {
 
 message InitializeLidarRequest {
   // The scene must already be loaded via Initialize.
+  //
+  // Single-sensor form. Kept for existing clients; equivalent to putting the
+  // one config in `sensors` below.
   LidarSensorConfig sensor = 1;
+
+  // Rig form: register several LiDARs at once, all sharing the loaded scene.
+  // Rendering a rig through one call is what lets the server gather the
+  // Gaussians ONCE per frame for the whole rig and rasterize each sensor on
+  // its own CUDA stream -- N sensors then cost one multi-million-Gaussian
+  // transient buffer instead of N, which is the dominant VRAM term on driving
+  // scenes. Sensor names must be unique. When non-empty this takes precedence
+  // over `sensor`.
+  repeated LidarSensorConfig sensors = 2;
+}
+
+// ── Camera rig ───────────────────────────────────────────────────────
+
+message CameraSensorConfig {
+  string name = 1;
+  CameraIntrinsics intrinsics = 2;
+  // Camera→base_link extrinsic (rotation is wxyz). The server composes it
+  // with the streamed base_link pose, so a rig streams ONE pose per frame.
+  Pose extrinsic = 3;
+  // DDS publishing.
+  string image_topic = 4;
+  string camera_info_topic = 5;
+  string frame_id = 6;
+  // "jpeg", "png", or "" for a raw Image.
+  string compress_format = 7;
+}
+
+message InitializeCameraRigRequest {
+  // The scene must already be loaded via Initialize. Registers cameras that
+  // are driven off the shared base_link pose stream, sharing one Gaussian
+  // gather per frame the same way the LiDAR rig does.
+  repeated CameraSensorConfig cameras = 1;
+  // Render cadence for the rig (Hz). 0 keeps the value from Initialize.
+  double frame_rate = 2;
+}
+
+message RigData {
+  Timestamp stamp = 1;
+  // base_link → world pose. Every registered LiDAR and camera is rendered
+  // from this single pose via its own extrinsic.
+  Pose pose = 2;
+}
+
+message RigSummary {
+  uint64 frames_rendered = 1;
+  uint64 poses_received = 2;
+  uint64 lidars_rendered = 3;
+  uint64 cameras_rendered = 4;
 }
 
 message LidarData {
@@ -165,6 +216,16 @@ service RenderingService {
   // panorama at the sensor's spin rate and publishes sensor_msgs/PointCloud2
   // via DDS. Returns summary when the stream closes.
   rpc StreamLidarData(stream LidarData) returns (StreamSummary);
+
+  // Register a camera rig driven off the shared base_link pose stream.
+  rpc InitializeCameraRig(InitializeCameraRigRequest) returns (InitializeResponse);
+
+  // Client streams timestamped base_link poses; the server renders EVERY
+  // registered LiDAR and camera for each pose off one shared Gaussian gather
+  // (one transient buffer for the whole rig) and publishes each sensor to its
+  // own DDS topic. Use this instead of separate StreamCameraData /
+  // StreamLidarData streams when a rig has more than one sensor.
+  rpc StreamRigData(stream RigData) returns (RigSummary);
 
   // Toggle Level-of-Detail filtering on the already-loaded scene at runtime.
   // Requires Initialize to have been called first.

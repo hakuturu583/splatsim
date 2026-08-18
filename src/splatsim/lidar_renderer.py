@@ -738,30 +738,209 @@ def _splatad_lidar_rasterization():
     return _SPLATAD_RAST
 
 
+@dataclass
+class LidarGaussians:
+    """The LiDAR-ready Gaussian set handed to the rasterizer.
+
+    Produced by :meth:`LidarRenderer.gather` / :func:`gather_lidar_rig` and
+    consumed by :meth:`LidarRenderer.render` via its ``shared=`` argument. Every
+    field is already LOD-filtered, lidar_mask-applied and concatenated across
+    scene sources; ``colors`` is deliberately absent (the LiDAR path never reads
+    it when per-Gaussian ``intensity_raw`` exists).
+    """
+
+    means: torch.Tensor  # (N, 3) world
+    quats: torch.Tensor  # (N, 4) wxyz
+    scales: torch.Tensor  # (N, 3)
+    opacities: torch.Tensor  # (N,)
+    intensity_sig: torch.Tensor  # (N,)
+    raydrop_logit: torch.Tensor  # (N,)
+    raydrop_sh: torch.Tensor | None  # (N, (deg+1)**2-1) or None
+
+    @property
+    def count(self) -> int:
+        return int(self.means.shape[0])
+
+    def _tensors(self) -> "list[torch.Tensor]":
+        ts = [
+            self.means,
+            self.quats,
+            self.scales,
+            self.opacities,
+            self.intensity_sig,
+            self.raydrop_logit,
+        ]
+        if self.raydrop_sh is not None:
+            ts.append(self.raydrop_sh)
+        return ts
+
+    def nbytes(self) -> int:
+        """Device bytes held by this set (for VRAM accounting / logging)."""
+        return int(sum(t.numel() * t.element_size() for t in self._tensors()))
+
+    def record_stream(self, stream: "torch.cuda.Stream") -> None:
+        """Mark these buffers as in use by *stream*.
+
+        They are allocated on the gathering stream but read by the per-sensor
+        rasterizations on side streams; without this the caching allocator may
+        hand the memory to another stream while those reads are still pending.
+        """
+        for t in self._tensors():
+            if t.is_cuda:
+                t.record_stream(stream)
+
+
+def gather_lidar_rig(
+    renderers: "Sequence[LidarRenderer]",
+    base_to_world: torch.Tensor,
+    scene: "Scene",
+    *,
+    base_to_world_end: torch.Tensor | None = None,
+) -> "LidarGaussians | None":
+    """One LOD gather covering every LiDAR on a rig.
+
+    Each sensor's own :meth:`LidarRenderer.gather` selects LOD tiers by distance
+    from THAT sensor's mount, so an N-sensor rig paid N gathers and — worse for
+    the streaming path — held N transient copies of a multi-million-Gaussian set
+    at once. On a driving scene that is the dominant VRAM term and it is what
+    makes per-sensor CUDA streams lose to sequential rendering (they overlap the
+    rasterizers but multiply the peak).
+
+    This gathers ONCE from the rig's base_link, with the LOD cell cull widened to
+    ``max(sensor max_range + that sensor's mount offset)`` so no sensor loses a
+    Gaussian it would otherwise see. The per-sensor radial/FOV cull still runs
+    inside each rasterization, so each sensor's own range limits are respected
+    exactly.
+
+    LOD tiers are selected per cell from the NEAREST sensor mount (the filter
+    takes an ``[S, 3]`` position set), so the shared selection is a superset of
+    every sensor's own: no sensor is ever handed a coarser tier than it would
+    have picked alone. Keying on a single rig origin instead would decimate the
+    near field of whichever sensor sits furthest from it — measured at 5.3% of
+    cells changed for a roof LiDAR against a ground-level base_link.
+
+    The result is still not bit-identical to per-sensor gathers: a sensor can
+    now receive Gaussians a *neighbouring* sensor's proximity kept, i.e. strictly
+    finer LOD than it asked for. Pass ``shared=None`` to
+    :meth:`LidarRenderer.render` for the exact per-sensor behaviour.
+
+    Returns ``None`` when the scene contributes nothing.
+    """
+    if not renderers:
+        return None
+    ref = renderers[0]
+    device = ref.device
+    b2w = base_to_world.to(device)
+
+    # Cell cull bound: the longest range on the rig. Cell distances below are
+    # measured from the nearest mount, so no mount-offset slack is needed.
+    max_dist: float | None = 0.0
+    for r in renderers:
+        if r.max_range_m is None:
+            max_dist = None
+            break
+        assert max_dist is not None  # noqa: S101 - guarded by the break above
+        max_dist = max(max_dist, r.max_range_m)
+    if max_dist is not None and base_to_world_end is not None:
+        max_dist += 0.5 * float(
+            torch.norm(base_to_world_end.to(device)[:3, 3] - b2w[:3, 3])
+        )
+
+    # [S, 3] world positions of every sensor mount this frame.
+    sensor_positions = torch.stack(
+        [(b2w @ r._s2b_t.to(device))[:3, 3] for r in renderers], dim=0
+    ).detach()
+
+    lod_scale = float(os.environ.get("SPLATSIM_LIDAR_LOD_SCALE", "0.5"))
+    ignore_mask = any(r.ignore_lidar_mask for r in renderers)
+    tensor_list = scene.collect_tensors(
+        sensor_positions,
+        lod_count_scale=lod_scale,
+        lidar_view=not ignore_mask,
+        lod_max_distance=max_dist,
+    )
+    if not tensor_list:
+        return None
+
+    sh_degrees = {t.sh_degree for t in tensor_list}
+    if len(sh_degrees) != 1:
+        raise ValueError(f"Mixed SH degrees across scene sources: {sh_degrees}")
+
+    means_l, quats_l, scales_l, opac_l, inten_l, drop_l = [], [], [], [], [], []
+    sh_l: list[torch.Tensor | None] = []
+    for t in tensor_list:
+        if not ignore_mask and t.lidar_mask is not None:
+            t = t[t.lidar_mask]
+        i_sig, r_logit = _resolve_lidar_attrs(t)
+        means_l.append(t.means)
+        quats_l.append(t.quats)
+        scales_l.append(t.scales)
+        opac_l.append(t.opacities)
+        inten_l.append(i_sig)
+        drop_l.append(r_logit)
+        sh_l.append(t.raydrop_sh)
+
+    means = torch.cat(means_l, dim=0).to(device)
+    if means.shape[0] == 0:
+        return None
+    return LidarGaussians(
+        means=means,
+        quats=torch.cat(quats_l, dim=0).to(device),
+        scales=torch.cat(scales_l, dim=0).to(device),
+        opacities=torch.cat(opac_l, dim=0).to(device),
+        intensity_sig=torch.cat(inten_l, dim=0),
+        raydrop_logit=torch.cat(drop_l, dim=0),
+        raydrop_sh=ref._concat_raydrop_sh(sh_l, [m.shape[0] for m in means_l], device),
+    )
+
+
 def render_lidars_concurrent(
     renderers: "Sequence[LidarRenderer]",
     base_to_world: torch.Tensor,
-    scene: Scene,
+    scene: "Scene",
     base_to_world_end: torch.Tensor | None = None,
+    *,
+    shared_gather: bool = True,
 ) -> list[dict]:
-    """Render several LiDAR panoramas for one frame, one CUDA stream each.
+    """Render every LiDAR on a rig for one frame, sharing one Gaussian gather.
 
-    A single spinning-LiDAR render underutilises the GPU at aggressive LOD (the
-    rasterize is cheap and each sensor's setup / cull / projection / launch
-    overhead is latency- and CPU-bound, not SM-bound). The sensors share the
-    read-only ``scene`` and write independent panoramas, so putting each on its
-    own stream overlaps those pipelines: measured ~2.6x for the 5-LiDAR rig
-    (prodD, LOD 0.25 5.7->15 FPS; LOD 0.1 14->36 FPS), bit-identical to the
-    sequential result.
+    Two things make an N-sensor rig cheap here:
 
-    Set ``SPLATSIM_LIDAR_CONCURRENT=0`` to force sequential. Falls back to
-    sequential on CUDA OOM (concurrent renders hold all sensors' transient
-    memory at once, which can be too much for large scenes at high LOD).
+    * **One gather instead of N** (``shared_gather``, default on). The sensors
+      sit within a couple of metres of each other on the same vehicle, so
+      :func:`gather_lidar_rig` collects the union once and every sensor
+      rasterizes it. That removes N-1 LOD gathers AND, decisively, N-1
+      multi-million-Gaussian transient buffers — the peak-VRAM term that used to
+      make the concurrent path lose to sequential rendering on big scenes. See
+      :func:`gather_lidar_rig` for the LOD tier approximation this implies.
+    * **One CUDA stream per sensor.** With the memory blow-up gone, the
+      per-sensor cull / projection / launch pipelines (latency- and CPU-bound at
+      aggressive LOD, not SM-bound) overlap instead of serializing.
+
+    ``SPLATSIM_LIDAR_CONCURRENT=0`` forces one stream (the shared gather still
+    applies); ``shared_gather=False`` restores per-sensor gathers. Falls back to
+    sequential on CUDA OOM, which concurrent streams can still provoke on very
+    large scenes since all sensors' rasterizer scratch is live at once.
     """
+    if not renderers:
+        return []
+
+    shared = None
+    if shared_gather:
+        shared = gather_lidar_rig(
+            renderers, base_to_world, scene, base_to_world_end=base_to_world_end
+        )
+        if shared is None:
+            return [r._empty_panorama() for r in renderers]
 
     def _sequential() -> list[dict]:
         return [
-            r.render(base_to_world, scene=scene, base_to_world_end=base_to_world_end)
+            r.render(
+                base_to_world,
+                scene=scene,
+                base_to_world_end=base_to_world_end,
+                shared=shared,
+            )
             for r in renderers
         ]
 
@@ -773,13 +952,33 @@ def render_lidars_concurrent(
         return _sequential()
 
     try:
+        current = torch.cuda.current_stream()
         streams = [torch.cuda.Stream() for _ in renderers]
+        # The shared gather was produced on the CURRENT stream; entering a side
+        # stream does not inherit that dependency, so each side stream must wait
+        # for it explicitly. Without this the first (and largest) sensor races
+        # the tail of the gather and rasterizes a partially-written buffer --
+        # observed as an empty panorama in 11 of 12 runs.
+        for st in streams:
+            st.wait_stream(current)
         outs: dict[int, dict] = {}
-        for i, (r, s) in enumerate(zip(renderers, streams)):
-            with torch.cuda.stream(s):
+        for i, (r, st) in enumerate(zip(renderers, streams)):
+            with torch.cuda.stream(st):
                 outs[i] = r.render(
-                    base_to_world, scene=scene, base_to_world_end=base_to_world_end
+                    base_to_world,
+                    scene=scene,
+                    base_to_world_end=base_to_world_end,
+                    shared=shared,
                 )
+            # Keep the caching allocator from recycling the shared buffers (and
+            # each sensor's outputs) into another stream before this one is done.
+            if shared is not None:
+                shared.record_stream(st)
+            for t in outs[i].values():
+                if torch.is_tensor(t):
+                    t.record_stream(current)
+        for st in streams:
+            current.wait_stream(st)
         torch.cuda.synchronize()
         return [outs[i] for i in range(len(renderers))]
     except torch.cuda.OutOfMemoryError:
@@ -1285,6 +1484,7 @@ class LidarRenderer:
         *,
         scene: "Scene",
         base_to_world_end: torch.Tensor | None = None,
+        shared: "LidarGaussians | None" = None,
     ) -> dict[str, torch.Tensor]:
         """Render one LiDAR panorama.
 
@@ -1296,6 +1496,11 @@ class LidarRenderer:
                 sweep. When given, the panorama is rendered from the midpoint of
                 the two poses — a motion-during-sweep approximation, not true
                 rolling shutter (see :func:`render_lidar_panorama`).
+            shared: Pre-gathered Gaussians from :func:`gather_lidar_rig`. When
+                given, this sensor skips its own LOD gather and rasterizes the
+                shared set — the point of the rig path: one gather and one
+                transient buffer for N sensors instead of N of each. ``None``
+                gathers per-sensor, as before.
 
         Returns:
             ``{"alpha", "distance", "intensity", "raydrop_logit"}`` — each an
@@ -1306,6 +1511,50 @@ class LidarRenderer:
         sensor_to_world_end = None
         if base_to_world_end is not None:
             sensor_to_world_end = base_to_world_end.to(self.device) @ self._s2b_t
+
+        if shared is None:
+            shared = self.gather(
+                base_to_world, scene, base_to_world_end=base_to_world_end
+            )
+        if shared is None or shared.means.shape[0] == 0:
+            return self._empty_panorama()
+
+        return render_lidar_panorama(
+            means=shared.means,
+            quats=shared.quats,
+            scales=shared.scales,
+            opacities=shared.opacities,
+            intensity_sig=shared.intensity_sig,
+            raydrop_logit=shared.raydrop_logit,
+            sensor_to_world=sensor_to_world,
+            lidar_spec=self.sensor_spec,
+            raydrop_sh=shared.raydrop_sh,
+            sensor_to_world_end=sensor_to_world_end,
+            min_range_m=self.min_range_m,
+            max_range_m=self.max_range_m,
+            packed=self.packed,
+            radius_clip=self.radius_clip,
+            frustum_cull=self.frustum_cull,
+            cull_scale_sigmas=self.cull_scale_sigmas,
+            elev_fov_cull=self.elev_fov_cull,
+            with_ut=self.with_ut,
+            with_eval3d=self.with_eval3d,
+        )
+
+    def gather(
+        self,
+        base_to_world: torch.Tensor,
+        scene: "Scene",
+        *,
+        base_to_world_end: torch.Tensor | None = None,
+    ) -> "LidarGaussians | None":
+        """Collect the LiDAR-ready Gaussian set this sensor would rasterize.
+
+        Split out of :meth:`render` so a whole rig can share one gather — see
+        :func:`gather_lidar_rig`. Returns ``None`` when the scene contributes
+        nothing.
+        """
+        sensor_to_world = base_to_world.to(self.device) @ self._s2b_t
         cam_pos = sensor_to_world[:3, 3].detach()
 
         # LiDAR-specific LOD: a spinning LiDAR sees the full 360°, so (unlike a
@@ -1342,7 +1591,7 @@ class LidarRenderer:
             lod_max_distance=lod_max_dist,
         )
         if not tensor_list:
-            return self._empty_panorama()
+            return None
 
         sh_degrees = {t.sh_degree for t in tensor_list}
         if len(sh_degrees) != 1:
@@ -1382,30 +1631,19 @@ class LidarRenderer:
             raydrop_sh_list, [m.shape[0] for m in means_list], self.device
         )
 
-        # Every Gaussian masked out of the LiDAR pass -> zero-output panorama.
+        # Every Gaussian masked out of the LiDAR pass -> caller emits a
+        # zero-output panorama.
         if means.shape[0] == 0:
-            return self._empty_panorama()
+            return None
 
-        return render_lidar_panorama(
+        return LidarGaussians(
             means=means,
             quats=quats,
             scales=scales,
             opacities=opacities,
             intensity_sig=intensity_sig,
             raydrop_logit=raydrop_logit,
-            sensor_to_world=sensor_to_world,
-            lidar_spec=self.sensor_spec,
             raydrop_sh=raydrop_sh,
-            sensor_to_world_end=sensor_to_world_end,
-            min_range_m=self.min_range_m,
-            max_range_m=self.max_range_m,
-            packed=self.packed,
-            radius_clip=self.radius_clip,
-            frustum_cull=self.frustum_cull,
-            cull_scale_sigmas=self.cull_scale_sigmas,
-            elev_fov_cull=self.elev_fov_cull,
-            with_ut=self.with_ut,
-            with_eval3d=self.with_eval3d,
         )
 
     @staticmethod

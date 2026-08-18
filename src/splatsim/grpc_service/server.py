@@ -30,8 +30,12 @@ from splatsim.grpc_service.viewmat_builder import (
     build_intrinsics,
     build_viewmat_from_pose,
 )
-from splatsim.lidar_renderer import LidarRenderer, build_lidar_sensors_from_config
-from splatsim.renderer import Renderer
+from splatsim.lidar_renderer import (
+    LidarRenderer,
+    build_lidar_sensors_from_config,
+    render_lidars_concurrent,
+)
+from splatsim.renderer import Renderer, render_cameras_concurrent
 from splatsim.scene import Scene
 
 logger = logging.getLogger(__name__)
@@ -47,6 +51,29 @@ class _PinholeConfig:
     cy: float
     image_width: int
     image_height: int
+
+
+@dataclass
+class _RigLidar:
+    """One LiDAR on the rig, with everything the frame loop needs."""
+
+    name: str
+    renderer: LidarRenderer
+    publisher: PointCloud2Publisher
+    drop_threshold: float
+    alpha_threshold: float
+
+
+@dataclass
+class _RigCamera:
+    """One camera on the rig; ``cam_to_base`` is composed with the ego pose."""
+
+    name: str
+    renderer: Renderer
+    K: torch.Tensor
+    cam_to_base: torch.Tensor  # (4, 4) camera→base_link
+    image_pub: ImagePublisher | None
+    info_pub: CameraInfoPublisher | None
 
 
 class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
@@ -74,6 +101,15 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         self._lidar_drop_threshold: float = 0.5
         self._lidar_alpha_threshold: float = 0.1
         self._lidar_render_count: int = 0
+
+        # Rig state: every LiDAR / camera driven off ONE base_link pose stream.
+        # Rendering them together is what lets a frame share a single Gaussian
+        # gather (see render_lidars_concurrent / render_cameras_concurrent), so
+        # N sensors cost one multi-million-Gaussian transient buffer, not N.
+        self._rig_lidars: list[_RigLidar] = []
+        self._rig_cameras: list[_RigCamera] = []
+        self._rig_frame_rate: float = 10.0
+        self._rig_render_count: int = 0
 
     def Initialize(
         self,
@@ -250,12 +286,12 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
 
     def _run_pose_stream(
         self,
-        request_iterator: Iterator[pb2.CameraData | pb2.LidarData],
+        request_iterator: Iterator[pb2.CameraData | pb2.LidarData | pb2.RigData],
         *,
         frame_rate: float,
         render_and_publish: Callable[[TimestampedPose, int], None],
     ) -> pb2.StreamSummary:
-        """Shared two-thread pose-streaming loop for camera and LiDAR.
+        """Shared two-thread pose-streaming loop for camera, LiDAR and rig.
 
         Reading from the gRPC stream and GPU rendering run on separate
         threads so slow rendering never blocks pose ingestion. The render
@@ -431,7 +467,13 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 assert self._device is not None  # noqa: S101
                 assert self._dp is not None  # noqa: S101
 
-                s = request.sensor
+                # Rig form takes precedence; the single-sensor field stays
+                # supported for existing clients.
+                sensor_msgs = list(request.sensors) or [request.sensor]
+                if len(sensor_msgs) > 1 or request.sensors:
+                    return self._init_lidar_rig(sensor_msgs)
+
+                s = sensor_msgs[0]
                 ext = s.extrinsic
                 pos = ext.position
                 rot = ext.rotation  # wxyz
@@ -521,6 +563,264 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             frame_rate=self._lidar_frame_rate,
             render_and_publish=self._render_and_publish_lidar,
         )
+
+    # ── Rig: many LiDARs / cameras off one shared gather ─────────────────
+
+    def _lidar_config_from_msg(self, s) -> LidarConfig:
+        """Build a LidarConfig from a proto LidarSensorConfig (defaults filled)."""
+        ext = s.extrinsic
+        pos, rot = ext.position, ext.rotation  # rot is wxyz
+        d = sensor_defaults(s.sensor_type)
+        return LidarConfig(
+            name=s.name or "lidar",
+            sensor_type=s.sensor_type,
+            n_rows=int(s.n_rows) or int(d.get("n_rows", 128)),
+            n_columns=int(s.n_columns) or int(d.get("n_columns", 2048)),
+            fps=s.fps or d.get("fps", 10.0),
+            min_range_m=s.min_range_m or d.get("min_range_m", 0.3),
+            max_range_m=s.max_range_m or d.get("max_range_m", 120.0),
+            position=(pos.x, pos.y, pos.z),
+            rotation=(rot.w, rot.x, rot.y, rot.z),
+            elevation_deg=tuple(s.elevation_deg) or None,
+            pointcloud_topic=(
+                s.pointcloud_topic or f"/splatsim/{s.name or 'lidar'}/pointcloud"
+            ),
+            frame_id=s.frame_id or (s.name or "splatsim_lidar"),
+            drop_threshold=s.drop_threshold or 0.5,
+            alpha_threshold=s.alpha_threshold or 0.1,
+        )
+
+    def _init_lidar_rig(self, sensor_msgs) -> pb2.InitializeResponse:
+        """Register several LiDARs that render together off one gather."""
+        assert self._device is not None  # noqa: S101
+        assert self._dp is not None  # noqa: S101
+
+        cfgs = [self._lidar_config_from_msg(m) for m in sensor_msgs]
+        names = [c.name for c in cfgs]
+        if len(set(names)) != len(names):
+            return pb2.InitializeResponse(
+                success=False, message=f"duplicate LiDAR names: {names}"
+            )
+
+        specs = build_lidar_sensors_from_config(cfgs)
+        rig: list[_RigLidar] = []
+        for cfg, spec in zip(cfgs, specs):
+            rig.append(
+                _RigLidar(
+                    name=cfg.name,
+                    renderer=LidarRenderer(
+                        spec,
+                        device=self._device,
+                        min_range_m=cfg.min_range_m,
+                        max_range_m=cfg.max_range_m,
+                    ),
+                    publisher=PointCloud2Publisher(
+                        self._dp,
+                        topic_name=cfg.pointcloud_topic,
+                        frame_id=cfg.frame_id,
+                    ),
+                    drop_threshold=cfg.drop_threshold,
+                    alpha_threshold=cfg.alpha_threshold,
+                )
+            )
+        self._rig_lidars = rig
+        # The rig renders on one cadence; take the fastest sensor's rate so no
+        # sensor is starved (slower ones simply repeat the latest pose).
+        self._rig_frame_rate = max(c.fps for c in cfgs)
+        logger.info(
+            "LiDAR rig initialized: %d sensors (%s) at %.1f Hz",
+            len(rig),
+            ", ".join(names),
+            self._rig_frame_rate,
+        )
+        return pb2.InitializeResponse(success=True)
+
+    def InitializeCameraRig(
+        self,
+        request: pb2.InitializeCameraRigRequest,
+        context: grpc.ServicerContext,
+    ) -> pb2.InitializeResponse:
+        """Register cameras driven off the shared base_link pose stream."""
+        with self._lock:
+            try:
+                if not self._initialized or self._scene is None:
+                    return pb2.InitializeResponse(
+                        success=False,
+                        message="Scene not initialized. Call Initialize first.",
+                    )
+                assert self._device is not None  # noqa: S101
+                assert self._dp is not None  # noqa: S101
+
+                names = [c.name for c in request.cameras]
+                if len(set(names)) != len(names):
+                    return pb2.InitializeResponse(
+                        success=False, message=f"duplicate camera names: {names}"
+                    )
+
+                rig: list[_RigCamera] = []
+                for c in request.cameras:
+                    intr = c.intrinsics
+                    ext = c.extrinsic
+                    cam_to_base = build_base_to_world_from_pose(
+                        (ext.position.x, ext.position.y, ext.position.z),
+                        (
+                            ext.rotation.w,
+                            ext.rotation.x,
+                            ext.rotation.y,
+                            ext.rotation.z,
+                        ),
+                        self._device,
+                    )
+                    rig.append(
+                        _RigCamera(
+                            name=c.name or "camera",
+                            renderer=Renderer(
+                                width=intr.width,
+                                height=intr.height,
+                                device=self._device,
+                            ),
+                            K=build_intrinsics(
+                                intr.fx, intr.fy, intr.cx, intr.cy, self._device
+                            ),
+                            cam_to_base=cam_to_base,
+                            image_pub=ImagePublisher(
+                                self._dp,
+                                topic_name=(
+                                    c.image_topic
+                                    or f"/splatsim/{c.name or 'camera'}/image"
+                                ),
+                                frame_id=c.frame_id or (c.name or "splatsim_camera"),
+                                compress_format=c.compress_format or "",
+                            ),
+                            info_pub=CameraInfoPublisher(
+                                self._dp,
+                                topic_name=(
+                                    c.camera_info_topic
+                                    or f"/splatsim/{c.name or 'camera'}/camera_info"
+                                ),
+                                frame_id=c.frame_id or (c.name or "splatsim_camera"),
+                                config=_PinholeConfig(
+                                    fx=intr.fx,
+                                    fy=intr.fy,
+                                    cx=intr.cx,
+                                    cy=intr.cy,
+                                    image_width=intr.width,
+                                    image_height=intr.height,
+                                ),
+                            ),
+                        )
+                    )
+                self._rig_cameras = rig
+                if request.frame_rate:
+                    self._rig_frame_rate = request.frame_rate
+                logger.info(
+                    "Camera rig initialized: %d cameras (%s)",
+                    len(rig),
+                    ", ".join(names),
+                )
+                return pb2.InitializeResponse(success=True)
+            except Exception as exc:
+                logger.exception("InitializeCameraRig failed")
+                return pb2.InitializeResponse(success=False, message=str(exc))
+
+    def StreamRigData(
+        self,
+        request_iterator: Iterator[pb2.RigData],
+        context: grpc.ServicerContext,
+    ) -> pb2.RigSummary:
+        """Render every registered LiDAR and camera per streamed base_link pose."""
+        if not self._initialized:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "Service not initialized. Call Initialize first.",
+            )
+        if not self._rig_lidars and not self._rig_cameras:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "No rig registered. Call InitializeLidar (sensors) or "
+                "InitializeCameraRig first.",
+            )
+
+        summary = self._run_pose_stream(
+            request_iterator,
+            frame_rate=self._rig_frame_rate,
+            render_and_publish=self._render_and_publish_rig,
+        )
+        return pb2.RigSummary(
+            frames_rendered=summary.frames_rendered,
+            poses_received=summary.poses_received,
+            lidars_rendered=summary.frames_rendered * len(self._rig_lidars),
+            cameras_rendered=summary.frames_rendered * len(self._rig_cameras),
+        )
+
+    def _render_and_publish_rig(
+        self,
+        pose: TimestampedPose,
+        render_time_ns: int,
+    ) -> None:
+        """One frame for the whole rig: one gather per modality, one stream each."""
+        assert self._scene is not None  # noqa: S101
+        assert self._device is not None  # noqa: S101
+
+        t0 = time.monotonic()
+        base_to_world = build_base_to_world_from_pose(
+            pose.position, pose.rotation, self._device
+        )
+        sec, nanosec = divmod(render_time_ns, 1_000_000_000)
+        stamp = Time(sec=sec, nanosec=nanosec)
+
+        n_points = 0
+        with torch.no_grad():
+            if self._rig_lidars:
+                panoramas = render_lidars_concurrent(
+                    [rl.renderer for rl in self._rig_lidars],
+                    base_to_world,
+                    self._scene,
+                )
+                for rl, pano in zip(self._rig_lidars, panoramas):
+                    records, n = rl.renderer.panorama_to_pointcloud2_data(
+                        pano,
+                        drop_threshold=rl.drop_threshold,
+                        alpha_threshold=rl.alpha_threshold,
+                    )
+                    rl.publisher.publish_packed(records, n, stamp=stamp)
+                    n_points += n
+            t_lidar = time.monotonic()
+
+            if self._rig_cameras:
+                # world→camera = inv(base_to_world @ cam_to_base)
+                viewmats = [
+                    torch.linalg.inv(base_to_world @ rc.cam_to_base)
+                    for rc in self._rig_cameras
+                ]
+                images = render_cameras_concurrent(
+                    [rc.renderer for rc in self._rig_cameras],
+                    viewmats,
+                    [rc.K for rc in self._rig_cameras],
+                    scene=self._scene,
+                    camera_names=[rc.name for rc in self._rig_cameras],
+                )
+                for rc, rgb in zip(self._rig_cameras, images):
+                    bgr = (rgb.clamp(0.0, 1.0) * 255).byte()[:, :, [2, 1, 0]]
+                    if rc.image_pub is not None:
+                        rc.image_pub.publish(bgr.cpu().numpy(), stamp=stamp)
+                    if rc.info_pub is not None:
+                        rc.info_pub.publish(stamp=stamp)
+        t_end = time.monotonic()
+
+        self._rig_render_count += 1
+        if self._rig_render_count <= 5 or self._rig_render_count % 100 == 0:
+            logger.info(
+                "Rig frame #%d: %d LiDARs (%d pts) + %d cameras "
+                "total=%.1fms (lidar=%.1f camera=%.1f)",
+                self._rig_render_count,
+                len(self._rig_lidars),
+                n_points,
+                len(self._rig_cameras),
+                (t_end - t0) * 1000,
+                (t_lidar - t0) * 1000,
+                (t_end - t_lidar) * 1000,
+            )
 
     def _render_and_publish_lidar(
         self,

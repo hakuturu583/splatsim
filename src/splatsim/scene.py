@@ -106,7 +106,8 @@ class Scene:
         """Collect Gaussian tensors from all sources, applying LOD if enabled.
 
         Args:
-            camera_position: [3] float32 GPU tensor, or None to skip LOD.
+            camera_position: ``[3]`` float32 GPU tensor (or ``[S, 3]`` for a
+                rig — see :meth:`LodManager.filter`), or None to skip LOD.
             lod_count_scale: Extra per-cell LOD decimation (``<1`` thins every
                 cell further; forwarded to :meth:`LodManager.filter`). Used by
                 the LiDAR renderer to cap Gaussian count on 360° scenes that the
@@ -151,7 +152,10 @@ class Scene:
                 # Transform camera position into the rigid body's local frame
                 # so that octree cell distances are computed correctly.
                 rot_mat = quat_to_rotation_matrix(rb.rotation)  # [3, 3]
-                cam_local = rot_mat.T @ (camera_position - rb.position)
+                # Works for a single [3] position and for a rig's [S, 3].
+                cam_local = (camera_position.reshape(-1, 3) - rb.position) @ rot_mat
+                if camera_position.dim() == 1:
+                    cam_local = cam_local.reshape(3)
                 base = self._lod_manager.filter(
                     rb.base_tensors,
                     rb.lod_index,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -48,40 +49,35 @@ class Renderer:
         *,
         scene: Scene | None = None,
         camera_name: str | None = None,
+        shared: "CameraGaussians | None" = None,
     ) -> Tensor:
-        """Render the scene and return an [H, W, 3] float32 RGB image (0-1)."""
-        tensor_list: list[GaussianTensors] = []
+        """Render the scene and return an [H, W, 3] float32 RGB image (0-1).
 
+        ``shared`` supplies a pre-gathered Gaussian set (see
+        :func:`gather_camera_rig`) so a multi-camera rig pays one LOD gather and
+        holds one transient buffer for the whole rig instead of one per camera.
+        """
         camera_pos: Tensor | None = None
-        if scene is not None:
-            if scene.lod_enabled or scene.ppisp_tables is not None:
-                # viewmat is world-to-camera: [R | t], camera_pos = -R^T @ t
-                R = viewmat[:3, :3]
-                t = viewmat[:3, 3]
-                camera_pos = -(R.T @ t)
+        if scene is not None and (scene.lod_enabled or scene.ppisp_tables is not None):
+            # viewmat is world-to-camera: [R | t], camera_pos = -R^T @ t
+            R = viewmat[:3, :3]
+            t = viewmat[:3, 3]
+            camera_pos = -(R.T @ t)
 
-            tensor_list = scene.collect_tensors(
-                camera_pos if scene.lod_enabled else None
-            )
+        if shared is None:
+            shared = gather_camera(scene, camera_pos)
 
-        if not tensor_list:
+        if shared is None:
             return torch.zeros(
                 self.height, self.width, 3, device=self.device, dtype=torch.float32
             )
 
-        # Concatenate all Gaussians
-        all_means = torch.cat([t.means for t in tensor_list], dim=0)
-        all_quats = torch.cat([t.quats for t in tensor_list], dim=0)
-        all_scales = torch.cat([t.scales for t in tensor_list], dim=0)
-        all_opacities = torch.cat([t.opacities for t in tensor_list], dim=0)
-        all_colors = torch.cat([t.colors for t in tensor_list], dim=0)
-
-        # Determine SH degree (use SH only if all sources agree)
-        sh_degrees = {t.sh_degree for t in tensor_list}
-        if len(sh_degrees) == 1 and sh_degrees.pop() > 0:
-            sh_degree: int | None = tensor_list[0].sh_degree
-        else:
-            sh_degree = None
+        all_means = shared.means
+        all_quats = shared.quats
+        all_scales = shared.scales
+        all_opacities = shared.opacities
+        all_colors = shared.colors
+        sh_degree = shared.sh_degree
 
         # Camera tensors: add batch dimension
         viewmats = viewmat.unsqueeze(0).to(self.device)  # [1, 4, 4]
@@ -121,3 +117,146 @@ class Renderer:
         elif self.exposure != 1.0:
             rgb = rgb * self.exposure
         return rgb  # [H, W, 3]
+
+
+@dataclass
+class CameraGaussians:
+    """A camera-ready Gaussian set, already LOD-filtered and concatenated.
+
+    Produced by :func:`gather_camera` / :func:`gather_camera_rig` and consumed
+    by :meth:`Renderer.render` via ``shared=``. Unlike the LiDAR equivalent this
+    keeps ``colors`` (the appearance path needs the SH block).
+    """
+
+    means: Tensor
+    quats: Tensor
+    scales: Tensor
+    opacities: Tensor
+    colors: Tensor
+    sh_degree: int | None
+
+    @property
+    def count(self) -> int:
+        return int(self.means.shape[0])
+
+    def _tensors(self) -> "list[Tensor]":
+        return [self.means, self.quats, self.scales, self.opacities, self.colors]
+
+    def nbytes(self) -> int:
+        """Device bytes held by this set (for VRAM accounting / logging)."""
+        return int(sum(t.numel() * t.element_size() for t in self._tensors()))
+
+    def record_stream(self, stream) -> None:
+        """Mark these buffers as in use by *stream* (see the LiDAR equivalent)."""
+        for t in self._tensors():
+            if t.is_cuda:
+                t.record_stream(stream)
+
+
+def _pack(tensor_list: "list[GaussianTensors]") -> "CameraGaussians | None":
+    if not tensor_list:
+        return None
+    sh_degrees = {t.sh_degree for t in tensor_list}
+    if len(sh_degrees) == 1 and sh_degrees.pop() > 0:
+        sh_degree: int | None = tensor_list[0].sh_degree
+    else:
+        sh_degree = None
+    return CameraGaussians(
+        means=torch.cat([t.means for t in tensor_list], dim=0),
+        quats=torch.cat([t.quats for t in tensor_list], dim=0),
+        scales=torch.cat([t.scales for t in tensor_list], dim=0),
+        opacities=torch.cat([t.opacities for t in tensor_list], dim=0),
+        colors=torch.cat([t.colors for t in tensor_list], dim=0),
+        sh_degree=sh_degree,
+    )
+
+
+def gather_camera(
+    scene: "Scene | None", camera_pos: Tensor | None
+) -> "CameraGaussians | None":
+    """Collect the Gaussians a single camera at *camera_pos* would rasterize."""
+    if scene is None:
+        return None
+    return _pack(scene.collect_tensors(camera_pos if scene.lod_enabled else None))
+
+
+def gather_camera_rig(
+    scene: "Scene | None", viewmats: "list[Tensor]"
+) -> "CameraGaussians | None":
+    """One LOD gather covering every camera on a rig.
+
+    LOD tiers are picked per cell from the NEAREST camera (the filter accepts an
+    ``[S, 3]`` position set), so the shared set is a superset of what any single
+    camera would have selected -- no camera is handed a coarser tier than it
+    asked for. In exchange an N-camera rig performs one gather and holds one
+    transient Gaussian buffer per frame instead of N, which is the dominant VRAM
+    term when a rig renders concurrently.
+    """
+    if scene is None or not viewmats:
+        return None
+    if not scene.lod_enabled:
+        return _pack(scene.collect_tensors(None))
+    positions = torch.stack(
+        [-(vm[:3, :3].T @ vm[:3, 3]) for vm in viewmats], dim=0
+    ).detach()  # [S, 3]
+    return _pack(scene.collect_tensors(positions))
+
+
+def render_cameras_concurrent(
+    renderers: "list[Renderer]",
+    viewmats: "list[Tensor]",
+    Ks: "list[Tensor]",
+    *,
+    scene: "Scene | None" = None,
+    camera_names: "list[str | None] | None" = None,
+    shared_gather: bool = True,
+) -> "list[Tensor]":
+    """Render every camera on a rig for one frame off one shared gather.
+
+    Mirrors :func:`splatsim.lidar_renderer.render_lidars_concurrent`: one gather
+    for the rig (``shared_gather``) plus one CUDA stream per camera, so the
+    per-camera setup/launch pipelines overlap without multiplying peak VRAM.
+    ``SPLATSIM_CAMERA_CONCURRENT=0`` forces a single stream.
+    """
+    import os
+
+    if not renderers:
+        return []
+    names = camera_names or [None] * len(renderers)
+    shared = gather_camera_rig(scene, viewmats) if shared_gather else None
+
+    def _one(i: int) -> Tensor:
+        return renderers[i].render(
+            viewmats[i], Ks[i], scene=scene, camera_name=names[i], shared=shared
+        )
+
+    if (
+        len(renderers) <= 1
+        or not torch.cuda.is_available()
+        or os.environ.get("SPLATSIM_CAMERA_CONCURRENT", "1") == "0"
+    ):
+        return [_one(i) for i in range(len(renderers))]
+
+    try:
+        current = torch.cuda.current_stream()
+        streams = [torch.cuda.Stream() for _ in renderers]
+        # Side streams do not inherit the current stream's pending work, so they
+        # must wait for the shared gather explicitly (see the LiDAR rig path for
+        # what happens otherwise: the first camera reads a half-written buffer).
+        for st in streams:
+            st.wait_stream(current)
+        outs: dict[int, Tensor] = {}
+        for i, st in enumerate(streams):
+            with torch.cuda.stream(st):
+                outs[i] = _one(i)
+            if shared is not None:
+                shared.record_stream(st)
+            outs[i].record_stream(current)
+        for st in streams:
+            current.wait_stream(st)
+        torch.cuda.synchronize()
+        return [outs[i] for i in range(len(renderers))]
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        return [_one(i) for i in range(len(renderers))]
