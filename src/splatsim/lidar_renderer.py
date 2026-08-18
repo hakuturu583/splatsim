@@ -1060,7 +1060,7 @@ def render_lidar_panorama(
     max_range_m: float | None = 120.0,
     packed: bool = False,
     radius_clip: float = 0.0,
-    frustum_cull: bool = True,
+    frustum_cull: bool = False,
     cull_scale_sigmas: float = 3.0,
     elev_fov_cull: bool = True,
     with_ut: bool = True,
@@ -1100,11 +1100,26 @@ def render_lidar_panorama(
     ``radius_clip`` drops Gaussians whose projected 2D radius is below
     the given pixel count; useful for skipping sub-pixel dust.
 
-    ``frustum_cull`` runs a cheap Python-side spherical-shell test
-    (``|means - sensor_pos| ± sigmas * max(scale)``) that trims the
-    input tensors before they reach gsplat. This is the biggest
-    single-source win for driving-scale scenes, where most Gaussians
-    live far outside the sensor's usable range.
+    ``frustum_cull`` runs a spherical-shell + elevation-FOV test
+    (``|means - sensor_pos| ± sigmas * max(scale)``) and gathers the survivors
+    before they reach the rasterizer. It defaults to OFF, and measurably so:
+
+    * It no longer removes much. The LOD gather already drops whole octree
+      cells beyond the sensor's range (``lod_max_distance``), so this pass cuts
+      only ~15% of what reaches it (9.6M -> 8.2M on a driving frame) -- yet it
+      pays for 7 full-array gathers to do it.
+    * Those gathers cost more than they save: the 5-sensor rig measures
+      124.4 ms with the cull and 116.6 ms without, at 0.6 GiB LOWER peak VRAM
+      (no gathered copies).
+    * It was also dropping real returns. The projection kernel rejects on the
+      exact projected extent; this pass approximates with a linearized
+      elevation band, so it can discard Gaussians the rasterizer would have
+      kept. Measured against cull-off across the rig, every differing cell was
+      a return the cull had thrown away and none was one it invented
+      (only-OFF 3-9 cells per sensor, only-ON 0).
+
+    Turn it on only when memory pressure makes the shorter arrays worth the
+    gather and the lost returns.
 
     ``elev_fov_cull`` layers a splatAD-style vertical-FOV test on top
     of the radial shell (sensor-frame elevation ± ``sigmas * scale /
@@ -1453,7 +1468,7 @@ class LidarRenderer:
         max_range_m: float | None = 120.0,
         packed: bool = False,
         radius_clip: float = 0.0,
-        frustum_cull: bool = True,
+        frustum_cull: bool = False,
         cull_scale_sigmas: float = 3.0,
         elev_fov_cull: bool = True,
         with_ut: bool = True,
