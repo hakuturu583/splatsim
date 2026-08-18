@@ -459,6 +459,22 @@ def _eval_view_dependent_raydrop(
     if raydrop_sh is None:
         return raydrop_logit
 
+    # Fast path: a dedicated single-pass CUDA kernel. gsplat's
+    # spherical_harmonics takes colour-shaped (N, K, 3) coefficients, so the
+    # fallback below has to materialise a throwaway (N, K, 3) buffer (306 MiB at
+    # N=3.2M, K=9) and zero-fill + scatter into it, then evaluate three channels
+    # to use one -- ~1.8 ms/frame/sensor of pure packing. The kernel reads the
+    # scalar logit and the higher bands directly.
+    if means.is_cuda and means.shape[0] > 0:
+        ext = _cuda_cull_ext._try_load()
+        if ext is not None and hasattr(ext, "raydrop_sh_eval"):
+            return ext.raydrop_sh_eval(
+                means.float(),
+                view_pos.to(means.device, torch.float32).reshape(3),
+                raydrop_logit.float(),
+                raydrop_sh.float(),
+            )
+
     import gsplat
 
     n = means.shape[0]

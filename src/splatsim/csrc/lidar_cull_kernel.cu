@@ -182,6 +182,149 @@ torch::Tensor lidar_cull_mask(
   return keep;
 }
 
+
+// ── Scalar view-dependent raydrop SH evaluation ─────────────────────────
+//
+// The LiDAR raydrop logit is ONE channel, but gsplat's spherical_harmonics
+// takes colour-shaped (N, K, 3) coefficients. Packing into that layout cost a
+// throwaway (N, K, 3) buffer -- 306 MiB at N=3.2M, K=9 -- plus its zero-fill
+// and two scatter writes, then evaluated 3 channels to use 1. This kernel does
+// the same math in a single pass: reads means (12B), the DC logit (4B) and the
+// higher bands (4*C_HIGH B) per Gaussian and writes one float.
+//
+// Convention matches gsplat exactly: dir = normalize(mean - view_pos), the DC
+// term is the scalar logit (i.e. coefficient logit/SH_C0 scaled by SH_C0), and
+// the higher bands follow gsplat's coefficient order.
+
+namespace {
+
+__device__ __forceinline__ float sh_eval_scalar(
+    const float* __restrict__ high,  // (C_HIGH,) higher bands for this Gaussian
+    const int degree,
+    const float dc,                  // band-0 contribution (the scalar logit)
+    const float x, const float y, const float z) {
+  // gsplat's SH_C* constants.
+  constexpr float C1 = 0.4886025119029199f;
+  constexpr float C20 = 1.0925484305920792f;
+  constexpr float C21 = -1.0925484305920792f;
+  constexpr float C22 = 0.31539156525252005f;
+  constexpr float C23 = -1.0925484305920792f;
+  constexpr float C24 = 0.5462742152960396f;
+  constexpr float C30 = -0.5900435899266435f;
+  constexpr float C31 = 2.890611442640554f;
+  constexpr float C32 = -0.4570457994644658f;
+  constexpr float C33 = 0.3731763325901154f;
+  constexpr float C34 = -0.4570457994644658f;
+  constexpr float C35 = 1.445305721320277f;
+  constexpr float C36 = -0.5900435899266435f;
+
+  float out = dc;
+  if (degree < 1) return out;
+  out += C1 * (-y * high[0] + z * high[1] - x * high[2]);
+  if (degree < 2) return out;
+  const float xx = x * x, yy = y * y, zz = z * z;
+  const float xy = x * y, yz = y * z, xz = x * z;
+  out += C20 * xy * high[3]
+       + C21 * yz * high[4]
+       + C22 * (2.f * zz - xx - yy) * high[5]
+       + C23 * xz * high[6]
+       + C24 * (xx - yy) * high[7];
+  if (degree < 3) return out;
+  out += C30 * y * (3.f * xx - yy) * high[8]
+       + C31 * xy * z * high[9]
+       + C32 * y * (4.f * zz - xx - yy) * high[10]
+       + C33 * z * (2.f * zz - 3.f * xx - 3.f * yy) * high[11]
+       + C34 * x * (4.f * zz - xx - yy) * high[12]
+       + C35 * z * (xx - yy) * high[13]
+       + C36 * x * (xx - 3.f * yy) * high[14];
+  return out;
+}
+
+template <int C_HIGH>
+__global__ void raydrop_sh_kernel(
+    const float* __restrict__ means,        // (N, 3)
+    const float* __restrict__ view_pos,     // (3,)
+    const float* __restrict__ dc_logit,     // (N,)
+    const float* __restrict__ high,         // (N, C_HIGH)
+    const int degree,
+    const int64_t N,
+    float* __restrict__ out) {              // (N,)
+  __shared__ float s_view[3];
+  if (threadIdx.x < 3) s_view[threadIdx.x] = view_pos[threadIdx.x];
+  __syncthreads();
+
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+
+  float dx = means[i * 3 + 0] - s_view[0];
+  float dy = means[i * 3 + 1] - s_view[1];
+  float dz = means[i * 3 + 2] - s_view[2];
+  // gsplat normalizes the direction before evaluating the basis.
+  const float inv = rsqrtf(fmaxf(dx * dx + dy * dy + dz * dz, 1e-20f));
+  dx *= inv; dy *= inv; dz *= inv;
+
+  out[i] = sh_eval_scalar(high + i * C_HIGH, degree, dc_logit[i], dx, dy, dz);
+}
+
+}  // namespace
+
+torch::Tensor raydrop_sh_eval(
+    const torch::Tensor& means,          // (N, 3) float32 CUDA
+    const torch::Tensor& view_pos,       // (3,) float32 CUDA
+    const torch::Tensor& dc_logit,       // (N,) float32 CUDA
+    const torch::Tensor& high) {         // (N, C_HIGH) float32 CUDA
+  TORCH_CHECK(means.is_cuda() && means.scalar_type() == at::kFloat);
+  TORCH_CHECK(means.dim() == 2 && means.size(1) == 3, "means must be (N, 3)");
+  TORCH_CHECK(high.dim() == 2 && high.size(0) == means.size(0),
+              "high must be (N, C_HIGH) matching means");
+  TORCH_CHECK(dc_logit.dim() == 1 && dc_logit.size(0) == means.size(0));
+  TORCH_CHECK(view_pos.numel() == 3);
+
+  auto means_c = means.contiguous();
+  auto high_c = high.contiguous();
+  auto dc_c = dc_logit.contiguous();
+  auto vp_c = view_pos.to(means.options()).contiguous().view({3});
+
+  const int64_t N = means_c.size(0);
+  const int64_t c_high = high_c.size(1);
+  // c_high == (degree + 1)^2 - 1
+  int degree = -1;
+  for (int d = 0; d <= 3; ++d) {
+    if ((d + 1) * (d + 1) - 1 == c_high) { degree = d; break; }
+  }
+  TORCH_CHECK(degree >= 0, "raydrop_sh width ", c_high,
+              " is not (deg+1)^2-1 for deg in [0, 3]");
+
+  auto out = at::empty({N}, means_c.options());
+  if (N == 0) return out;
+
+  const int block = 256;
+  const int grid = static_cast<int>((N + block - 1) / block);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  const float* m = means_c.data_ptr<float>();
+  const float* v = vp_c.data_ptr<float>();
+  const float* d = dc_c.data_ptr<float>();
+  const float* h = high_c.data_ptr<float>();
+  float* o = out.data_ptr<float>();
+
+  switch (c_high) {
+    case 3:
+      raydrop_sh_kernel<3><<<grid, block, 0, stream>>>(m, v, d, h, degree, N, o);
+      break;
+    case 8:
+      raydrop_sh_kernel<8><<<grid, block, 0, stream>>>(m, v, d, h, degree, N, o);
+      break;
+    case 15:
+      raydrop_sh_kernel<15><<<grid, block, 0, stream>>>(m, v, d, h, degree, N, o);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported raydrop_sh width ", c_high);
+  }
+  AT_CUDA_CHECK(cudaGetLastError());
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "lidar_cull_mask",
@@ -199,4 +342,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       pybind11::arg("cos_min"),
       pybind11::arg("sin_max"),
       pybind11::arg("cos_max"));
+  m.def(
+      "raydrop_sh_eval",
+      &raydrop_sh_eval,
+      "Scalar view-dependent raydrop SH evaluation (CUDA)",
+      pybind11::arg("means"),
+      pybind11::arg("view_pos"),
+      pybind11::arg("dc_logit"),
+      pybind11::arg("high"));
 }

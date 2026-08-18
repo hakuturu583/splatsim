@@ -281,18 +281,29 @@ class LodManager:
                 )
                 self._prev_tier_idx = tier_idx.clone()
 
-        # 4. Build flat index tensor
+        # 4. Build the flat index tensor.
+        #
+        # Each cell contributes its first ``selected_counts[c]`` entries, i.e.
+        # ``starts[c] .. starts[c] + selected_counts[c]``. Building that as a
+        # dense [num_cells, max_count] matrix and masking it costs a
+        # max_count-sized row for EVERY cell -- 406 MiB of int64 at
+        # max_count=25k / 2137 cells on a driving scene, allocated, filled and
+        # masked every frame, to keep ~3M entries. Instead lay the runs out
+        # contiguously: repeat_interleave gives each output slot its cell's
+        # start, and subtracting the run's own base offset turns a global arange
+        # into a per-run 0,1,2,... ramp. Same values, same order, no dense
+        # intermediate.
         starts = lod_index.cell_ranges[:, 0]  # [C]
-        max_count = selected_counts.max()  # scalar tensor, stays on GPU
-
-        offsets = (
-            torch.arange(max_count.item(), device=device)
-            .unsqueeze(0)
-            .expand(num_cells, -1)
-        )
-        abs_indices = starts.unsqueeze(1) + offsets  # [C, max_count]
-        mask = offsets < selected_counts.unsqueeze(1)  # [C, max_count]
-        selected_indices = abs_indices[mask]  # [total_selected]
+        total = int(selected_counts.sum())
+        if total == 0:
+            selected_indices = torch.empty(0, dtype=torch.int64, device=device)
+        else:
+            run_ends = selected_counts.cumsum(0)  # [C] exclusive-end in output
+            run_bases = run_ends - selected_counts  # [C] output offset per cell
+            per_slot_start = torch.repeat_interleave(starts, selected_counts)
+            per_slot_base = torch.repeat_interleave(run_bases, selected_counts)
+            ramp = torch.arange(total, device=device) - per_slot_base
+            selected_indices = per_slot_start + ramp
 
         if lidar_view:
             return _gather_lidar_view(tensors, selected_indices)
