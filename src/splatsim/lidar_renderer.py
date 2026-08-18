@@ -613,14 +613,25 @@ def _rigid_inverse_4x4(m: torch.Tensor) -> torch.Tensor:
 
 # ── SplatAD spherical LiDAR kernel (vendored) ───────────────────────
 # Non-uniform elevation tile geometry for the SplatAD rasterizer.
-# 2x16 (32 threads = 1 warp per block) measured fastest across all five rig
-# sensors on a 27M-Gaussian driving scene (RTX 3090, sm_86): the rasterizer is
-# tail-bound by a few very long per-tile Gaussian lists (p95 ~66k, max ~480k at
-# 4x64), so many small tiles balance far better than fewer 256-thread blocks:
-# lidar_top 39->26 ms, corner LiDARs 52->29 ms end-to-end. Tiling only changes
-# how Gaussians are grouped, never the per-pixel front-to-back order, so the
-# rendered output is bit-identical to 4x64.
-_SPLATAD_TILE_HEIGHT = 2
+#
+# The rasterizer is tail-bound by a few very long per-tile Gaussian lists (p95
+# ~66k, max ~480k entries at the upstream 4x64), and every pixel in a tile walks
+# its whole list -- so the cost is dominated by testing Gaussians whose tile
+# bbox covers the pixel but whose ray never hits them. Smaller tiles cut those
+# lists; on a 27M-Gaussian driving scene (RTX 3090, sm_86) the 5-sensor rig
+# measures, as a 4-frame mean over light and heavy poses:
+#
+#   4x64 (upstream)  ~400 ms      2x16   159 ms
+#   4x32              201 ms      4x8    147 ms
+#   1x32              165 ms      1x16   141 ms   <- here
+#
+# Note 1x16 is 16 threads, i.e. a half-warp per block: shorter azimuth tiles win
+# even at the cost of idle lanes (1x32, a full warp over the same beam row, is
+# clearly worse). Tiling only regroups Gaussians -- it never changes a pixel's
+# front-to-back order -- so the render moves only by the handful of boundary
+# cells where the 3-sigma bbox binning and the ~3.7-sigma alpha cutoff disagree
+# (measured IoU >= 0.99998, p99 distance diff 0).
+_SPLATAD_TILE_HEIGHT = 1
 _SPLATAD_TILE_WIDTH = 16
 _SPLATAD_RAST = None
 
