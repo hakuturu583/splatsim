@@ -477,6 +477,7 @@ def lidar_rasterization(
     eps2d: float = 0.017,
     compute_alpha_sum_until_points: bool = True,
     compute_alpha_sum_until_points_threshold: float = 0.2,
+    row_elevations: Optional[Tensor] = None,  # [n_elevation_tiles], see below
     packed: bool = False,  # packed mode is not supported yet
     sparse_grad: bool = False,
     absgrad: bool = False,
@@ -750,6 +751,11 @@ def lidar_rasterization(
         n_cameras=C,
         camera_ids=camera_ids,
         gaussian_ids=gaussian_ids,
+        # Exact per-row azimuth spans (see isect_lidar_tiles): fewer pairs,
+        # still a superset of what any pixel in the row can be hit by.
+        conics=conics,
+        opacities=opacities,
+        row_elevations=row_elevations,
     )
     isect_offsets = isect_offset_encode(
         isect_ids, C, n_azimuth_tiles, n_elevation_tiles

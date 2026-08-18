@@ -681,6 +681,7 @@ class _PanoGeom(NamedTuple):
     raster_pts: torch.Tensor  # (1, H, W, 4) ascending az/el grid, device
     tile_boundaries: torch.Tensor  # (H//th + 1,) ascending deg, device
     dirs: torch.Tensor  # (H, W, 3) unit beam directions (desc/CW grid), device
+    row_elevations_asc: torch.Tensor  # (H,) ascending beam elevations [deg]
     min_el_deg: float  # ascending-grid elevation bounds (CPU floats,
     max_el_deg: float  # cached to avoid per-frame .item() syncs)
 
@@ -745,6 +746,7 @@ def _panorama_geometry(lidar_spec: LidarSensorSpec, device) -> _PanoGeom:
         raster_pts=raster_pts,
         tile_boundaries=tile_boundaries,
         dirs=dirs,
+        row_elevations_asc=el_deg.contiguous(),
         min_el_deg=float(el_deg_cpu.min()),
         max_el_deg=float(el_deg_cpu.max()),
     )
@@ -1311,6 +1313,10 @@ def render_lidar_panorama(
         viewmats=viewmats,
         raster_pts=raster_pts,
         tile_elevation_boundaries=tile_boundaries.clone(),
+        # A tile row is one beam at the shipped tiling, so the binner can use
+        # the beam's own elevation instead of the row's band -- exact, and far
+        # more restrictive (see isect_lidar_tiles).
+        row_elevations=geom.row_elevations_asc if th == 1 else None,
         min_azimuth=-180.0,
         max_azimuth=180.0,
         min_elevation=geom.min_el_deg,

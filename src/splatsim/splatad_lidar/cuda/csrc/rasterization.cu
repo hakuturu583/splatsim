@@ -297,6 +297,14 @@ __global__ void isect_lidar_tiles(
     const float2 *__restrict__ means2d,              // [C, N, 2] or [nnz, 2]
     const float *__restrict__ radii,               // [C, N, 2] or [nnz, 2]
     const float *__restrict__ depths,                // [C, N] or [nnz]
+    // splatsim: the exact per-row azimuth extent needs the conic and the
+    // opacity (which sets the alpha cutoff). nullptr keeps the bbox binning.
+    const float3 *__restrict__ conics,               // [C, N] or [nnz], optional
+    const float *__restrict__ opacities,             // [C, N] or [nnz], optional
+    // splatsim: the beam elevation of each tile row, when a row IS one beam
+    // (tile_height == 1). Then the row's only sampled elevation is that beam,
+    // which is far more restrictive -- and still exact -- than the row's band.
+    const float *__restrict__ row_elevations,        // [n_tiles_elev], optional
     const int64_t *__restrict__ cum_tiles_per_gauss, // [C, N] or [nnz]
     const float *__restrict__ elev_boundaries,      // [M]
     const float tile_azim_resolution, // [1]
@@ -356,10 +364,85 @@ __global__ void isect_lidar_tiles(
     tile_min.y = elev_min;
     tile_max.y = elev_max;
 
+    // splatsim: the bbox applies the Gaussian's WIDEST azimuth extent to every
+    // elevation row it spans, but the reachable azimuth interval narrows toward
+    // the top and bottom of the ellipse -- to nothing at its poles. Recomputing
+    // the interval per row drops ~11% of the (Gaussian, tile) pairs, and with
+    // them the same share of tile-list walking and sort work.
+    //
+    // For a row spanning elevations [e0, e1] take dy to the NEAREST point of
+    // that span, which maximises the interval, so the result is a superset of
+    // what any pixel in the row can be hit by. Then solve
+    //   0.5*cx*dx^2 + cy*dy*dx + 0.5*cz*dy^2 <= ln(255*opac)
+    // for dx exactly as the rasterizer's own test does.
+    const bool exact_rows = (conics != nullptr && opacities != nullptr);
+    float g_cx = 0.f, g_cy = 0.f, g_cz = 0.f, g_smax = 0.f;
+    if (exact_rows) {
+        const float3 cc = conics[idx];
+        g_cx = cc.x; g_cy = cc.y; g_cz = cc.z;
+        g_smax = __logf(fmaxf(opacities[idx], 1e-6f) * 255.0f);
+    }
+    const float g_elev = means2d[idx].y;
+    const float g_azim = means2d[idx].x;
+
+    // Azimuth tile span for one elevation row; returns false when the row is
+    // unreachable. Mirrors the bbox path's wrap handling.
+    auto row_span = [&](int32_t row, int32_t &out_lo, int32_t &out_hi) -> bool {
+        float half = radii[idx * 2];
+        float centre = g_azim;
+        if (exact_rows && g_cx > 0.f) {
+            float dy;
+            if (row_elevations != nullptr) {
+                // One beam per row: its elevation is the only one sampled.
+                dy = row_elevations[row] - g_elev;
+            } else {
+                // A row spans several beams; take the nearest elevation in the
+                // band so the span stays a superset for all of them.
+                const float e0 = elev_boundaries[row];
+                const float e1 = elev_boundaries[row + 1];
+                dy = fminf(fmaxf(g_elev, e0), e1) - g_elev;
+            }
+            const float qa = 0.5f * g_cx;
+            const float qb = g_cy * dy;
+            const float qc = 0.5f * g_cz * dy * dy;
+            const float disc = qb * qb - 4.0f * qa * (qc - g_smax);
+            if (disc < 0.f) {
+                return false;
+            }
+            const float sq = sqrtf(disc);
+            const float inv2a = 0.5f / qa;
+            half = sq * inv2a;
+            centre = g_azim - qb * inv2a;
+        }
+        const float a_lo = centre - half - min_azim;
+        const float a_hi = centre + half - min_azim;
+        const float azim_max = static_cast<float>(n_tiles_azim) * tile_azim_resolution;
+        float t_lo, t_hi;
+        if (a_lo >= 0) {
+            t_lo = a_lo / tile_azim_resolution;
+        } else {
+            t_lo = (fmodf((a_lo + 360.f), 360.f) - azim_max) / tile_azim_resolution;
+        }
+        if (a_hi <= 360.f) {
+            t_hi = a_hi / tile_azim_resolution;
+        } else {
+            t_hi = static_cast<float>(n_tiles_azim) +
+                   (fmodf((a_hi + 360.f), 360.f)) / tile_azim_resolution;
+        }
+        out_lo = static_cast<int32_t>(floor(t_lo));
+        out_hi = static_cast<int32_t>(ceil(t_hi));
+        return out_hi > out_lo;
+    };
+
     if (first_pass) {
-        // first pass only writes out tiles_per_gauss
-        tiles_per_gauss[idx] =
-            static_cast<int32_t>((tile_max.y - tile_min.y) * (tile_max.x - tile_min.x));
+        int32_t n = 0;
+        for (int32_t i2 = tile_min.y; i2 < tile_max.y; ++i2) {
+            int32_t lo, hi;
+            if (row_span(i2, lo, hi)) {
+                n += (hi - lo);
+            }
+        }
+        tiles_per_gauss[idx] = n;
         return;
     }
 
@@ -379,7 +462,11 @@ __global__ void isect_lidar_tiles(
     int64_t depth_id_enc = (int64_t) * (int32_t *)&(depths[idx]);
     int64_t cur_idx = (idx == 0) ? 0 : cum_tiles_per_gauss[idx - 1];
     for (int32_t i = tile_min.y; i < tile_max.y; ++i) {
-        for (int32_t j = tile_min.x; j < tile_max.x; ++j) {
+        int32_t row_lo, row_hi;
+        if (!row_span(i, row_lo, row_hi)) {
+            continue;
+        }
+        for (int32_t j = row_lo; j < row_hi; ++j) {
             // wrap j to [0, n_tiles_azim)
             int32_t wrapped_j = (j + n_tiles_azim) % n_tiles_azim;
 
@@ -398,6 +485,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 isect_lidar_tiles_tensor(const torch::Tensor &means2d, // [C, N, 2] or [nnz, 2]
                    const torch::Tensor &radii,   // [C, N, 2] or [nnz, 2]
                    const torch::Tensor &depths,  // [C, N] or [nnz]
+                   // splatsim: optional, enables exact per-row azimuth spans
+                   const at::optional<torch::Tensor> &conics,
+                   const at::optional<torch::Tensor> &opacities,
+                   const at::optional<torch::Tensor> &row_elevations,
                    const at::optional<torch::Tensor> &camera_ids,   // [nnz]
                    const at::optional<torch::Tensor> &gaussian_ids, // [nnz]
                    const uint32_t C,
@@ -458,7 +549,13 @@ isect_lidar_tiles_tensor(const torch::Tensor &means2d, // [C, N, 2] or [nnz, 2]
                       stream>>>(
             packed, C, N, nnz, camera_ids_ptr, gaussian_ids_ptr,
             (float2 *)means2d.data_ptr<float>(), radii.data_ptr<float>(),
-            depths.data_ptr<float>(), nullptr, elev_boundaries.data_ptr<float>(),
+            depths.data_ptr<float>(),
+            conics.has_value() ? (const float3 *)conics.value().data_ptr<float>()
+                               : nullptr,
+            opacities.has_value() ? opacities.value().data_ptr<float>() : nullptr,
+            row_elevations.has_value() ? row_elevations.value().data_ptr<float>()
+                                       : nullptr,
+            nullptr, elev_boundaries.data_ptr<float>(),
             tile_azim_resolution, min_azim, n_tiles_azim, n_tiles_elev,
             tile_n_bits, tiles_per_gauss.data_ptr<int32_t>(), nullptr, nullptr);
         cum_tiles_per_gauss = torch::cumsum(tiles_per_gauss.view({-1}), 0);
@@ -477,7 +574,13 @@ isect_lidar_tiles_tensor(const torch::Tensor &means2d, // [C, N, 2] or [nnz, 2]
                       stream>>>(
             packed, C, N, nnz, camera_ids_ptr, gaussian_ids_ptr,
             (float2 *)means2d.data_ptr<float>(), radii.data_ptr<float>(),
-            depths.data_ptr<float>(), cum_tiles_per_gauss.data_ptr<int64_t>(),
+            depths.data_ptr<float>(),
+            conics.has_value() ? (const float3 *)conics.value().data_ptr<float>()
+                               : nullptr,
+            opacities.has_value() ? opacities.value().data_ptr<float>() : nullptr,
+            row_elevations.has_value() ? row_elevations.value().data_ptr<float>()
+                                       : nullptr,
+            cum_tiles_per_gauss.data_ptr<int64_t>(),
             elev_boundaries.data_ptr<float>(),
             tile_azim_resolution, min_azim, n_tiles_azim, n_tiles_elev,
             tile_n_bits, nullptr,

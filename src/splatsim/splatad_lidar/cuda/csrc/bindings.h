@@ -233,6 +233,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 isect_lidar_tiles_tensor(const torch::Tensor &means2d, // [C, N, 2] or [nnz, 2]
                    const torch::Tensor &radii,   // [C, N, 2] or [nnz, 2]
                    const torch::Tensor &depths,  // [C, N] or [nnz]
+                   const at::optional<torch::Tensor> &conics,
+                   const at::optional<torch::Tensor> &opacities,
+                   const at::optional<torch::Tensor> &row_elevations,
                    const at::optional<torch::Tensor> &camera_ids,   // [nnz]
                    const at::optional<torch::Tensor> &gaussian_ids, // [nnz]
                    const uint32_t C,
