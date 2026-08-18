@@ -95,6 +95,12 @@ except ImportError:
             extra_cuda_cflags = ["-O3"]
         else:
             extra_cuda_cflags = ["-O3", "--use_fast_math"]
+        # splatsim: how many Gaussians each thread stages into shared memory per
+        # round in the LiDAR rasterizer (see LIDAR_BATCH_MULT in
+        # rasterization.cu). Compile-time; changing it triggers a rebuild.
+        _batch_mult = os.environ.get("SPLATSIM_LIDAR_BATCH_MULT")
+        if _batch_mult:
+            extra_cuda_cflags.append(f"-DLIDAR_BATCH_MULT={int(_batch_mult)}")
         sources = list(glob.glob(os.path.join(PATH, "csrc/*.cu"))) + list(
             glob.glob(os.path.join(PATH, "csrc/*.cpp"))
         )

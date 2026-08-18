@@ -2105,7 +2105,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize
 // per thread) -> higher occupancy on this compositing kernel (the render
 // hot-spot), with bit-identical output. STATIC == false keeps the full
 // rolling-shutter path unchanged.
-template <uint32_t COLOR_DIM, bool STATIC>
+// splatsim: Gaussians staged into shared memory per thread per round. The
+// upstream kernel used 1 (batch == tile pixel count), which costs a
+// __syncthreads every `tile pixels` Gaussians -- a barrier every 16 entries at
+// the 1x16 tiling this renderer uses. Compile-time so the loader unrolls.
+#ifndef LIDAR_BATCH_MULT
+#define LIDAR_BATCH_MULT 16
+#endif
+
+template <uint32_t COLOR_DIM, bool STATIC, bool ROW_TILE = false,
+          uint32_t BATCH_MULT = LIDAR_BATCH_MULT>
 __global__ void rasterize_to_points_fwd_kernel(
     const uint32_t C, const uint32_t N, const uint32_t n_isects, const bool packed,
     const float2 *__restrict__ means2d,             // [C, N, 2] or [nnz, 2]
@@ -2186,7 +2195,13 @@ __global__ void rasterize_to_points_fwd_kernel(
             ? n_isects
             : tile_offsets[tile_id + 1];
     const uint32_t block_size = block.size();
-    uint32_t num_batches = (range_end - range_start + block_size - 1) / block_size;
+    // splatsim: stage BATCH_MULT Gaussians per thread per round instead of one.
+    // The batch size used to equal the tile's pixel count, so a 1x16 tile paid a
+    // __syncthreads every 16 Gaussians -- hundreds of barriers across the long
+    // tile lists that dominate this kernel. Staging a wider slice amortizes the
+    // barrier and gives the inner loop a long run of independent shared reads.
+    const uint32_t stage_size = block_size * BATCH_MULT;
+    uint32_t num_batches = (range_end - range_start + stage_size - 1) / stage_size;
 
     extern __shared__ int s[];
     // STATIC packs (xy.x, xy.y, opac, conic.x) + (conic.y, conic.z, id, -) into
@@ -2195,13 +2210,13 @@ __global__ void rasterize_to_points_fwd_kernel(
     // shared loads that dominate this kernel's MIO-latency stalls (per ncu). The
     // full (rolling-shutter) path keeps the per-attribute layout. Both alias `s`;
     // only one set is used depending on STATIC.
-    float4 *packA_batch = (float4 *)s;                            // [block_size] STATIC
-    float4 *packB_batch = (float4 *)&packA_batch[block_size];     // [block_size] STATIC
-    int32_t *id_batch = (int32_t *)s;                              // [block_size]
-    float3 *xy_opacity_batch = (float3 *)&id_batch[block_size];    // [block_size]
-    float3 *conic_batch = (float3 *)&xy_opacity_batch[block_size]; // [block_size]
-    float3 *pix_vel_batch = (float3 *)&conic_batch[block_size];    // [block_size]
-    float2 *depth_comp_batch = (float2 *)&pix_vel_batch[block_size]; // [block_size]
+    float4 *packA_batch = (float4 *)s;                            // [stage_size] STATIC
+    float4 *packB_batch = (float4 *)&packA_batch[stage_size];     // [stage_size] STATIC
+    int32_t *id_batch = (int32_t *)s;                              // [stage_size]
+    float3 *xy_opacity_batch = (float3 *)&id_batch[stage_size];    // [stage_size]
+    float3 *conic_batch = (float3 *)&xy_opacity_batch[stage_size]; // [stage_size]
+    float3 *pix_vel_batch = (float3 *)&conic_batch[stage_size];    // [stage_size]
+    float2 *depth_comp_batch = (float2 *)&pix_vel_batch[stage_size]; // [stage_size]
     (void)packA_batch; (void)packB_batch;
 
     // current visibility left to render
@@ -2227,9 +2242,14 @@ __global__ void rasterize_to_points_fwd_kernel(
 
         // each thread fetch 1 gaussian from front to back
         // index of gaussian to load
-        uint32_t batch_start = range_start + block_size * b;
-        uint32_t idx = batch_start + tr;
-        if (idx < range_end) {
+        uint32_t batch_start = range_start + stage_size * b;
+        PRAGMA_UNROLL
+        for (uint32_t j = 0; j < BATCH_MULT; ++j) {
+            const uint32_t slot = j * block_size + tr;
+            const uint32_t idx = batch_start + slot;
+            if (idx >= range_end) {
+                break;
+            }
             int32_t g = flatten_ids[idx]; // flatten index in [C * N] or [nnz]
             const float2 xy = means2d[g];
             const float opac = opacities[g];
@@ -2237,16 +2257,41 @@ __global__ void rasterize_to_points_fwd_kernel(
             if constexpr (STATIC) {
                 // two aligned float4: (xy.x, xy.y, opac, conic.x), (conic.y,
                 // conic.z, id-as-float, pad)
-                packA_batch[tr] = make_float4(xy.x, xy.y, opac, conic.x);
-                packB_batch[tr] = make_float4(conic.y, conic.z, __int_as_float(g), 0.f);
+                // splatsim: pack a per-Gaussian sigma cutoff into what used to
+                // be padding. The contribution test is
+                //   alpha = opac * exp(-sigma) >= alpha_min
+                // i.e. sigma <= ln(opac / alpha_min). Comparing sigma directly
+                // lets the (dominant) non-contributing Gaussians skip the
+                // exponential entirely -- in a tile list most entries cover the
+                // pixel's tile but not its ray.
+                const float sigma_max = __logf(opac * 255.0f);
+                if (ROW_TILE) {
+                    // A one-beam-row tile shares its elevation across every
+                    // thread (raster_pts is a meshgrid, so py is the row's
+                    // elevation for all columns). Fold the elevation half of
+                    //   sigma = .5(cx dx^2 + cz dy^2) + cy dx dy
+                    // into a quadratic in dx alone, evaluated once per Gaussian
+                    // here instead of per pixel:  sigma = (qa dx + qb) dx + qc.
+                    const float dy = xy.y - py;
+                    const float qa = 0.5f * conic.x;
+                    const float qb = conic.y * dy;
+                    const float qc = 0.5f * conic.z * dy * dy;
+                    packA_batch[slot] = make_float4(xy.x, opac, qa, qb);
+                    packB_batch[slot] =
+                        make_float4(qc, sigma_max, __int_as_float(g), 0.f);
+                } else {
+                    packA_batch[slot] = make_float4(xy.x, xy.y, opac, conic.x);
+                    packB_batch[slot] =
+                        make_float4(conic.y, conic.z, __int_as_float(g), sigma_max);
+                }
             } else {
-                id_batch[tr] = g;
-                xy_opacity_batch[tr] = {xy.x, xy.y, opac};
-                conic_batch[tr] = conic;
+                id_batch[slot] = g;
+                xy_opacity_batch[slot] = {xy.x, xy.y, opac};
+                conic_batch[slot] = conic;
                 const float3 pix_vel = pix_vels[g];
                 const float2 depth_comp = depth_compensations[g];
-                pix_vel_batch[tr] = {pix_vel.x, pix_vel.y, pix_vel.z};
-                depth_comp_batch[tr] = {depth_comp.x, depth_comp.y};
+                pix_vel_batch[slot] = {pix_vel.x, pix_vel.y, pix_vel.z};
+                depth_comp_batch[slot] = {depth_comp.x, depth_comp.y};
             }
         }
 
@@ -2254,16 +2299,56 @@ __global__ void rasterize_to_points_fwd_kernel(
         block.sync();
 
         // process gaussians in the current batch for this pixel
-        uint32_t batch_size = min(block_size, range_end - batch_start);
+        uint32_t batch_size = min(stage_size, range_end - batch_start);
         for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
             float3 conic, xy_opac;
             int32_t g;
+            float sigma_max = 0.f;
             if constexpr (STATIC) {
-                const float4 A = packA_batch[t]; // (xy.x, xy.y, opac, conic.x)
-                const float4 B = packB_batch[t]; // (conic.y, conic.z, id, pad)
+                const float4 A = packA_batch[t];
+                const float4 B = packB_batch[t];
+                if (ROW_TILE) {
+                    // (xy.x, opac, qa, qb) | (qc, sigma_max, id, -)
+                    const float dx = angle_difference(A.x, px);
+                    const float sigma_row = fmaf(fmaf(A.z, dx, A.w), dx, B.x);
+                    if (sigma_row < 0.f || sigma_row > B.y) {
+                        continue;
+                    }
+                    const float opac_row = A.y;
+                    const float alpha_row = min(0.999f, opac_row * __expf(-sigma_row));
+                    if (alpha_row < 1.f / 255.f) {
+                        continue;
+                    }
+                    const float next_T_row = T * (1.0f - alpha_row);
+                    if (next_T_row <= 1e-4f) {
+                        done = true;
+                        break;
+                    }
+                    const int32_t g_row = __float_as_int(B.z);
+                    const float vis_row = alpha_row * T;
+                    const float *c_row = colors + g_row * COLOR_DIM;
+                    PRAGMA_UNROLL
+                    for (uint32_t kk = 0; kk < COLOR_DIM; ++kk) {
+                        pix_out[kk] += c_row[kk] * vis_row;
+                    }
+                    if (T > 0.5f && next_T_row <= 0.5f) {
+                        median_depths[pix_id] = c_row[depth_channel_idx];
+                    }
+                    if (compute_alpha_sum_until_points) {
+                        const float g_depth = c_row[depth_channel_idx];
+                        if (g_depth < (pz - compute_alpha_sum_until_points_threshold)) {
+                            alpha_sum_until_points[pix_id] += alpha_row;
+                        }
+                    }
+                    cur_idx = batch_start + t;
+                    T = next_T_row;
+                    continue;
+                }
+                // (xy.x, xy.y, opac, conic.x) | (conic.y, conic.z, id, sigma_max)
                 xy_opac = make_float3(A.x, A.y, A.z);
                 conic = make_float3(A.w, B.x, B.y);
                 g = __float_as_int(B.z);
+                sigma_max = B.w;
             } else {
                 conic = conic_batch[t];
                 xy_opac = xy_opacity_batch[t];
@@ -2288,6 +2373,12 @@ __global__ void rasterize_to_points_fwd_kernel(
             const float sigma =
                 0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) +
                 conic.y * delta.x * delta.y;
+            if constexpr (STATIC) {
+                // Equivalent to the alpha test below, minus the exponential.
+                if (sigma < 0.f || sigma > sigma_max) {
+                    continue;
+                }
+            }
             float alpha = min(0.999f, opac * __expf(-sigma));
             if (sigma < 0.f || alpha < 1.f / 255.f) {
                 continue;
@@ -2415,8 +2506,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         tile_width * tile_height * (sizeof(int32_t) + sizeof(float3) + sizeof(float3) + sizeof(float3) + sizeof(float2));
     // splatsim STATIC path packs (xy, opac, conic, id) into two aligned float4
     // per thread (single LDS.128 each; no pix_vel/depth_comp batches).
+    // splatsim: the STATIC path stages LIDAR_BATCH_MULT Gaussians per thread per
+    // round (see the kernel), so the shared buffer scales with it.
     const uint32_t shared_mem_static =
-        tile_width * tile_height * (2 * sizeof(float4));
+        tile_width * tile_height * LIDAR_BATCH_MULT * (2 * sizeof(float4));
 
     // TODO: an optimization can be done by passing the actual number of channels into
     // the kernel functions and avoid necessary global memory writes. This requires
@@ -2483,13 +2576,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         // fast path when possible; otherwise the full velocity path. Only the
         // 3-channel case is exercised by the LiDAR renderer.
         if (static_render) {
-            if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<3, true>,
+            // splatsim: a one-beam-row tile lets the elevation half of the
+            // conic be folded per Gaussian instead of per pixel (ROW_TILE);
+            // the renderer's default tiling is 1xW, so this is the hot path.
+            const bool row_tile = (tile_height == 1);
+            auto kern = row_tile
+                           ? (void *)rasterize_to_points_fwd_kernel<3, true, true>
+                           : (void *)rasterize_to_points_fwd_kernel<3, true, false>;
+            if (cudaFuncSetAttribute(kern,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      shared_mem_static) != cudaSuccess) {
                 AT_ERROR("Failed to set maximum shared memory size (requested ",
                          shared_mem_static, " bytes), try lowering tile_size.");
             }
-            rasterize_to_points_fwd_kernel<3, true><<<blocks, threads, shared_mem_static, stream>>>(
+            if (row_tile) {
+                rasterize_to_points_fwd_kernel<3, true, true>
+                    <<<blocks, threads, shared_mem_static, stream>>>(
                 C, N, n_isects, packed,
                 (float2 *)means2d.data_ptr<float>(),
                 (float3 *)conics.data_ptr<float>(),
@@ -2509,6 +2611,29 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 alphas.data_ptr<float>(),
                 compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
                 last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            } else {
+                rasterize_to_points_fwd_kernel<3, true, false>
+                    <<<blocks, threads, shared_mem_static, stream>>>(
+                C, N, n_isects, packed,
+                (float2 *)means2d.data_ptr<float>(),
+                (float3 *)conics.data_ptr<float>(),
+                colors.data_ptr<float>(),
+                opacities.data_ptr<float>(),
+                (float3 *)pix_vels.data_ptr<float>(),
+                (float2 *)depth_compensations.data_ptr<float>(),
+                backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
+                (float4 *)raster_pts.data_ptr<float>(),
+                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+                compute_alpha_sum_until_points,
+                compute_alpha_sum_until_points_threshold,
+                tile_offsets.data_ptr<int32_t>(),
+                flatten_ids.data_ptr<int32_t>(),
+                depth_channel_idx,
+                renders.data_ptr<float>(),
+                alphas.data_ptr<float>(),
+                compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
+                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            }
         } else {
             if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<3, false>,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize,

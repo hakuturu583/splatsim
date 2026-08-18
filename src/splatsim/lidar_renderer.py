@@ -631,8 +631,10 @@ def _rigid_inverse_4x4(m: torch.Tensor) -> torch.Tensor:
 # front-to-back order -- so the render moves only by the handful of boundary
 # cells where the 3-sigma bbox binning and the ~3.7-sigma alpha cutoff disagree
 # (measured IoU >= 0.99998, p99 distance diff 0).
-_SPLATAD_TILE_HEIGHT = 1
-_SPLATAD_TILE_WIDTH = 16
+# Annotated (rather than inferred as Literal) because benchmarks and tests
+# rebind them to explore the tiling.
+_SPLATAD_TILE_HEIGHT: int = 1
+_SPLATAD_TILE_WIDTH: int = 16
 _SPLATAD_RAST = None
 
 # Static per-(sensor, device) rasterization geometry. Everything here depends
