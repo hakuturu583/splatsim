@@ -20,6 +20,12 @@ dependencies = [
     "protobuf>=4.25.0",
     "grpcio-tools>=1.60.0",
     "packaging",
+    # Vendored SplatAD LiDAR kernel (src/splatsim/splatad_lidar): the JIT build
+    # driver prints status via `rich`, and the kernel's Python layer annotates
+    # with `typing_extensions.Literal`. Both are usually pulled transitively by
+    # torch/others, but the LiDAR rasterizer imports them directly.
+    "rich",
+    "typing_extensions",
 ]
 
 [project.optional-dependencies]
@@ -29,13 +35,6 @@ gui = [
 dds = [
     "cyclonedds>=11.0.1",
     "opencv-python-headless>=4.0.0",
-]
-carla = [
-    "autoware-carla-scenario[carla-0-9-16]",
-    "autoware-lanelet2-to-opendrive",
-    "cyclonedds>=11.0.1",
-    "python-dotenv>=1.0.0",
-    "pyproj>=3.7.1",
 ]
 # Ground-truth LiDAR evaluation (src/eval, run as `python -m eval.eval_lidar`).
 # Pulls a local WebAuto / T4 dataset via t4-devkit for the GT trajectory + GT
@@ -68,7 +67,7 @@ bev = [
     "spconv-cu126>=2.3,<2.4",
 ]
 all = [
-    "splatsim[gui,carla]",
+    "splatsim[gui]",
 ]
 
 [tool.uv]
@@ -105,15 +104,19 @@ torchvision = [
   { index = "pytorch-cu128" },
 ]
 
-# 3dgs_io v1.1.0: adds an optional per-Gaussian `lidar_mask` channel to the
-# EXT_gaussian_lidar sidecar (decode_lidar_sidecar may now return a "lidar_mask"
-# (N,) float32 array in {0,1}; 1 = participates in LiDAR / near-field, 0 =
-# appearance-only / far-field; absent for old 2-channel sidecars). v1.0.0 was
-# the first tagged release with the frame-explicit v2 scene USDZ work (issue
-# #39). Only the scene USDZ readers (load_spz, decode_lidar_sidecar,
-# parse_rig_trajectories, ...) are used; splatsim no longer loads 3D Tiles
-# tilesets.
-3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v1.1.0" }
+# 3dgs_io v1.2.0: adds an optional view-dependent (SH) per-Gaussian raydrop
+# trailing block to the EXT_gaussian_lidar sidecar (version-2 sidecar;
+# decode_lidar_sidecar may now return a "raydrop_sh" (N, (deg+1)**2-1) float32
+# array of the higher-order SH bands — the DC term stays in
+# lidar_raydrop_logit; absent for version-1 sidecars). v1.1.0 added the optional
+# per-Gaussian `lidar_mask` channel (decode_lidar_sidecar may return a
+# "lidar_mask" (N,) float32 array in {0,1}; 1 = participates in LiDAR /
+# near-field, 0 = appearance-only / far-field; absent for old 2-channel
+# sidecars). v1.0.0 was the first tagged release with the frame-explicit v2
+# scene USDZ work (issue #39). Only the scene USDZ readers (load_spz,
+# decode_lidar_sidecar, parse_rig_trajectories, ...) are used; splatsim no
+# longer loads 3D Tiles tilesets.
+3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v1.2.0" }
 
 # t4-devkit: WebAuto / T4 dataset devkit, used by the optional 'eval' extra to
 # pull the GT ego trajectory + GT LiDAR scans. Not published to PyPI; pin to the
@@ -130,7 +133,6 @@ ppisp = { git = "https://github.com/nv-tlabs/ppisp.git", rev = "df33809f7b3b20ac
 # Rev tracks the pin used by tier4/gaussian_factory.
 gsplat = { git = "https://github.com/nerfstudio-project/gsplat.git", rev = "4e52698e45eaaed929ed3a5065e96a688d085df6" }
 
-autoware-carla-scenario = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "348108571cf4abec1f668ca0999753b75b8a5e4b", subdirectory = "autoware_carla_scenario" }
 autoware-lanelet2-to-opendrive = { git = "https://github.com/tier4/autoware_lanelet2_to_opendrive.git", rev = "348108571cf4abec1f668ca0999753b75b8a5e4b", subdirectory = "autoware_lanelet2_to_opendrive" }
 lanelet2-python-api-for-autoware = { git = "https://github.com/tier4/lanelet2_python_api_for_autoware", rev = "21cafbf9a855afbc4b89d4dfc3d299a411b64dde" }
 
@@ -146,11 +148,15 @@ dev = [
 
 [project.scripts]
 splatsim-viewer = "splatsim.viewer:main"
-spawn-scenario = "scenarios.odaibatest_spawn.run:main"
 splatsim-grpc-server = "splatsim.grpc_service.cli:main"
 
 [tool.ruff]
-exclude = ["src/splatsim/grpc_service/_generated"]
+# splatad_lidar is a vendored third-party CUDA kernel (SplatAD / gsplat fork);
+# keep it byte-for-byte and out of our lint/format so it matches upstream.
+exclude = [
+    "src/splatsim/grpc_service/_generated",
+    "src/splatsim/splatad_lidar",
+]
 
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]
@@ -163,7 +169,7 @@ module-name = ["splatsim", "scenarios"]
 # artefacts). It contains full copies of the repo from other branches whose
 # tree state we don't want ty to type-check when it walks the project.
 [tool.ty.src]
-exclude = [".claude/"]
+exclude = [".claude/", "src/splatsim/splatad_lidar/"]
 
 # ROS 2 launch files depend on packages (launch, launch_ros, ament_index_python)
 # that are not installable via pip and unavailable in the uv-managed virtualenv.
