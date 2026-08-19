@@ -20,10 +20,10 @@ dependencies = [
     "protobuf>=4.25.0",
     "grpcio-tools>=1.60.0",
     "packaging",
-    # Vendored SplatAD LiDAR kernel (src/splatsim/splatad_lidar): the JIT build
-    # driver prints status via `rich`, and the kernel's Python layer annotates
-    # with `typing_extensions.Literal`. Both are usually pulled transitively by
-    # torch/others, but the LiDAR rasterizer imports them directly.
+    # SplatAD spherical LiDAR rasterizer, now its own package rather than a copy
+    # in-tree (see [tool.uv.sources]). It JIT-builds its CUDA extension on first
+    # use, so it needs the same nvcc gsplat's build does.
+    "splatad-kernel",
     "rich",
     "typing_extensions",
 ]
@@ -128,6 +128,13 @@ t4-devkit = { git = "https://github.com/tier4/t4-devkit.git", tag = "v0.7.1" }
 # (`ppisp_cuda`) built via torch.utils.cpp_extension.CUDAExtension.
 ppisp = { git = "https://github.com/nv-tlabs/ppisp.git", rev = "df33809f7b3b20ac06de088dfc871b144b8fb54d" }
 
+# SplatAD LiDAR rasterizer, extracted from the former src/splatsim/splatad_lidar
+# into its own repo so the kernel can be developed and versioned separately.
+# Not on PyPI, so pinned to a rev. Its CUDA extension JIT-builds at import time
+# exactly as the in-tree copy did, so the nvcc requirement is unchanged; the
+# extension is named splatad_kernel_cuda and does not collide with gsplat's.
+splatad-kernel = { git = "https://github.com/hakuturu583/splatad_kernel.git", rev = "885d1beffd753d3eb1d3149556b9d61e65e3dce7" }
+
 # gsplat main pinned past PR #890 (Add LiDAR sensor support) to enable
 # camera_model="lidar" rasterization via RowOffsetStructuredSpinningLidarModelParameters.
 # Rev tracks the pin used by tier4/gaussian_factory.
@@ -151,11 +158,8 @@ splatsim-viewer = "splatsim.viewer:main"
 splatsim-grpc-server = "splatsim.grpc_service.cli:main"
 
 [tool.ruff]
-# splatad_lidar is a vendored third-party CUDA kernel (SplatAD / gsplat fork);
-# keep it byte-for-byte and out of our lint/format so it matches upstream.
 exclude = [
     "src/splatsim/grpc_service/_generated",
-    "src/splatsim/splatad_lidar",
 ]
 
 [build-system]
@@ -169,7 +173,7 @@ module-name = ["splatsim", "scenarios"]
 # artefacts). It contains full copies of the repo from other branches whose
 # tree state we don't want ty to type-check when it walks the project.
 [tool.ty.src]
-exclude = [".claude/", "src/splatsim/splatad_lidar/"]
+exclude = [".claude/"]
 
 # ROS 2 launch files depend on packages (launch, launch_ros, ament_index_python)
 # that are not installable via pip and unavailable in the uv-managed virtualenv.

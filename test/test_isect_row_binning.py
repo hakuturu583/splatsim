@@ -42,8 +42,8 @@ def _scene(n: int = 40_000, seed: int = 0):
 
 def _pairs(scene, spec, s2w, *, row_elevations: bool):
     """Tile-list length for one render, with and without the tightening."""
-    from splatsim.splatad_lidar.cuda._wrapper import isect_lidar_tiles
-    from splatsim.splatad_lidar.rendering import fully_fused_lidar_projection
+    from splatad_kernel.cuda._wrapper import isect_lidar_tiles
+    from splatad_kernel.rendering import fully_fused_lidar_projection
 
     device = scene["means"].device
     geom = lr._panorama_geometry(spec, device)

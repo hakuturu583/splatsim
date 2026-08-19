@@ -841,7 +841,7 @@ def _panorama_geometry(lidar_spec: LidarSensorSpec, device) -> _PanoGeom:
 
 def _splatad_lidar_rasterization():
     """Return the vendored SplatAD ``lidar_rasterization`` entry point, building
-    the ``splatad_lidar_cuda`` CUDA extension on first use.
+    the ``splatad_kernel_cuda`` CUDA extension on first use.
 
     LiDAR rasterization goes exclusively through this kernel — there is no gsplat
     fallback — so a missing CUDA toolkit / build failure raises rather than
@@ -850,18 +850,18 @@ def _splatad_lidar_rasterization():
     global _SPLATAD_RAST
     if _SPLATAD_RAST is None:
         try:
-            from .splatad_lidar.cuda._backend import _C
-            from .splatad_lidar.rendering import lidar_rasterization
+            from splatad_kernel.cuda._backend import _C
+            from splatad_kernel.rendering import lidar_rasterization
         except Exception as e:  # noqa: BLE001 - surface any import/build failure
             raise RuntimeError(
                 "SplatAD LiDAR kernel could not be imported/built "
-                "(splatsim.splatad_lidar). LiDAR rendering requires this CUDA "
+                "(splatad_kernel). LiDAR rendering requires this CUDA "
                 "kernel and has no gsplat fallback; ensure a CUDA toolkit with "
                 f"nvcc is on PATH. Original error: {e}"
             ) from e
         if _C is None:
             raise RuntimeError(
-                "SplatAD LiDAR CUDA extension 'splatad_lidar_cuda' failed to "
+                "SplatAD LiDAR CUDA extension 'splatad_kernel_cuda' failed to "
                 "build (no nvcc / CUDA toolkit detected). LiDAR rendering "
                 "requires this kernel and has no gsplat fallback."
             )
