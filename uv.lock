@@ -1933,12 +1933,10 @@ wheels = [
 [[package]]
 name = "splatad-kernel"
 version = "1.0.0"
-source = { git = "https://github.com/hakuturu583/splatad_kernel.git?rev=885d1beffd753d3eb1d3149556b9d61e65e3dce7#885d1beffd753d3eb1d3149556b9d61e65e3dce7" }
+source = { git = "https://github.com/hakuturu583/splatad_kernel.git?rev=83f578686600e1c2020cac7f54ef266aa345caa4#83f578686600e1c2020cac7f54ef266aa345caa4" }
 dependencies = [
-    { name = "jaxtyping", version = "0.3.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "jaxtyping", version = "0.3.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "gsplat" },
     { name = "ninja" },
-    { name = "numpy" },
     { name = "rich" },
     { name = "torch" },
     { name = "typing-extensions" },
@@ -2018,7 +2016,7 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.10" },
     { name = "setuptools" },
     { name = "spconv-cu126", marker = "extra == 'bev'", specifier = ">=2.3,<2.4" },
-    { name = "splatad-kernel", git = "https://github.com/hakuturu583/splatad_kernel.git?rev=885d1beffd753d3eb1d3149556b9d61e65e3dce7" },
+    { name = "splatad-kernel", git = "https://github.com/hakuturu583/splatad_kernel.git?rev=83f578686600e1c2020cac7f54ef266aa345caa4" },
     { name = "splatsim", extras = ["gui"], marker = "extra == 'all'" },
     { name = "t4-devkit", marker = "extra == 'eval'", git = "https://github.com/tier4/t4-devkit.git?tag=v0.7.1" },
     { name = "torch", specifier = "==2.7.0+cu128", index = "https://download.pytorch.org/whl/cu128" },

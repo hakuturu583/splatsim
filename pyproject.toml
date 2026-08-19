@@ -133,7 +133,10 @@ ppisp = { git = "https://github.com/nv-tlabs/ppisp.git", rev = "df33809f7b3b20ac
 # Not on PyPI, so pinned to a rev. Its CUDA extension JIT-builds at import time
 # exactly as the in-tree copy did, so the nvcc requirement is unchanged; the
 # extension is named splatad_kernel_cuda and does not collide with gsplat's.
-splatad-kernel = { git = "https://github.com/hakuturu583/splatad_kernel.git", rev = "885d1beffd753d3eb1d3149556b9d61e65e3dce7" }
+# It compiles against the gsplat pinned below (its Utils.cuh/Common.h and the
+# glm headers it ships), so the two move together: bumping gsplat means
+# rebuilding the kernel, which the JIT does automatically.
+splatad-kernel = { git = "https://github.com/hakuturu583/splatad_kernel.git", rev = "83f578686600e1c2020cac7f54ef266aa345caa4" }
 
 # gsplat main pinned past PR #890 (Add LiDAR sensor support) to enable
 # camera_model="lidar" rasterization via RowOffsetStructuredSpinningLidarModelParameters.

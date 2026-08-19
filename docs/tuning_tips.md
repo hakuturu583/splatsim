@@ -160,3 +160,21 @@ list — not another parameter.
 
 `SPLATSIM_LIDAR_PIX_PER_THREAD` appears in the rejected list but is **not** in
 the tree — the pixels-per-thread work was reverted along with the measurement.
+
+## Where the kernel lives
+
+The rasterizer is no longer in this tree. It is
+[`splatad_kernel`](https://github.com/hakuturu583/splatad_kernel), pinned by rev
+in `[tool.uv.sources]`, and it holds only what gsplat has no equivalent for:
+`rasterize_to_points` (the median first-return compositor), `isect_lidar_tiles`
+(the per-beam binner) and `fully_fused_lidar_projection`. Everything the camera
+path shares — `quat_to_rotmat`, `quat_scale_to_covar_preci`, `posW2C`,
+`covarW2C`, `add_blur`, the glm headers, the `CHECK_*`/`CUB_WRAPPER` macros — is
+`#include`d out of the installed gsplat (1.5.3), not copied.
+
+Two things follow for anyone tuning it. The kernel and gsplat move together: the
+JIT rebuilds when either changes, so a gsplat bump is a kernel rebuild. And
+iterating means editing the kernel repo and rsyncing
+`src/splatad_kernel/` over `.venv/lib/python3.10/site-packages/splatad_kernel/`;
+`torch.utils.cpp_extension.load` notices the changed sources and rebuilds on the
+next import. Re-pin the rev when the change is settled.
