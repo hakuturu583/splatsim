@@ -637,6 +637,55 @@ _SPLATAD_TILE_HEIGHT: int = 1
 _SPLATAD_TILE_WIDTH: int = 16
 _SPLATAD_RAST = None
 
+# The SplatAD rasterizer stages LIDAR_BATCH_MULT Gaussians per thread per round in
+# dynamic shared memory. This mirrors the kernel's compile-time default (see
+# rasterization.cu `#define LIDAR_BATCH_MULT`); splatad_kernel is installed without
+# a -DLIDAR_BATCH_MULT override, so 16 is what it was built with. Keep in sync if a
+# future kernel build changes it.
+_LIDAR_BATCH_MULT: int = 16
+
+
+@lru_cache(maxsize=64)
+def _tile_shared_mem_bytes(
+    tile_width: int, tile_height: int, rolling_shutter: bool
+) -> int:
+    """Dynamic shared memory (bytes) the rasterizer requests for a tile shape.
+
+    Mirrors the kernel's own sizing (rasterization.cu): every staged Gaussian
+    occupies two ``float4`` on the static (inference) path, plus a ``float2`` for
+    the per-column velocity when rolling shutter is active. ``use_depth_compensation``
+    is always False on this inference path, so its extra ``float2`` never applies.
+    """
+    per_gaussian = 2 * 16 + (8 if rolling_shutter else 0)  # 2*sizeof(float4) [+ float2]
+    return tile_width * tile_height * _LIDAR_BATCH_MULT * per_gaussian
+
+
+@lru_cache(maxsize=64)
+def _assert_tile_fits_shared_mem(
+    tile_width: int, tile_height: int, rolling_shutter: bool, device_index: int
+) -> None:
+    """Reject a tile shape whose shared-memory request exceeds the device's cap.
+
+    The kernel asks the driver for ``tile_width * tile_height * LIDAR_BATCH_MULT``
+    Gaussians' worth of dynamic shared memory per block; above the per-block opt-in
+    limit the launch fails deep inside CUDA with a bare "Failed to set maximum
+    shared memory size". This surfaces the same condition here, at the splatsim
+    layer, with the numbers and the fix. Example: the pre-tuning 4x64 default needs
+    128 KB at BATCH_MULT=16, over the ~99 KB an RTX 4090 (sm_89) allows.
+    """
+    need = _tile_shared_mem_bytes(tile_width, tile_height, rolling_shutter)
+    cap = torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin
+    if need > cap:
+        raise ValueError(
+            f"LiDAR tile {tile_height}x{tile_width} "
+            f"(tile_height x tile_width) needs {need / 1024:.0f} KB of dynamic "
+            f"shared memory per block at LIDAR_BATCH_MULT={_LIDAR_BATCH_MULT}"
+            f"{' (rolling shutter)' if rolling_shutter else ''}, but "
+            f"{torch.cuda.get_device_name(device_index)} caps a block at "
+            f"{cap / 1024:.0f} KB. Lower _SPLATAD_TILE_WIDTH / _SPLATAD_TILE_HEIGHT "
+            f"(their product must be <= {cap // (_LIDAR_BATCH_MULT * (40 if rolling_shutter else 32))})."
+        )
+
 
 def _sweep_motion(
     s2w: torch.Tensor,
@@ -1395,6 +1444,11 @@ def render_lidar_panorama(
         [intensity_sig.float(), raydrop_logit.float()], dim=-1
     ).unsqueeze(0)  # (1, N, 2)
     quats_n = torch.nn.functional.normalize(quats.float(), p=2, dim=-1)
+
+    # Fail early and legibly if this tile shape's staging buffer won't fit in the
+    # device's per-block shared memory (the kernel's own check raises a bare CUDA
+    # error). Rolling shutter (lin_vel set) stages an extra float2 per Gaussian.
+    _assert_tile_fits_shared_mem(tw, th, lin_vel is not None, device.index or 0)
 
     lidar_rasterization = _splatad_lidar_rasterization()
     render, alpha, _alpha_sum, meta = lidar_rasterization(
