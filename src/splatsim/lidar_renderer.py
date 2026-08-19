@@ -1366,9 +1366,12 @@ def render_lidar_panorama(
     # sensor's motion. Without a sweep-end pose the sweep is static and the
     # whole panorama comes from the single given pose.
     render_s2w = sensor_to_world.to(device=device, dtype=torch.float32)
-    lin_vel = torch.zeros(1, 3, device=device)
-    ang_vel = torch.zeros(1, 3, device=device)
-    sweep_time = torch.zeros(1, device=device)
+    # Left as None without a sweep-end pose: the rasterizer's static fast path
+    # is selected by these being absent, not by them being zero, and passing
+    # zeros instead costs 48 -> 66 ms on the 5-sensor rig for no benefit.
+    lin_vel = None
+    ang_vel = None
+    sweep_time = None
     if sensor_to_world_end is not None:
         sweep_s = 1.0 / max(float(lidar_spec.spinning_frequency_hz), 1e-6)
         s2w_mid, lv, av = _sweep_motion(
