@@ -29,6 +29,14 @@ _EXT_LOAD_ERROR: Optional[BaseException] = None
 
 _SRC_PATH = Path(__file__).resolve().parent / "csrc" / "lidar_cull_kernel.cu"
 
+# Every binding the current kernel source exports. A pre-built ``.so`` missing
+# any of these is STALE (built from an older lidar_cull_kernel.cu) and must not
+# be used: callers probe with hasattr and silently fall back to a many-times
+# slower PyTorch path, so a stale binary costs milliseconds per frame while
+# looking perfectly healthy (observed: an .so predating raydrop_sh_eval kept
+# the 5-sensor rig on the gsplat fallback at ~15 ms/frame vs ~2 ms).
+_EXPECTED_SYMBOLS = ("lidar_cull_mask", "raydrop_sh_eval")
+
 
 def _try_load() -> Any:
     """Compile and load the CUDA extension, or return ``None`` on failure."""
@@ -109,11 +117,28 @@ def _load_prebuilt() -> Any:
         so_path = build_dir / f"{_EXT_NAME}.so"
         if not so_path.exists():
             return None
+        # Staleness must be decided BEFORE importing: CPython caches C
+        # extensions by (name, path), so once a stale .so is imported, even a
+        # JIT rebuild in this same process gets the old module handed back.
+        # An .so older than the kernel source predates its latest edit; let
+        # the JIT path rebuild instead. (In the Docker flow the builder JITs
+        # after the sources are laid down, so the .so is always newer there
+        # and this fast path keeps working without nvcc.)
+        if so_path.stat().st_mtime < _SRC_PATH.stat().st_mtime:
+            return None
         from torch.utils.cpp_extension import _import_module_from_library  # type: ignore[attr-defined]
 
-        return _import_module_from_library(
+        mod = _import_module_from_library(
             _EXT_NAME, str(build_dir), is_python_module=True
         )
+        # Secondary guard for binaries whose mtime lies (e.g. copied around):
+        # a build missing any current binding is stale. Rejecting here can't
+        # rescue THIS process (the import above already pinned the module in
+        # CPython's extension cache) but it does let callers' fallbacks run
+        # correctly and the next process pick up the JIT-rebuilt .so.
+        if any(not hasattr(mod, sym) for sym in _EXPECTED_SYMBOLS):
+            return None
+        return mod
     except Exception:
         return None
 
