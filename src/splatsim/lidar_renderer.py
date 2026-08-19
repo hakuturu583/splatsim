@@ -650,51 +650,56 @@ def _sweep_motion(
     [-0.5, +0.5], so the reference pose must be the middle of the sweep and the
     velocities must be about it. Rotation is interpolated as a true half-way
     rotation (not a lerp of matrices) so the reference stays a rigid transform.
-    """
-    R0, R1 = s2w[:3, :3], s2w_end[:3, :3]
-    t0, t1 = s2w[:3, 3], s2w_end[:3, 3]
 
-    # Relative rotation over the sweep, as an axis-angle vector in the START
+    Computed on the CPU on purpose. These are 4x4 matrices, but the branches on
+    the rotation magnitude are data-dependent: evaluating them on device tensors
+    forces a GPU->CPU sync per sensor, which serialises the rig's streams and
+    cost 48 -> 68 ms per frame with no change in kernel time at all.
+    """
+    dev, dt = s2w.device, s2w.dtype
+    a = s2w.detach().to("cpu", torch.float64).numpy()
+    b = s2w_end.detach().to("cpu", torch.float64).numpy()
+    R0, R1 = a[:3, :3], b[:3, :3]
+    t0, t1 = a[:3, 3], b[:3, 3]
+
+    # Relative rotation over the sweep as an axis-angle vector in the START
     # sensor frame: R_rel = R0^T R1.
-    R_rel = R0.transpose(0, 1) @ R1
-    cos_t = ((R_rel[0, 0] + R_rel[1, 1] + R_rel[2, 2] - 1.0) * 0.5).clamp(-1.0, 1.0)
-    theta = torch.acos(cos_t)
-    axis = torch.stack(
-        [
-            R_rel[2, 1] - R_rel[1, 2],
-            R_rel[0, 2] - R_rel[2, 0],
-            R_rel[1, 0] - R_rel[0, 1],
-        ]
-    )
-    sin_t = torch.sin(theta)
-    if float(sin_t.abs()) < 1e-7:
+    R_rel = R0.T @ R1
+    cos_t = float(np.clip((np.trace(R_rel) - 1.0) * 0.5, -1.0, 1.0))
+    theta = math.acos(cos_t)
+    sin_t = math.sin(theta)
+    if abs(sin_t) < 1e-7:
         # No rotation over the sweep (or a 180 deg flip, which a LiDAR sweep
         # never does): treat as pure translation.
-        rotvec = torch.zeros(3, device=s2w.device, dtype=s2w.dtype)
+        rotvec = np.zeros(3)
     else:
+        axis = np.array(
+            [
+                R_rel[2, 1] - R_rel[1, 2],
+                R_rel[0, 2] - R_rel[2, 0],
+                R_rel[1, 0] - R_rel[0, 1],
+            ]
+        )
         rotvec = axis * (theta / (2.0 * sin_t))
 
-    # Half-way rotation via Rodrigues on rotvec/2, applied to R0.
+    # Half-way rotation via Rodrigues on rotvec / 2, applied to R0.
     half = rotvec * 0.5
-    ang = torch.linalg.norm(half)
-    eye = torch.eye(3, device=s2w.device, dtype=s2w.dtype)
-    if float(ang) < 1e-9:
-        R_half = eye
+    ang = float(np.linalg.norm(half))
+    if ang < 1e-9:
+        R_half = np.eye(3)
     else:
         k = half / ang
-        K = torch.zeros(3, 3, device=s2w.device, dtype=s2w.dtype)
-        K[0, 1], K[0, 2] = -k[2], k[1]
-        K[1, 0], K[1, 2] = k[2], -k[0]
-        K[2, 0], K[2, 1] = -k[1], k[0]
-        R_half = eye + torch.sin(ang) * K + (1.0 - torch.cos(ang)) * (K @ K)
+        K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+        R_half = np.eye(3) + math.sin(ang) * K + (1.0 - math.cos(ang)) * (K @ K)
 
-    s2w_mid = torch.eye(4, device=s2w.device, dtype=s2w.dtype)
-    s2w_mid[:3, :3] = R0 @ R_half
-    s2w_mid[:3, 3] = 0.5 * (t0 + t1)
+    mid = np.eye(4)
+    mid[:3, :3] = R0 @ R_half
+    mid[:3, 3] = 0.5 * (t0 + t1)
 
     inv_dt = 1.0 / max(sweep_s, 1e-6)
-    lin_vel = (t1 - t0) * inv_dt  # world frame
-    ang_vel = rotvec * inv_dt  # sensor frame
+    s2w_mid = torch.as_tensor(mid, dtype=dt, device=dev)
+    lin_vel = torch.as_tensor((t1 - t0) * inv_dt, dtype=dt, device=dev)
+    ang_vel = torch.as_tensor(rotvec * inv_dt, dtype=dt, device=dev)
     return s2w_mid, lin_vel, ang_vel
 
 

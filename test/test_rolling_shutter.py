@@ -189,3 +189,26 @@ def test_sweep_time_is_seconds_not_a_phase() -> None:
     # First column scanned is the LAST in the ascending grid (the sweep runs
     # +180 -> -180 while the grid ascends).
     assert float(fast.roll_time_s[-1]) < 0.0 < float(fast.roll_time_s[0])
+
+
+@cuda
+def test_depth_compensation_off_is_not_paid_for() -> None:
+    """The velocity path must not stage depth compensation it never uses.
+
+    The renderer runs with depth compensation off, so those coefficients are
+    all zero. Staging them anyway cost 8 of 48 bytes per Gaussian in shared
+    memory -- and shared memory is what bounds blocks per SM here, which is why
+    the rolling-shutter render was slower than the static one almost exactly in
+    proportion to the record size. This pins that the zero case still renders
+    correctly through the narrower record.
+    """
+    spec = _spec(n_columns=512)
+    scene = _ring_scene(n=20_000, seed=4)
+    travel = 20.0 * SWEEP_S
+    swept = _render(scene, spec, _pose_x(0.0), _pose_x(travel))
+    assert torch.isfinite(swept["distance"]).all()
+    assert int((swept["alpha"] > 0.1).sum()) > 0
+    # And it must still beat the midpoint against the swept reference.
+    ref = _swept_reference(scene, spec, travel, slices=16)
+    midpoint = _render(scene, spec, _pose_x(0.5 * travel))
+    assert _mean_range_error(ref, swept) < _mean_range_error(ref, midpoint)

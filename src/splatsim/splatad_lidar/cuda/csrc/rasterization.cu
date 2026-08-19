@@ -2217,7 +2217,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize
 #endif
 
 template <uint32_t COLOR_DIM, bool STATIC, bool ROW_TILE = false,
-          uint32_t BATCH_MULT = LIDAR_BATCH_MULT>
+          bool DEPTH_COMP = true, uint32_t BATCH_MULT = LIDAR_BATCH_MULT>
 __global__ void rasterize_to_points_fwd_kernel(
     const uint32_t C, const uint32_t N, const uint32_t n_isects, const bool packed,
     const float2 *__restrict__ means2d,             // [C, N, 2] or [nnz, 2]
@@ -2315,11 +2315,18 @@ __global__ void rasterize_to_points_fwd_kernel(
     // only one set is used depending on STATIC.
     float4 *packA_batch = (float4 *)s;                            // [stage_size] STATIC
     float4 *packB_batch = (float4 *)&packA_batch[stage_size];     // [stage_size] STATIC
-    int32_t *id_batch = (int32_t *)s;                              // [stage_size]
-    float3 *xy_opacity_batch = (float3 *)&id_batch[stage_size];    // [stage_size]
-    float3 *conic_batch = (float3 *)&xy_opacity_batch[stage_size]; // [stage_size]
-    float3 *pix_vel_batch = (float3 *)&conic_batch[stage_size];    // [stage_size]
-    float2 *depth_comp_batch = (float2 *)&pix_vel_batch[stage_size]; // [stage_size]
+    // splatsim: the velocity path used five separate arrays -- id (4 B) +
+    // xy_opac (12) + conic (12) + pix_vel (12) + depth_comp (8) = 48 B per
+    // staged Gaussian, against the static path's 32 B. That extra shared
+    // memory costs blocks per SM, and the rolling-shutter render was slower
+    // than the static one almost exactly in proportion (145 vs 94 ms, 48 vs
+    // 32 B). Pack into two aligned float4 plus a float2, and drop depth_comp
+    // entirely when it is known to be zero (DEPTH_COMP == false), for 40 B.
+    float4 *velA_batch = (float4 *)s;                             // [stage_size]
+    float4 *velB_batch = (float4 *)&velA_batch[stage_size];       // [stage_size]
+    float2 *velC_batch = (float2 *)&velB_batch[stage_size];       // [stage_size]
+    float2 *depth_comp_batch =
+        DEPTH_COMP ? (float2 *)&velC_batch[stage_size] : nullptr; // [stage_size]
     (void)packA_batch; (void)packB_batch;
 
     // current visibility left to render
@@ -2388,13 +2395,15 @@ __global__ void rasterize_to_points_fwd_kernel(
                         make_float4(conic.y, conic.z, __int_as_float(g), sigma_max);
                 }
             } else {
-                id_batch[slot] = g;
-                xy_opacity_batch[slot] = {xy.x, xy.y, opac};
-                conic_batch[slot] = conic;
                 const float3 pix_vel = pix_vels[g];
-                const float2 depth_comp = depth_compensations[g];
-                pix_vel_batch[slot] = {pix_vel.x, pix_vel.y, pix_vel.z};
-                depth_comp_batch[slot] = {depth_comp.x, depth_comp.y};
+                velA_batch[slot] = make_float4(xy.x, xy.y, opac, conic.x);
+                velB_batch[slot] =
+                    make_float4(conic.y, conic.z, __int_as_float(g), pix_vel.z);
+                velC_batch[slot] = make_float2(pix_vel.x, pix_vel.y);
+                if (DEPTH_COMP) {
+                    const float2 depth_comp = depth_compensations[g];
+                    depth_comp_batch[slot] = make_float2(depth_comp.x, depth_comp.y);
+                }
             }
         }
 
@@ -2453,9 +2462,11 @@ __global__ void rasterize_to_points_fwd_kernel(
                 g = __float_as_int(B.z);
                 sigma_max = B.w;
             } else {
-                conic = conic_batch[t];
-                xy_opac = xy_opacity_batch[t];
-                g = id_batch[t];
+                const float4 A = velA_batch[t];
+                const float4 B = velB_batch[t];
+                xy_opac = make_float3(A.x, A.y, A.z);
+                conic = make_float3(A.w, B.x, B.y);
+                g = __float_as_int(B.z);
             }
             const float opac = xy_opac.z;
             float2 delta;
@@ -2466,12 +2477,15 @@ __global__ void rasterize_to_points_fwd_kernel(
             if constexpr (STATIC) {
                 delta = {angle_difference(xy_opac.x, px), xy_opac.y - py};
             } else {
-                const float3 pix_vel = pix_vel_batch[t];
-                const float2 depth_comp = depth_comp_batch[t];
-                delta = {angle_difference(xy_opac.x + roll_time * pix_vel.x, px),
-                         (xy_opac.y + roll_time * pix_vel.y) - py};
-                depth_extra =
-                    depth_comp.x * delta.x + depth_comp.y * delta.y + pix_vel.z * roll_time;
+                const float2 vxy = velC_batch[t];
+                const float vz = velB_batch[t].w;
+                delta = {angle_difference(xy_opac.x + roll_time * vxy.x, px),
+                         (xy_opac.y + roll_time * vxy.y) - py};
+                depth_extra = vz * roll_time;
+                if (DEPTH_COMP) {
+                    const float2 dc = depth_comp_batch[t];
+                    depth_extra += dc.x * delta.x + dc.y * delta.y;
+                }
             }
             const float sigma =
                 0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) +
@@ -2609,10 +2623,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // (see the kernel's stage_size), so both shared buffers scale with it.
     // Missing that factor here overran the non-static path's shared memory by
     // 16x the moment rolling shutter started using it.
+    // splatsim: the velocity path stages two float4 + a float2 per Gaussian,
+    // plus a float2 for depth compensation only when it is actually used.
+    const bool needs_depth_comp = depth_compensations.abs().max().item<float>() > 0.f;
     const uint32_t shared_mem =
         tile_width * tile_height * LIDAR_BATCH_MULT *
-        (sizeof(int32_t) + sizeof(float3) + sizeof(float3) + sizeof(float3) +
-         sizeof(float2));
+        (2 * sizeof(float4) + sizeof(float2) +
+         (needs_depth_comp ? sizeof(float2) : 0u));
     // splatsim STATIC path packs (xy, opac, conic, id) into two aligned float4
     // per thread (single LDS.128 each; no pix_vel/depth_comp batches).
     const uint32_t shared_mem_static =
@@ -2742,13 +2759,18 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
             }
         } else {
-            if (cudaFuncSetAttribute(rasterize_to_points_fwd_kernel<3, false>,
+            auto kern_v = needs_depth_comp
+                ? (void *)rasterize_to_points_fwd_kernel<3, false, false, true>
+                : (void *)rasterize_to_points_fwd_kernel<3, false, false, false>;
+            if (cudaFuncSetAttribute(kern_v,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      shared_mem) != cudaSuccess) {
                 AT_ERROR("Failed to set maximum shared memory size (requested ", shared_mem,
                          " bytes), try lowering tile_size.");
             }
-            rasterize_to_points_fwd_kernel<3, false><<<blocks, threads, shared_mem, stream>>>(
+            if (needs_depth_comp) {
+            rasterize_to_points_fwd_kernel<3, false, false, true>
+                <<<blocks, threads, shared_mem, stream>>>(
                 C, N, n_isects, packed,
                 (float2 *)means2d.data_ptr<float>(),
                 (float3 *)conics.data_ptr<float>(),
@@ -2768,6 +2790,29 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 alphas.data_ptr<float>(),
                 compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
                 last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            } else {
+            rasterize_to_points_fwd_kernel<3, false, false, false>
+                <<<blocks, threads, shared_mem, stream>>>(
+                C, N, n_isects, packed,
+                (float2 *)means2d.data_ptr<float>(),
+                (float3 *)conics.data_ptr<float>(),
+                colors.data_ptr<float>(),
+                opacities.data_ptr<float>(),
+                (float3 *)pix_vels.data_ptr<float>(),
+                (float2 *)depth_compensations.data_ptr<float>(),
+                backgrounds.has_value() ? backgrounds.value().data_ptr<float>() : nullptr,
+                (float4 *)raster_pts.data_ptr<float>(),
+                image_width, image_height, tile_width, tile_height, tile_grid_width, tile_grid_height,
+                compute_alpha_sum_until_points,
+                compute_alpha_sum_until_points_threshold,
+                tile_offsets.data_ptr<int32_t>(),
+                flatten_ids.data_ptr<int32_t>(),
+                depth_channel_idx,
+                renders.data_ptr<float>(),
+                alphas.data_ptr<float>(),
+                compute_alpha_sum_until_points ? alpha_sum_until_points.data_ptr<float>() : nullptr,
+                last_ids.data_ptr<int32_t>(), median_depths.data_ptr<float>());
+            }
         }
         break;
     case 4:
