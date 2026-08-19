@@ -2605,12 +2605,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                                           means2d.options().dtype(torch::kInt32));
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+    // splatsim: BOTH paths stage LIDAR_BATCH_MULT Gaussians per thread per round
+    // (see the kernel's stage_size), so both shared buffers scale with it.
+    // Missing that factor here overran the non-static path's shared memory by
+    // 16x the moment rolling shutter started using it.
     const uint32_t shared_mem =
-        tile_width * tile_height * (sizeof(int32_t) + sizeof(float3) + sizeof(float3) + sizeof(float3) + sizeof(float2));
+        tile_width * tile_height * LIDAR_BATCH_MULT *
+        (sizeof(int32_t) + sizeof(float3) + sizeof(float3) + sizeof(float3) +
+         sizeof(float2));
     // splatsim STATIC path packs (xy, opac, conic, id) into two aligned float4
     // per thread (single LDS.128 each; no pix_vel/depth_comp batches).
-    // splatsim: the STATIC path stages LIDAR_BATCH_MULT Gaussians per thread per
-    // round (see the kernel), so the shared buffer scales with it.
     const uint32_t shared_mem_static =
         tile_width * tile_height * LIDAR_BATCH_MULT * (2 * sizeof(float4));
 

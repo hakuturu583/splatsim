@@ -638,6 +638,66 @@ _SPLATAD_TILE_WIDTH: int = 16
 _SPLATAD_RAST = None
 
 
+def _sweep_motion(
+    s2w: torch.Tensor,
+    s2w_end: torch.Tensor,
+    sweep_s: float,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+    """Mid-sweep sensor pose plus the linear/angular velocity across the sweep.
+
+    Returns ``(s2w_mid, lin_vel_world, ang_vel_sensor)``. The rasterizer places
+    every column at ``phase * sweep_s`` around the mid-sweep pose, with phase in
+    [-0.5, +0.5], so the reference pose must be the middle of the sweep and the
+    velocities must be about it. Rotation is interpolated as a true half-way
+    rotation (not a lerp of matrices) so the reference stays a rigid transform.
+    """
+    R0, R1 = s2w[:3, :3], s2w_end[:3, :3]
+    t0, t1 = s2w[:3, 3], s2w_end[:3, 3]
+
+    # Relative rotation over the sweep, as an axis-angle vector in the START
+    # sensor frame: R_rel = R0^T R1.
+    R_rel = R0.transpose(0, 1) @ R1
+    cos_t = ((R_rel[0, 0] + R_rel[1, 1] + R_rel[2, 2] - 1.0) * 0.5).clamp(-1.0, 1.0)
+    theta = torch.acos(cos_t)
+    axis = torch.stack(
+        [
+            R_rel[2, 1] - R_rel[1, 2],
+            R_rel[0, 2] - R_rel[2, 0],
+            R_rel[1, 0] - R_rel[0, 1],
+        ]
+    )
+    sin_t = torch.sin(theta)
+    if float(sin_t.abs()) < 1e-7:
+        # No rotation over the sweep (or a 180 deg flip, which a LiDAR sweep
+        # never does): treat as pure translation.
+        rotvec = torch.zeros(3, device=s2w.device, dtype=s2w.dtype)
+    else:
+        rotvec = axis * (theta / (2.0 * sin_t))
+
+    # Half-way rotation via Rodrigues on rotvec/2, applied to R0.
+    half = rotvec * 0.5
+    ang = torch.linalg.norm(half)
+    eye = torch.eye(3, device=s2w.device, dtype=s2w.dtype)
+    if float(ang) < 1e-9:
+        R_half = eye
+    else:
+        k = half / ang
+        K = torch.zeros(3, 3, device=s2w.device, dtype=s2w.dtype)
+        K[0, 1], K[0, 2] = -k[2], k[1]
+        K[1, 0], K[1, 2] = k[2], -k[0]
+        K[2, 0], K[2, 1] = -k[1], k[0]
+        R_half = eye + torch.sin(ang) * K + (1.0 - torch.cos(ang)) * (K @ K)
+
+    s2w_mid = torch.eye(4, device=s2w.device, dtype=s2w.dtype)
+    s2w_mid[:3, :3] = R0 @ R_half
+    s2w_mid[:3, 3] = 0.5 * (t0 + t1)
+
+    inv_dt = 1.0 / max(sweep_s, 1e-6)
+    lin_vel = (t1 - t0) * inv_dt  # world frame
+    ang_vel = rotvec * inv_dt  # sensor frame
+    return s2w_mid, lin_vel, ang_vel
+
+
 def _lidar_lod_scale() -> float:
     """Extra per-cell LOD thinning applied to the LiDAR gather.
 
@@ -682,6 +742,7 @@ class _PanoGeom(NamedTuple):
     tile_boundaries: torch.Tensor  # (H//th + 1,) ascending deg, device
     dirs: torch.Tensor  # (H, W, 3) unit beam directions (desc/CW grid), device
     row_elevations_asc: torch.Tensor  # (H,) ascending beam elevations [deg]
+    roll_time_s: torch.Tensor  # (W,) time offset per ASCENDING column [s]
     min_el_deg: float  # ascending-grid elevation bounds (CPU floats,
     max_el_deg: float  # cached to avoid per-frame .item() syncs)
 
@@ -696,6 +757,7 @@ def _panorama_geometry(lidar_spec: LidarSensorSpec, device) -> _PanoGeom:
         lidar_spec.el_lo_rad,
         lidar_spec.el_hi_rad,
         lidar_spec.n_rows_uniform,
+        lidar_spec.spinning_frequency_hz,
         _SPLATAD_TILE_HEIGHT,
         _SPLATAD_TILE_WIDTH,
     )
@@ -712,10 +774,27 @@ def _panorama_geometry(lidar_spec: LidarSensorSpec, device) -> _PanoGeom:
     el_deg = torch.rad2deg(torch.flip(elevs_desc, [0]))  # (H,) ascending deg
     az_deg = torch.rad2deg(torch.flip(azs_cw, [0]))  # (W,) ascending deg
     grid_el, grid_az = torch.meshgrid(el_deg, az_deg, indexing="ij")  # (H, W)
+    # When each column is scanned, in SECONDS relative to the mid-sweep pose
+    # (the rasterizer multiplies this by a per-Gaussian angular rate in deg/s,
+    # so it must not be a dimensionless phase). The panorama grid is ASCENDING
+    # azimuth while a spinning LiDAR sweeps +180 -> -180 (clockwise), so time
+    # runs backwards along it: the last column is scanned first.
+    sweep_s = 1.0 / max(float(lidar_spec.spinning_frequency_hz), 1e-6)
+    n_cols = az_deg.shape[0]
+    if n_cols > 1:
+        idx = torch.arange(n_cols, device=device, dtype=torch.float32)
+        roll_time_s = (((n_cols - 1 - idx) / (n_cols - 1)) - 0.5) * sweep_s
+    else:
+        roll_time_s = torch.zeros(n_cols, device=device)
     raster_pts = torch.stack(
-        [grid_az, grid_el, torch.ones_like(grid_az), torch.zeros_like(grid_az)],
+        [
+            grid_az,
+            grid_el,
+            torch.ones_like(grid_az),
+            roll_time_s.unsqueeze(0).expand_as(grid_az).contiguous(),
+        ],
         dim=-1,
-    ).unsqueeze(0)  # (1, H, W, 4) = [azimuth_deg, elevation_deg, range=1, time=0]
+    ).unsqueeze(0)  # (1, H, W, 4) = [azimuth_deg, elevation_deg, range=1, t_s]
 
     # Non-uniform elevation tile boundaries (tile_height beams/tile), asc deg.
     th = _SPLATAD_TILE_HEIGHT
@@ -747,6 +826,7 @@ def _panorama_geometry(lidar_spec: LidarSensorSpec, device) -> _PanoGeom:
         tile_boundaries=tile_boundaries,
         dirs=dirs,
         row_elevations_asc=el_deg.contiguous(),
+        roll_time_s=roll_time_s,
         min_el_deg=float(el_deg_cpu.min()),
         max_el_deg=float(el_deg_cpu.max()),
     )
@@ -1281,19 +1361,25 @@ def render_lidar_panorama(
     raster_pts = geom.raster_pts
     tile_boundaries = geom.tile_boundaries
 
-    # Rolling shutter: SplatAD models intra-sweep skew via per-Gaussian
-    # velocities, not a sweep-end pose. Until that path is wired, approximate the
-    # sweep by rendering from the midpoint pose (matching the cull midpoint).
-    render_s2w = sensor_to_world
+    # Rolling shutter: render from the MID-sweep pose and let the rasterizer
+    # displace each column by its own sweep phase (raster_pts[..., 3]) times the
+    # sensor's motion. Without a sweep-end pose the sweep is static and the
+    # whole panorama comes from the single given pose.
+    render_s2w = sensor_to_world.to(device=device, dtype=torch.float32)
+    lin_vel = torch.zeros(1, 3, device=device)
+    ang_vel = torch.zeros(1, 3, device=device)
+    sweep_time = torch.zeros(1, device=device)
     if sensor_to_world_end is not None:
-        render_s2w = sensor_to_world.clone()
-        render_s2w[:3, 3] = 0.5 * (
-            sensor_to_world[:3, 3]
-            + sensor_to_world_end.to(sensor_to_world.device, sensor_to_world.dtype)[
-                :3, 3
-            ]
+        sweep_s = 1.0 / max(float(lidar_spec.spinning_frequency_hz), 1e-6)
+        s2w_mid, lv, av = _sweep_motion(
+            sensor_to_world.to(device=device, dtype=torch.float32),
+            sensor_to_world_end.to(device=device, dtype=torch.float32),
+            sweep_s,
         )
-    render_s2w = render_s2w.to(device=device, dtype=torch.float32)
+        render_s2w = s2w_mid
+        lin_vel = lv.reshape(1, 3)
+        ang_vel = av.reshape(1, 3)
+        sweep_time = torch.full((1,), sweep_s, device=device)
     viewmats = _rigid_inverse_4x4(render_s2w).unsqueeze(0)  # (C=1, 4, 4)
 
     # lidar_features = [intensity_sig, raydrop_logit] -> rendered feature channels.
@@ -1310,6 +1396,9 @@ def render_lidar_panorama(
         opacities=opacities.float(),
         lidar_features=lidar_features,
         velocities=None,
+        linear_velocity=lin_vel,
+        angular_velocity=ang_vel,
+        rolling_shutter_time=sweep_time,
         viewmats=viewmats,
         raster_pts=raster_pts,
         tile_elevation_boundaries=tile_boundaries.clone(),

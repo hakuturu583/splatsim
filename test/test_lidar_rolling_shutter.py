@@ -1,11 +1,11 @@
 """Motion-during-sweep (``sensor_to_world_end``) LiDAR rendering.
 
 Exercises the ``sensor_to_world_end`` path of :func:`render_lidar_panorama`.
-Note this is a midpoint-pose *approximation*, not true rolling shutter: the
-vendored SplatAD kernel has no per-column pose interpolation (the gsplat
-backend had, via ``viewmats_rs`` + ``RollingShutterType``), so the panorama is
-rendered from the translational midpoint of the start/end poses and every
-column shares that one pose. These tests pin that documented behaviour.
+This is real rolling shutter: the panorama is rendered from the MID-sweep pose
+and each column is displaced by its own scan time times the sensor's motion.
+The correctness of that displacement -- sign, frame and units -- is checked in
+test_rolling_shutter.py against a swept reference; these tests cover the shape
+of the interface around it.
 """
 
 from __future__ import annotations
@@ -94,14 +94,15 @@ def test_motion_changes_the_scan() -> None:
     assert diff.mean().item() > 0.01, "rolling shutter had no effect under motion"
 
 
-def test_end_pose_renders_from_the_midpoint() -> None:
-    """A start/end pair renders exactly like a single pose at their midpoint.
+def test_end_pose_is_not_just_the_midpoint_pose() -> None:
+    """Motion must actually skew the sweep, not merely shift it.
 
-    This is the whole content of the approximation: no per-column interpolation
-    happens, so the (start, end) render is bit-identical to a single-pose render
-    at the translational midpoint. If real rolling shutter is ever wired up (via
-    the SplatAD kernel's per-Gaussian ``velocities``), this test is the one that
-    must change.
+    The renderer used to approximate a moving sweep by rendering everything
+    from the midpoint pose; this asserts that is no longer what happens. That
+    the displacement is also correct in sign and magnitude is checked in
+    test_rolling_shutter.py, against a reference swept over many poses -- this
+    scene does not cover the full azimuth, so its sweep extremes are too sparse
+    to say anything about the error profile.
     """
     start = torch.eye(4, device="cuda")
     end = torch.eye(4, device="cuda")
@@ -111,8 +112,13 @@ def test_end_pose_renders_from_the_midpoint() -> None:
 
     swept = _render(start, sensor_to_world_end=end)
     at_mid = _render(mid)
-    for key in ("alpha", "distance", "intensity", "raydrop_logit"):
-        assert torch.equal(swept[key], at_mid[key]), f"{key} differs from midpoint"
+
+    both = (swept["alpha"] > 0.1) & (at_mid["alpha"] > 0.1)
+    assert int(both.sum()) > 0
+    diff = (swept["distance"] - at_mid["distance"]).abs()
+    assert float(diff[both].mean()) > 1e-3, (
+        "the swept render is indistinguishable from the midpoint pose"
+    )
 
 
 def test_inert_kernel_flags_are_accepted() -> None:
