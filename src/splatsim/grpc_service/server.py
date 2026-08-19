@@ -111,6 +111,25 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         self._rig_frame_rate: float = 10.0
         self._rig_render_count: int = 0
 
+    def _warmup(self, what: str, render_once: Callable[[], object]) -> None:
+        """Render one throwaway frame so CUDA module loads / kernel JIT happen
+        here instead of stalling the first streamed pose (measured ~320 ms of
+        GIL hold on the first frame otherwise). Nothing is published. Failures
+        are logged and swallowed: a broken warmup pose must not fail Initialize
+        when the real pose stream would still work.
+        """
+        try:
+            t0 = time.monotonic()
+            with torch.no_grad():
+                render_once()
+            logger.info(
+                "Warmup render (%s) done in %.0f ms",
+                what,
+                (time.monotonic() - t0) * 1000,
+            )
+        except Exception:
+            logger.exception("Warmup render (%s) failed; continuing", what)
+
     def Initialize(
         self,
         request: pb2.InitializeRequest,
@@ -195,6 +214,14 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
 
                 self._initialized = True
                 logger.info("Initialization complete (%.1f fps)", self._frame_rate)
+
+                renderer, K, scene = self._renderer, self._K, self._scene
+                self._warmup(
+                    "camera",
+                    lambda: renderer.render(
+                        torch.eye(4, device=device), K, scene=scene
+                    ),
+                )
 
                 centroid = background.tile_local_centroid
                 scene_origin = pb2.Vector3(
@@ -504,12 +531,13 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 )
 
                 spec = build_lidar_sensors_from_config([cfg])[0]
-                self._lidar_renderer = LidarRenderer(
+                lidar_renderer = LidarRenderer(
                     spec,
                     device=self._device,
                     min_range_m=cfg.min_range_m,
                     max_range_m=cfg.max_range_m,
                 )
+                self._lidar_renderer = lidar_renderer
                 self._pointcloud_pub = PointCloud2Publisher(
                     self._dp,
                     topic_name=cfg.pointcloud_topic,
@@ -526,6 +554,18 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                     self._lidar_renderer.n_columns,
                     cfg.fps,
                     cfg.pointcloud_topic,
+                )
+
+                lidar_scene = self._scene
+                self._warmup(
+                    f"lidar {cfg.name}",
+                    lambda: lidar_renderer.panorama_to_pointcloud2_data(
+                        lidar_renderer.render(
+                            torch.eye(4, device=self._device), scene=lidar_scene
+                        ),
+                        drop_threshold=cfg.drop_threshold,
+                        alpha_threshold=cfg.alpha_threshold,
+                    ),
                 )
                 return pb2.InitializeResponse(success=True)
 
@@ -633,6 +673,24 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             ", ".join(names),
             self._rig_frame_rate,
         )
+
+        assert self._scene is not None  # noqa: S101
+        rig_scene = self._scene
+
+        def _rig_once() -> None:
+            panoramas = render_lidars_concurrent(
+                [rl.renderer for rl in rig],
+                torch.eye(4, device=self._device),
+                rig_scene,
+            )
+            for rl, pano in zip(rig, panoramas):
+                rl.renderer.panorama_to_pointcloud2_data(
+                    pano,
+                    drop_threshold=rl.drop_threshold,
+                    alpha_threshold=rl.alpha_threshold,
+                )
+
+        self._warmup("lidar rig", _rig_once)
         return pb2.InitializeResponse(success=True)
 
     def InitializeCameraRig(
@@ -718,6 +776,17 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                     len(rig),
                     ", ".join(names),
                 )
+
+                def _cam_rig_once() -> None:
+                    render_cameras_concurrent(
+                        [rc.renderer for rc in rig],
+                        [torch.linalg.inv(rc.cam_to_base) for rc in rig],
+                        [rc.K for rc in rig],
+                        scene=self._scene,
+                        camera_names=[rc.name for rc in rig],
+                    )
+
+                self._warmup("camera rig", _cam_rig_once)
                 return pb2.InitializeResponse(success=True)
             except Exception as exc:
                 logger.exception("InitializeCameraRig failed")
