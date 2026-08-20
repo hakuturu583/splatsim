@@ -34,6 +34,7 @@ from splatsim.grpc_service.viewmat_builder import (
 from splatsim.lidar_renderer import (
     LidarRenderer,
     build_lidar_sensors_from_config,
+    gather_lidar_rig,
     render_lidars_concurrent,
 )
 from splatsim.renderer import Renderer, render_cameras_concurrent
@@ -48,7 +49,49 @@ def _sweep_time_ns(spinning_frequency_hz: float) -> int | None:
     rendering, the pre-rolling-shutter behaviour)."""
     if os.environ.get("SPLATSIM_LIDAR_ROLLING_SHUTTER", "1") == "0":
         return None
+    return _spin_period_ns(spinning_frequency_hz)
+
+
+def _spin_period_ns(spinning_frequency_hz: float) -> int:
+    """One LiDAR revolution in nanoseconds, regardless of the rolling-shutter
+    env toggle (sector streaming needs the period even for static sectors)."""
     return int(1_000_000_000 / max(float(spinning_frequency_hz), 1e-6))
+
+
+def _lidar_sector_count() -> int:
+    """How many azimuth sectors each LiDAR revolution is rendered in.
+
+    ``SPLATSIM_LIDAR_SECTORS=S`` (S >= 2) turns the pose-stream LiDAR loop
+    into sector streaming: each revolution is rendered as S wedges, each from
+    poses interpolated over ITS OWN slice of the sweep, and the wedges are
+    concatenated and published once per revolution. This is both a better
+    rolling shutter (per-sector motion instead of one whole-sweep pose pair)
+    and faster (the fused CUDA azimuth cull drops ~(S-1)/S of the Gaussians
+    per wedge). ``S`` must divide the panorama into tile-aligned slices — see
+    :func:`splatsim.lidar_renderer._panorama_geometry`. Default 1 (off).
+    """
+    try:
+        return max(1, int(os.environ.get("SPLATSIM_LIDAR_SECTORS", "1")))
+    except ValueError:
+        return 1
+
+
+@dataclass
+class _SectorHooks:
+    """Modality-specific callbacks for the sector-streaming pose loop.
+
+    ``render_sector(start, end, k, state)`` renders sector ``k`` from the pose
+    pair at the sector window's endpoints and returns an opaque per-sector
+    output; ``state`` is a scratch dict living for one revolution (used to
+    gather the Gaussian set once and reuse it across all sectors).
+    ``publish_revolution(outputs, end_pose, stamp_ns)`` receives the S sector
+    outputs in scan order plus the sweep-end pose/stamp.
+    """
+
+    n_sectors: int
+    spin_period_ns: int
+    render_sector: Callable[[TimestampedPose, TimestampedPose, int, dict], object]
+    publish_revolution: Callable[[list, TimestampedPose, int], None]
 
 
 @dataclass
@@ -330,6 +373,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             [TimestampedPose, int, TimestampedPose | None], None
         ],
         sweep_time_ns: int | None = None,
+        sector_hooks: "_SectorHooks | None" = None,
     ) -> pb2.StreamSummary:
         """Shared two-thread pose-streaming loop for camera, LiDAR and rig.
 
@@ -344,6 +388,15 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         (latest) pose, interpolated from the buffered pose queue — matching a
         real spinning LiDAR, whose cloud stamped at ``t`` was swept over
         ``[t - sweep, t]``. ``None`` keeps the static single-pose behaviour.
+
+        ``sector_hooks`` switches the render thread to SECTOR STREAMING (see
+        :func:`_lidar_sector_count`): instead of one whole-sweep render per
+        frame, revolutions are pinned to the pose timeline and each azimuth
+        sector is rendered as soon as the poses covering its slice of the
+        sweep have arrived, from poses interpolated at the slice endpoints.
+        The finished revolution is concatenated and published with the
+        sweep-end stamp. ``frame_rate`` is ignored in this mode — the loop is
+        paced by the pose timeline itself.
         """
         pose_buffer = PoseBuffer()
         stream_done = threading.Event()
@@ -411,7 +464,96 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 logger.exception("Render loop failed")
                 render_failed.set()
 
-        render_thread = threading.Thread(target=_render_loop, daemon=True)
+        def _sector_render_loop() -> None:
+            """Render sectors as the pose timeline covers their sweep slices.
+
+            A revolution is anchored at ``rev_start_ns`` (the first buffered
+            pose, then back-to-back). Sector ``k`` of ``S`` covers
+            ``[rev_start + k/S * period, rev_start + (k+1)/S * period]``; it is
+            rendered the moment the newest buffered pose passes the window's
+            end, from poses interpolated at the window endpoints. After sector
+            ``S-1`` the revolution is published with the sweep-end stamp.
+
+            If the pose timeline runs away from the loop (rendering slower
+            than real time, or a source gap), the next revolution resyncs to
+            the newest pose instead of grinding through stale sweeps — the
+            sector-mode analogue of the plain loop's latest-pose behaviour.
+            """
+            nonlocal frames_rendered
+            assert sector_hooks is not None  # noqa: S101
+            n_sectors = sector_hooks.n_sectors
+            period = sector_hooks.spin_period_ns
+            rev_start_ns: int | None = None
+            k = 0
+            outputs: list = []
+            state: dict = {}
+
+            def _pose_at(t_ns: int) -> TimestampedPose | None:
+                pose = pose_buffer.interpolate(t_ns)
+                if pose is not None:
+                    return pose
+                # Before the buffered range (first revolution): clamp to the
+                # oldest pose, mirroring the plain loop's short-sweep fallback.
+                earliest = pose_buffer.get_earliest()
+                if earliest is not None and t_ns <= earliest.time_ns:
+                    return earliest
+                return pose_buffer.get_latest()
+
+            try:
+                while not stream_done.is_set():
+                    if not pose_buffer.new_pose_event.wait(timeout=1.0):
+                        continue
+                    pose_buffer.new_pose_event.clear()
+                    # Drain: render every sector whose window the newest pose
+                    # has passed (several per wake-up when catching up).
+                    while not stream_done.is_set():
+                        latest_ns = pose_buffer.latest_time_ns
+                        if latest_ns is None:
+                            break
+                        if rev_start_ns is None:
+                            rev_start_ns = latest_ns
+                        if k == 0 and latest_ns - rev_start_ns > 2 * period:
+                            logger.warning(
+                                "Sector loop resync: poses ran %.0f ms ahead "
+                                "of the revolution start; restarting at the "
+                                "newest pose",
+                                (latest_ns - rev_start_ns) / 1e6,
+                            )
+                            rev_start_ns = latest_ns
+                        sector_end_ns = rev_start_ns + (k + 1) * period // n_sectors
+                        if latest_ns < sector_end_ns:
+                            break
+                        sector_start_ns = rev_start_ns + k * period // n_sectors
+                        start = _pose_at(sector_start_ns)
+                        end = _pose_at(sector_end_ns)
+                        if start is None or end is None:
+                            break
+                        outputs.append(sector_hooks.render_sector(start, end, k, state))
+                        k += 1
+                        if k == n_sectors:
+                            sector_hooks.publish_revolution(outputs, end, sector_end_ns)
+                            frames_rendered += 1
+                            if frames_rendered <= 3 or frames_rendered % 100 == 0:
+                                logger.info(
+                                    "Sector revolution #%d published "
+                                    "(t=%d ns, %d sectors)",
+                                    frames_rendered,
+                                    sector_end_ns,
+                                    n_sectors,
+                                )
+                            pose_buffer.trim_before(sector_end_ns)
+                            rev_start_ns = sector_end_ns
+                            k = 0
+                            outputs = []
+                            state = {}
+            except Exception:
+                logger.exception("Sector render loop failed")
+                render_failed.set()
+
+        render_thread = threading.Thread(
+            target=_sector_render_loop if sector_hooks is not None else _render_loop,
+            daemon=True,
+        )
         render_thread.start()
 
         try:
@@ -659,6 +801,86 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             sweep_time_ns=_sweep_time_ns(
                 self._lidar_renderer.sensor_spec.spinning_frequency_hz
             ),
+            sector_hooks=self._lidar_sector_hooks(),
+        )
+
+    def _lidar_sector_hooks(self) -> "_SectorHooks | None":
+        """Sector-streaming callbacks for the single-LiDAR pose stream, or
+        ``None`` when ``SPLATSIM_LIDAR_SECTORS`` <= 1."""
+        n_sectors = _lidar_sector_count()
+        if n_sectors <= 1 or self._lidar_renderer is None:
+            return None
+        renderer = self._lidar_renderer
+        scene = self._scene
+        device = self._device
+        assert scene is not None and device is not None  # noqa: S101
+        publisher = self._pointcloud_pub
+        assert publisher is not None  # noqa: S101
+        # Rolling shutter (per-sector pose pair) unless disabled via env;
+        # static sectors still render at each window's END pose.
+        rolling = _sweep_time_ns(renderer.sensor_spec.spinning_frequency_hz) is not None
+
+        def render_sector(
+            start: TimestampedPose, end: TimestampedPose, k: int, state: dict
+        ) -> dict:
+            b2w_end = build_base_to_world_from_pose(end.position, end.rotation, device)
+            if rolling:
+                b2w = build_base_to_world_from_pose(
+                    start.position, start.rotation, device
+                )
+                b2w_pair = (b2w, b2w_end)
+            else:
+                b2w_pair = (b2w_end, None)
+            with torch.no_grad():
+                if "shared" not in state:
+                    # One LOD gather per revolution, reused by every sector.
+                    state["shared"] = renderer.gather(
+                        b2w_pair[0], scene, base_to_world_end=b2w_pair[1]
+                    )
+                shared = state["shared"]
+                if shared is None:
+                    return renderer._empty_panorama((k, n_sectors))
+                return renderer.render(
+                    b2w_pair[0],
+                    scene=scene,
+                    base_to_world_end=b2w_pair[1],
+                    shared=shared,
+                    sector=(k, n_sectors),
+                )
+
+        def publish_revolution(
+            outputs: list, end_pose: TimestampedPose, stamp_ns: int
+        ) -> None:
+            del end_pose
+            t0 = time.monotonic()
+            with torch.no_grad():
+                panorama = {
+                    key: torch.cat([o[key] for o in outputs], dim=1)
+                    for key in outputs[0]
+                }
+                records, n_points = renderer.panorama_to_pointcloud2_data(
+                    panorama,
+                    drop_threshold=self._lidar_drop_threshold,
+                    alpha_threshold=self._lidar_alpha_threshold,
+                )
+            sec, nanosec = divmod(stamp_ns, 1_000_000_000)
+            publisher.publish_packed(
+                records, n_points, stamp=Time(sec=sec, nanosec=nanosec)
+            )
+            self._lidar_render_count += 1
+            if self._lidar_render_count <= 5 or self._lidar_render_count % 100 == 0:
+                logger.info(
+                    "LiDAR sector revolution #%d: %d points, publish=%.1fms",
+                    self._lidar_render_count,
+                    n_points,
+                    (time.monotonic() - t0) * 1000,
+                )
+
+        return _SectorHooks(
+            n_sectors=n_sectors,
+            spin_period_ns=_spin_period_ns(renderer.sensor_spec.spinning_frequency_hz),
+            render_sector=render_sector,
+            publish_revolution=publish_revolution,
         )
 
     # ── Rig: many LiDARs / cameras off one shared gather ─────────────────
@@ -900,6 +1122,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             frame_rate=self._rig_frame_rate,
             render_and_publish=self._render_and_publish_rig,
             sweep_time_ns=self._rig_sweep_time_ns(),
+            sector_hooks=self._rig_sector_hooks(),
         )
         return pb2.RigSummary(
             frames_rendered=summary.frames_rendered,
@@ -907,6 +1130,130 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             lidars_rendered=summary.frames_rendered * len(self._rig_lidars),
             cameras_rendered=summary.frames_rendered * len(self._rig_cameras),
         )
+
+    def _rig_sector_hooks(self) -> "_SectorHooks | None":
+        """Sector-streaming callbacks for the rig pose stream, or ``None``.
+
+        LiDARs render per sector off ONE Gaussian gather per revolution;
+        cameras render once per revolution at the sweep-end pose (their
+        existing cadence — a camera has no sweep to slice).
+        """
+        n_sectors = _lidar_sector_count()
+        if n_sectors <= 1 or not self._rig_lidars:
+            return None
+        scene = self._scene
+        device = self._device
+        assert scene is not None and device is not None  # noqa: S101
+        renderers = [rl.renderer for rl in self._rig_lidars]
+        rolling = self._rig_sweep_time_ns() is not None
+        spins = {
+            float(rl.renderer.sensor_spec.spinning_frequency_hz)
+            for rl in self._rig_lidars
+        }
+
+        def render_sector(
+            start: TimestampedPose, end: TimestampedPose, k: int, state: dict
+        ) -> list[dict]:
+            b2w_end = build_base_to_world_from_pose(end.position, end.rotation, device)
+            if rolling:
+                b2w = build_base_to_world_from_pose(
+                    start.position, start.rotation, device
+                )
+                b2w_pair = (b2w, b2w_end)
+            else:
+                b2w_pair = (b2w_end, None)
+            with torch.no_grad():
+                if "shared" not in state:
+                    # One rig-wide LOD gather per revolution, shared by every
+                    # sensor and every sector.
+                    state["shared"] = gather_lidar_rig(
+                        renderers,
+                        b2w_pair[0],
+                        scene,
+                        base_to_world_end=b2w_pair[1],
+                    )
+                shared = state["shared"]
+                if shared is None:
+                    return [r._empty_panorama((k, n_sectors)) for r in renderers]
+                # sync=False: outputs stay stream-ordered; the one host sync
+                # per revolution happens in publish (the .cpu() copy).
+                return render_lidars_concurrent(
+                    renderers,
+                    b2w_pair[0],
+                    scene,
+                    base_to_world_end=b2w_pair[1],
+                    shared=shared,
+                    sector=(k, n_sectors),
+                    sync=False,
+                )
+
+        def publish_revolution(
+            outputs: list, end_pose: TimestampedPose, stamp_ns: int
+        ) -> None:
+            t0 = time.monotonic()
+            sec, nanosec = divmod(stamp_ns, 1_000_000_000)
+            stamp = Time(sec=sec, nanosec=nanosec)
+            base_to_world = build_base_to_world_from_pose(
+                end_pose.position, end_pose.rotation, device
+            )
+            n_points = 0
+            with torch.no_grad():
+                for i, rl in enumerate(self._rig_lidars):
+                    panorama = {
+                        key: torch.cat(
+                            [outputs[s][i][key] for s in range(len(outputs))],
+                            dim=1,
+                        )
+                        for key in outputs[0][i]
+                    }
+                    records, n = rl.renderer.panorama_to_pointcloud2_data(
+                        panorama,
+                        drop_threshold=rl.drop_threshold,
+                        alpha_threshold=rl.alpha_threshold,
+                    )
+                    rl.publisher.publish_packed(records, n, stamp=stamp)
+                    n_points += n
+                self._render_rig_cameras(base_to_world, stamp)
+            self._rig_render_count += 1
+            if self._rig_render_count <= 5 or self._rig_render_count % 100 == 0:
+                logger.info(
+                    "Rig sector revolution #%d: %d LiDARs (%d pts) + %d "
+                    "cameras, publish+cameras=%.1fms",
+                    self._rig_render_count,
+                    len(self._rig_lidars),
+                    n_points,
+                    len(self._rig_cameras),
+                    (time.monotonic() - t0) * 1000,
+                )
+
+        return _SectorHooks(
+            n_sectors=n_sectors,
+            spin_period_ns=_spin_period_ns(max(spins)),
+            render_sector=render_sector,
+            publish_revolution=publish_revolution,
+        )
+
+    def _render_rig_cameras(self, base_to_world: torch.Tensor, stamp: Time) -> None:
+        """Render + publish every rig camera at one ego pose (shared gather)."""
+        if not self._rig_cameras:
+            return
+        # world→camera = inv(base_to_world @ cam_to_base)
+        viewmats = [
+            torch.linalg.inv(base_to_world @ rc.cam_to_base) for rc in self._rig_cameras
+        ]
+        images = render_cameras_concurrent(
+            [rc.renderer for rc in self._rig_cameras],
+            viewmats,
+            [rc.K for rc in self._rig_cameras],
+            scene=self._scene,
+            camera_names=[rc.name for rc in self._rig_cameras],
+        )
+        for rc, rgb in zip(self._rig_cameras, images):
+            bgr = (rgb.clamp(0.0, 1.0) * 255).byte()[:, :, [2, 1, 0]]
+            if rc.image_pub is not None:
+                rc.image_pub.publish(bgr.cpu().numpy(), stamp=stamp)
+            if rc.info_pub is not None:
+                rc.info_pub.publish(stamp=stamp)
 
     def _render_and_publish_rig(
         self,
@@ -956,25 +1303,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                     n_points += n
             t_lidar = time.monotonic()
 
-            if self._rig_cameras:
-                # world→camera = inv(base_to_world @ cam_to_base)
-                viewmats = [
-                    torch.linalg.inv(base_to_world @ rc.cam_to_base)
-                    for rc in self._rig_cameras
-                ]
-                images = render_cameras_concurrent(
-                    [rc.renderer for rc in self._rig_cameras],
-                    viewmats,
-                    [rc.K for rc in self._rig_cameras],
-                    scene=self._scene,
-                    camera_names=[rc.name for rc in self._rig_cameras],
-                )
-                for rc, rgb in zip(self._rig_cameras, images):
-                    bgr = (rgb.clamp(0.0, 1.0) * 255).byte()[:, :, [2, 1, 0]]
-                    if rc.image_pub is not None:
-                        rc.image_pub.publish(bgr.cpu().numpy(), stamp=stamp)
-                    if rc.info_pub is not None:
-                        rc.info_pub.publish(stamp=stamp)
+            self._render_rig_cameras(base_to_world, stamp)
         t_end = time.monotonic()
 
         self._rig_render_count += 1
