@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -39,6 +40,15 @@ from splatsim.renderer import Renderer, render_cameras_concurrent
 from splatsim.scene import Scene
 
 logger = logging.getLogger(__name__)
+
+
+def _sweep_time_ns(spinning_frequency_hz: float) -> int | None:
+    """One LiDAR revolution in nanoseconds, or ``None`` when rolling shutter
+    is disabled via ``SPLATSIM_LIDAR_ROLLING_SHUTTER=0`` (static single-pose
+    rendering, the pre-rolling-shutter behaviour)."""
+    if os.environ.get("SPLATSIM_LIDAR_ROLLING_SHUTTER", "1") == "0":
+        return None
+    return int(1_000_000_000 / max(float(spinning_frequency_hz), 1e-6))
 
 
 @dataclass
@@ -316,7 +326,10 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         request_iterator: Iterator[pb2.CameraData | pb2.LidarData | pb2.RigData],
         *,
         frame_rate: float,
-        render_and_publish: Callable[[TimestampedPose, int], None],
+        render_and_publish: Callable[
+            [TimestampedPose, int, TimestampedPose | None], None
+        ],
+        sweep_time_ns: int | None = None,
     ) -> pb2.StreamSummary:
         """Shared two-thread pose-streaming loop for camera, LiDAR and rig.
 
@@ -324,7 +337,13 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         threads so slow rendering never blocks pose ingestion. The render
         loop always uses the latest available pose at ``frame_rate`` cadence,
         publishing through the supplied ``render_and_publish`` callback, and
-        old poses are dropped from the buffer.
+        poses consumed by a frame are dropped from the buffer afterwards.
+
+        ``sweep_time_ns`` enables rolling shutter for spinning LiDARs: each
+        frame then also receives the pose one sweep BEFORE the rendered
+        (latest) pose, interpolated from the buffered pose queue — matching a
+        real spinning LiDAR, whose cloud stamped at ``t`` was swept over
+        ``[t - sweep, t]``. ``None`` keeps the static single-pose behaviour.
         """
         pose_buffer = PoseBuffer()
         stream_done = threading.Event()
@@ -352,6 +371,23 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
 
                     render_time_ns = latest.time_ns
 
+                    # Rolling shutter: reconstruct the pose one sweep back from
+                    # the queued poses. Early frames without enough history fall
+                    # back to the oldest buffered pose (a shorter sweep), and a
+                    # single-pose queue renders static.
+                    sweep_start: TimestampedPose | None = None
+                    if sweep_time_ns:
+                        sweep_start = pose_buffer.interpolate(
+                            render_time_ns - sweep_time_ns
+                        )
+                        if sweep_start is None:
+                            earliest = pose_buffer.get_earliest()
+                            if (
+                                earliest is not None
+                                and earliest.time_ns < render_time_ns
+                            ):
+                                sweep_start = earliest
+
                     if frames_rendered <= 3 or frames_rendered % 100 == 0:
                         logger.info(
                             "Render #%d: render_t=%d pos=(%.4f, %.4f, %.4f)",
@@ -362,7 +398,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                             latest.position[2],
                         )
 
-                    render_and_publish(latest, render_time_ns)
+                    render_and_publish(latest, render_time_ns, sweep_start)
                     frames_rendered += 1
                     pose_buffer.trim_before(render_time_ns)
 
@@ -424,8 +460,14 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         self,
         pose: TimestampedPose,
         render_time_ns: int,
+        sweep_start: TimestampedPose | None = None,
     ) -> None:
-        """Render a single frame at the interpolated pose and publish via DDS."""
+        """Render a single frame at the interpolated pose and publish via DDS.
+
+        ``sweep_start`` is accepted for signature parity with the LiDAR/rig
+        callbacks; the camera renderer has no motion model, so it is unused.
+        """
+        del sweep_start
         assert self._renderer is not None  # noqa: S101
         assert self._K is not None  # noqa: S101
         assert self._device is not None  # noqa: S101
@@ -557,11 +599,22 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 )
 
                 lidar_scene = self._scene
+                # Warm the same kernel path streaming will use: rolling
+                # shutter stages per-Gaussian velocities, a different code
+                # path from the static render (zero motion here, so the
+                # output is unchanged).
+                warm_end = (
+                    torch.eye(4, device=self._device)
+                    if _sweep_time_ns(lidar_renderer.sensor_spec.spinning_frequency_hz)
+                    else None
+                )
                 self._warmup(
                     f"lidar {cfg.name}",
                     lambda: lidar_renderer.panorama_to_pointcloud2_data(
                         lidar_renderer.render(
-                            torch.eye(4, device=self._device), scene=lidar_scene
+                            torch.eye(4, device=self._device),
+                            scene=lidar_scene,
+                            base_to_world_end=warm_end,
                         ),
                         drop_threshold=cfg.drop_threshold,
                         alpha_threshold=cfg.alpha_threshold,
@@ -597,11 +650,15 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
 
         assert self._scene is not None  # noqa: S101
         assert self._device is not None  # noqa: S101
+        assert self._lidar_renderer is not None  # noqa: S101
 
         return self._run_pose_stream(
             request_iterator,
             frame_rate=self._lidar_frame_rate,
             render_and_publish=self._render_and_publish_lidar,
+            sweep_time_ns=_sweep_time_ns(
+                self._lidar_renderer.sensor_spec.spinning_frequency_hz
+            ),
         )
 
     # ── Rig: many LiDARs / cameras off one shared gather ─────────────────
@@ -678,10 +735,16 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         rig_scene = self._scene
 
         def _rig_once() -> None:
+            # Zero-motion end pose so the warmup exercises the rolling-shutter
+            # kernel path the pose stream will use.
+            warm_end = (
+                torch.eye(4, device=self._device) if self._rig_sweep_time_ns() else None
+            )
             panoramas = render_lidars_concurrent(
                 [rl.renderer for rl in rig],
                 torch.eye(4, device=self._device),
                 rig_scene,
+                base_to_world_end=warm_end,
             )
             for rl, pano in zip(rig, panoramas):
                 rl.renderer.panorama_to_pointcloud2_data(
@@ -792,6 +855,28 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 logger.exception("InitializeCameraRig failed")
                 return pb2.InitializeResponse(success=False, message=str(exc))
 
+    def _rig_sweep_time_ns(self) -> int | None:
+        """Sweep duration driving the rig's rolling shutter, or ``None``.
+
+        The rig shares one (start, end) pose pair per frame, so one sweep
+        duration has to serve every LiDAR. With mixed spin rates the fastest
+        sensor's sweep is used — exact for it, under-compensating (never
+        over-shooting) the slower ones.
+        """
+        if not self._rig_lidars:
+            return None
+        spins = {
+            float(rl.renderer.sensor_spec.spinning_frequency_hz)
+            for rl in self._rig_lidars
+        }
+        if len(spins) > 1:
+            logger.warning(
+                "Rig LiDARs spin at different rates (%s Hz); rolling shutter "
+                "uses the fastest sweep, under-compensating slower sensors.",
+                sorted(spins),
+            )
+        return _sweep_time_ns(max(spins))
+
     def StreamRigData(
         self,
         request_iterator: Iterator[pb2.RigData],
@@ -814,6 +899,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
             request_iterator,
             frame_rate=self._rig_frame_rate,
             render_and_publish=self._render_and_publish_rig,
+            sweep_time_ns=self._rig_sweep_time_ns(),
         )
         return pb2.RigSummary(
             frames_rendered=summary.frames_rendered,
@@ -826,8 +912,14 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         self,
         pose: TimestampedPose,
         render_time_ns: int,
+        sweep_start: TimestampedPose | None = None,
     ) -> None:
-        """One frame for the whole rig: one gather per modality, one stream each."""
+        """One frame for the whole rig: one gather per modality, one stream each.
+
+        ``pose`` is the sweep-END pose (the frame's stamp). Cameras render at
+        it directly; the LiDARs additionally get ``sweep_start`` (one spin
+        earlier) so their panoramas are motion-compensated over the sweep.
+        """
         assert self._scene is not None  # noqa: S101
         assert self._device is not None  # noqa: S101
 
@@ -841,10 +933,18 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         n_points = 0
         with torch.no_grad():
             if self._rig_lidars:
+                if sweep_start is not None:
+                    lidar_start = build_base_to_world_from_pose(
+                        sweep_start.position, sweep_start.rotation, self._device
+                    )
+                    lidar_end = base_to_world
+                else:
+                    lidar_start, lidar_end = base_to_world, None
                 panoramas = render_lidars_concurrent(
                     [rl.renderer for rl in self._rig_lidars],
-                    base_to_world,
+                    lidar_start,
                     self._scene,
+                    base_to_world_end=lidar_end,
                 )
                 for rl, pano in zip(self._rig_lidars, panoramas):
                     records, n = rl.renderer.panorama_to_pointcloud2_data(
@@ -895,19 +995,35 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         self,
         pose: TimestampedPose,
         render_time_ns: int,
+        sweep_start: TimestampedPose | None = None,
     ) -> None:
-        """Render one LiDAR panorama at *pose* and publish a PointCloud2."""
+        """Render one LiDAR panorama and publish a PointCloud2.
+
+        ``pose`` is the sweep-END pose (the cloud's stamp); ``sweep_start``,
+        when given, is the pose one spin earlier and turns on the renderer's
+        motion-during-sweep compensation (rolling shutter).
+        """
         assert self._lidar_renderer is not None  # noqa: S101
         assert self._pointcloud_pub is not None  # noqa: S101
         assert self._scene is not None  # noqa: S101
         assert self._device is not None  # noqa: S101
 
         t0 = time.monotonic()
-        base_to_world = build_base_to_world_from_pose(
+        base_to_world_end = build_base_to_world_from_pose(
             pose.position, pose.rotation, self._device
         )
+        if sweep_start is not None:
+            base_to_world = build_base_to_world_from_pose(
+                sweep_start.position, sweep_start.rotation, self._device
+            )
+        else:
+            base_to_world, base_to_world_end = base_to_world_end, None
         with torch.no_grad():
-            panorama = self._lidar_renderer.render(base_to_world, scene=self._scene)
+            panorama = self._lidar_renderer.render(
+                base_to_world,
+                scene=self._scene,
+                base_to_world_end=base_to_world_end,
+            )
             # Fast path: the point records are packed on the GPU and cross to
             # the host as one contiguous buffer (see panorama_to_pointcloud2_data).
             records, n_points = self._lidar_renderer.panorama_to_pointcloud2_data(
