@@ -527,8 +527,18 @@ def _lidar_cull_keep(
     cos_min: float,
     sin_max: float,
     cos_max: float,
+    azim_cull: bool = False,
+    az_center_rad: float = 0.0,
+    az_halfwidth_rad: float = 0.0,
+    az_pad_rad: float = 0.0,
 ) -> torch.Tensor:
-    """Combined shell (range) + elevation-FOV keep mask.
+    """Combined shell (range) + elevation-FOV (+ azimuth-wedge) keep mask.
+
+    ``azim_cull`` adds the sector-rendering test: keep a Gaussian iff its
+    linearized angular extent (``margin/dist``, plus the fixed ``az_pad_rad``
+    slack) can overlap the sensor-frame azimuth wedge
+    ``[az_center_rad ± az_halfwidth_rad]``. Wrap-aware, so a wedge touching
+    the ±π seam still keeps far-side Gaussians.
 
     Prefers the fused CUDA extension when available (single kernel launch,
     ~4× faster than the PyTorch chain at N=4M on sm_89). Falls back to the
@@ -548,6 +558,8 @@ def _lidar_cull_keep(
     device = means.device
     sensor_pos = sensor_to_world[:3, 3].to(device=device, dtype=means.dtype)
     up_world = sensor_to_world[:3, 2].to(device=device, dtype=means.dtype)
+    fwd_world = sensor_to_world[:3, 0].to(device=device, dtype=means.dtype)
+    left_world = sensor_to_world[:3, 1].to(device=device, dtype=means.dtype)
 
     if (
         _USE_CUDA_CULL
@@ -572,6 +584,12 @@ def _lidar_cull_keep(
                 cos_min=cos_min,
                 sin_max=sin_max,
                 cos_max=cos_max,
+                fwd_world=fwd_world,
+                left_world=left_world,
+                use_azim=azim_cull,
+                az_center=az_center_rad,
+                az_halfwidth=az_halfwidth_rad,
+                az_pad=az_pad_rad,
             )
         except Exception:
             # Fall through to PyTorch chain. Deliberately broad: we never
@@ -593,6 +611,18 @@ def _lidar_cull_keep(
         z_s = delta @ up_world
         keep = keep & (z_s + margin * cos_min >= dist * sin_min)
         keep = keep & (z_s - margin * cos_max <= dist * sin_max)
+    if azim_cull:
+        x_s = delta @ fwd_world
+        y_s = delta @ left_world
+        az = torch.atan2(y_s, x_s)
+        # Signed distance to the wedge centre, wrapped into [-pi, pi).
+        d = torch.remainder(az - az_center_rad + math.pi, 2.0 * math.pi) - math.pi
+        # The angular margin divides by the HORIZONTAL distance (azimuth is
+        # atan2(y, x)): near the elevation extremes a Gaussian subtends a wider
+        # azimuth arc than its slant-range extent suggests (1/cos(elev)).
+        dist_h = torch.sqrt(x_s * x_s + y_s * y_s)
+        ang_margin = margin / dist_h.clamp_min(1e-6) + az_pad_rad
+        keep = keep & (d.abs() <= az_halfwidth_rad + ang_margin)
     return keep
 
 
@@ -691,7 +721,7 @@ def _sweep_motion(
     s2w: torch.Tensor,
     s2w_end: torch.Tensor,
     sweep_s: float,
-) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]":
     """Mid-sweep sensor pose plus the linear/angular velocity across the sweep.
 
     Returns ``(s2w_mid, lin_vel_world, ang_vel_sensor)``. The rasterizer places
@@ -704,6 +734,9 @@ def _sweep_motion(
     the rotation magnitude are data-dependent: evaluating them on device tensors
     forces a GPU->CPU sync per sensor, which serialises the rig's streams and
     cost 48 -> 68 ms per frame with no change in kernel time at all.
+
+    Also returns ``rot_angle_rad`` (a plain CPU float, the total rotation over
+    the sweep) so callers can widen angular culls without a device→host sync.
     """
     dev, dt = s2w.device, s2w.dtype
     a = s2w.detach().to("cpu", torch.float64).numpy()
@@ -749,7 +782,7 @@ def _sweep_motion(
     s2w_mid = torch.as_tensor(mid, dtype=dt, device=dev)
     lin_vel = torch.as_tensor((t1 - t0) * inv_dt, dtype=dt, device=dev)
     ang_vel = torch.as_tensor(rotvec * inv_dt, dtype=dt, device=dev)
-    return s2w_mid, lin_vel, ang_vel
+    return s2w_mid, lin_vel, ang_vel, float(np.linalg.norm(rotvec))
 
 
 def _lidar_lod_scale() -> float:
@@ -799,9 +832,61 @@ class _PanoGeom(NamedTuple):
     roll_time_s: torch.Tensor  # (W,) time offset per ASCENDING column [s]
     min_el_deg: float  # ascending-grid elevation bounds (CPU floats,
     max_el_deg: float  # cached to avoid per-frame .item() syncs)
+    az_res_deg: float  # full-frame column pitch [deg] — constant across sectors
+    tile_col_offset: int  # first full-ring tile column this grid covers
+    window_s: float  # pose-pair time span the motion model divides by [s]
+    rs_time_s: float  # roll-time span for the kernel's extent expansion [s]
+    az_center_rad: float  # cull-wedge centre (sensor frame, CW grid)
+    az_halfwidth_rad: float  # cull-wedge half-width incl. half-column slack
 
 
-def _panorama_geometry(lidar_spec: LidarSensorSpec, device) -> _PanoGeom:
+def _sector_col_range(w_full: int, k: int, s_count: int) -> "tuple[int, int]":
+    """CW column range ``[c0, c1)`` of sector ``k`` of ``s_count``.
+
+    The rasterizer draws a sector as a tile-column window of the FULL azimuth
+    ring (``tile_col_offset``), so sector boundaries must land on raster tile
+    boundaries. Panorama widths are not generally divisible by
+    ``s_count * tile_width`` (e.g. 3600 columns over 8 sectors), so the tile
+    budget is split as evenly as the tile grid allows — sector widths may
+    differ by one tile.
+    """
+    tw = _SPLATAD_TILE_WIDTH
+    if w_full % tw != 0:
+        raise ValueError(
+            f"sector rendering needs n_columns ({w_full}) to be a multiple "
+            f"of the raster tile width ({tw})"
+        )
+    n_tiles = w_full // tw
+    if s_count > n_tiles:
+        raise ValueError(
+            f"sector count {s_count} exceeds the {n_tiles} raster tile "
+            f"columns of a {w_full}-column panorama"
+        )
+    return (k * n_tiles) // s_count * tw, ((k + 1) * n_tiles) // s_count * tw
+
+
+def _panorama_geometry(
+    lidar_spec: LidarSensorSpec, device, sector: "tuple[int, int] | None" = None
+) -> _PanoGeom:
+    """Per-(spec, device[, sector]) static render geometry.
+
+    ``sector=(k, S)`` slices the panorama into ``S`` equal azimuth wedges and
+    returns the geometry of the ``k``-th one *in scan order* (the CW sweep:
+    sector 0 starts at +180 deg). Column azimuths, elevations and tile
+    boundaries are exact slices of the full-frame tables, so concatenating the
+    ``S`` sector outputs along columns reproduces the full panorama grid.
+    Column roll times are kept relative to the SECTOR's own mid-sweep pose
+    (what :func:`_sweep_motion` is fed in sector mode), placed so that under
+    linear motion each column sees the same pose as in a full-frame render.
+    """
+    if sector is not None:
+        k, s_count = int(sector[0]), int(sector[1])
+        if s_count < 1 or not (0 <= k < s_count):
+            raise ValueError(f"sector (index, count) out of range: {sector}")
+        if s_count == 1:
+            sector = None
+        else:
+            sector = (k, s_count)
     key = (
         str(device),
         lidar_spec.name,
@@ -814,6 +899,7 @@ def _panorama_geometry(lidar_spec: LidarSensorSpec, device) -> _PanoGeom:
         lidar_spec.spinning_frequency_hz,
         _SPLATAD_TILE_HEIGHT,
         _SPLATAD_TILE_WIDTH,
+        sector,
     )
     geom = _PANO_GEOM_CACHE.get(key)
     if geom is not None:
@@ -821,23 +907,52 @@ def _panorama_geometry(lidar_spec: LidarSensorSpec, device) -> _PanoGeom:
 
     elevs_desc_cpu = _sensor_row_elevations(lidar_spec)
     elevs_desc = elevs_desc_cpu.to(device)  # (H,) desc rad
-    azs_cw = _sensor_column_azimuths(lidar_spec).to(device)  # (W,) CW rad
+    azs_cw_full = _sensor_column_azimuths(lidar_spec).to(device)  # (W,) CW rad
+    w_full = int(azs_cw_full.shape[0])
+    sweep_s = 1.0 / max(float(lidar_spec.spinning_frequency_hz), 1e-6)
+
+    if sector is None:
+        c0, c1 = 0, w_full
+        mid_frac = 0.5  # roll times centred on the full-sweep midpoint
+        window_s = sweep_s
+        az_center_rad, az_halfwidth_rad = 0.0, math.pi
+    else:
+        k, s_count = sector
+        c0, c1 = _sector_col_range(w_full, k, s_count)
+        # The sector's pose pair is interpolated at sweep fractions k/S and
+        # (k+1)/S (see the gRPC sector loop); roll times below are relative to
+        # the midpoint of that pose window. The COLUMN window may lean a few
+        # columns past the pose window (tile-rounded boundaries) — that only
+        # stretches the roll times, the motion model is anchored to the poses.
+        mid_frac = (2 * k + 1) / (2 * s_count)
+        window_s = sweep_s / s_count
+        half_step_rad = math.pi / w_full  # half a column pitch
+        # Cull wedge over the slice's CW azimuth span, padded by the half
+        # column each edge column owns beyond its centre.
+        a_hi = float(azs_cw_full[c0])  # largest azimuth in the slice
+        a_lo = float(azs_cw_full[c1 - 1])
+        az_center_rad = 0.5 * (a_hi + a_lo)
+        az_halfwidth_rad = 0.5 * (a_hi - a_lo) + half_step_rad
+    azs_cw = azs_cw_full[c0:c1].contiguous()  # (W_s,) CW rad
 
     # SplatAD requires ASCENDING elevation + ASCENDING azimuth. Build the
     # panorama grid in that order (the render output is flipped back).
     el_deg = torch.rad2deg(torch.flip(elevs_desc, [0]))  # (H,) ascending deg
-    az_deg = torch.rad2deg(torch.flip(azs_cw, [0]))  # (W,) ascending deg
-    grid_el, grid_az = torch.meshgrid(el_deg, az_deg, indexing="ij")  # (H, W)
-    # When each column is scanned, in SECONDS relative to the mid-sweep pose
-    # (the rasterizer multiplies this by a per-Gaussian angular rate in deg/s,
-    # so it must not be a dimensionless phase). The panorama grid is ASCENDING
-    # azimuth while a spinning LiDAR sweeps +180 -> -180 (clockwise), so time
-    # runs backwards along it: the last column is scanned first.
-    sweep_s = 1.0 / max(float(lidar_spec.spinning_frequency_hz), 1e-6)
+    az_deg = torch.rad2deg(torch.flip(azs_cw, [0]))  # (W_s,) ascending deg
+    grid_el, grid_az = torch.meshgrid(el_deg, az_deg, indexing="ij")  # (H, W_s)
+    # When each column is scanned, in SECONDS relative to the window's mid-sweep
+    # pose (the rasterizer multiplies this by a per-Gaussian angular rate in
+    # deg/s, so it must not be a dimensionless phase). The panorama grid is
+    # ASCENDING azimuth while a spinning LiDAR sweeps +180 -> -180 (clockwise),
+    # so time runs backwards along it: the last column is scanned first. CW
+    # column c is scanned at sweep fraction c/(W-1); subtracting the window's
+    # own mid fraction makes sector renders agree column-for-column with the
+    # full frame under linear motion.
     n_cols = az_deg.shape[0]
-    if n_cols > 1:
+    if w_full > 1:
         idx = torch.arange(n_cols, device=device, dtype=torch.float32)
-        roll_time_s = (((n_cols - 1 - idx) / (n_cols - 1)) - 0.5) * sweep_s
+        cw_col = (c1 - 1) - idx  # global CW column index per ASCENDING column
+        roll_time_s = (cw_col / (w_full - 1) - mid_frac) * sweep_s
     else:
         roll_time_s = torch.zeros(n_cols, device=device)
     raster_pts = torch.stack(
@@ -883,6 +998,26 @@ def _panorama_geometry(lidar_spec: LidarSensorSpec, device) -> _PanoGeom:
         roll_time_s=roll_time_s,
         min_el_deg=float(el_deg_cpu.min()),
         max_el_deg=float(el_deg_cpu.max()),
+        az_res_deg=360.0 / float(w_full),
+        # The kernel raster grid is ASCENDING azimuth: CW slice [c0, c1) sits
+        # at ascending columns [w_full - c1, w_full - c0).
+        tile_col_offset=(w_full - c1) // _SPLATAD_TILE_WIDTH,
+        window_s=window_s,
+        # The kernel expands projected extents by 0.5 * rs_time * |velocity|;
+        # tile-rounded sector columns can lean past the pose window, so cover
+        # the ACTUAL roll-time span, not the nominal pose span.
+        rs_time_s=(
+            2.0
+            * max(
+                abs(c0 / (w_full - 1) - mid_frac),
+                abs((c1 - 1) / (w_full - 1) - mid_frac),
+            )
+            * sweep_s
+            if w_full > 1
+            else window_s
+        ),
+        az_center_rad=az_center_rad,
+        az_halfwidth_rad=az_halfwidth_rad,
     )
     _PANO_GEOM_CACHE[key] = geom
     return geom
@@ -913,6 +1048,16 @@ def _splatad_lidar_rasterization():
                 "SplatAD LiDAR CUDA extension 'splatad_kernel_cuda' failed to "
                 "build (no nvcc / CUDA toolkit detected). LiDAR rendering "
                 "requires this kernel and has no gsplat fallback."
+            )
+        # Sector rendering needs the tile_col_offset support added in
+        # splatad_kernel 1.1.0; an older install would fail mid-frame with a
+        # TypeError, so reject it up front with an actionable message.
+        import inspect
+
+        if "tile_col_offset" not in inspect.signature(lidar_rasterization).parameters:
+            raise RuntimeError(
+                "the installed splatad_kernel predates sector rendering "
+                "(no tile_col_offset); upgrade to splatad_kernel >= 1.1.0"
             )
         _SPLATAD_RAST = lidar_rasterization
     return _SPLATAD_RAST
@@ -1100,6 +1245,9 @@ def render_lidars_concurrent(
     base_to_world_end: torch.Tensor | None = None,
     *,
     shared_gather: bool = True,
+    shared: "LidarGaussians | None" = None,
+    sector: "tuple[int, int] | None" = None,
+    sync: bool = True,
 ) -> list[dict]:
     """Render every LiDAR on a rig for one frame, sharing one Gaussian gather.
 
@@ -1120,17 +1268,25 @@ def render_lidars_concurrent(
     applies); ``shared_gather=False`` restores per-sensor gathers. Falls back to
     sequential on CUDA OOM, which concurrent streams can still provoke on very
     large scenes since all sensors' rasterizer scratch is live at once.
+
+    ``shared`` short-circuits the gather entirely with a pre-gathered set —
+    the sector streaming loop gathers ONCE per revolution and reuses it for
+    every sector. ``sector=(k, S)`` renders only that azimuth wedge on every
+    sensor (see :func:`render_lidar_panorama`). ``sync=False`` skips the final
+    device synchronization: the outputs are stream-ordered on the current
+    stream (safe to consume from it), and the sector loop — S calls per
+    revolution, host-synced once at publish — measures the per-call sync as
+    pure pipeline-bubble overhead.
     """
     if not renderers:
         return []
 
-    shared = None
-    if shared_gather:
+    if shared is None and shared_gather:
         shared = gather_lidar_rig(
             renderers, base_to_world, scene, base_to_world_end=base_to_world_end
         )
         if shared is None:
-            return [r._empty_panorama() for r in renderers]
+            return [r._empty_panorama(sector) for r in renderers]
 
     def _sequential() -> list[dict]:
         return [
@@ -1139,6 +1295,7 @@ def render_lidars_concurrent(
                 scene=scene,
                 base_to_world_end=base_to_world_end,
                 shared=shared,
+                sector=sector,
             )
             for r in renderers
         ]
@@ -1168,6 +1325,7 @@ def render_lidars_concurrent(
                     scene=scene,
                     base_to_world_end=base_to_world_end,
                     shared=shared,
+                    sector=sector,
                 )
             # Keep the caching allocator from recycling the shared buffers (and
             # each sensor's outputs) into another stream before this one is done.
@@ -1178,7 +1336,8 @@ def render_lidars_concurrent(
                     t.record_stream(current)
         for st in streams:
             current.wait_stream(st)
-        torch.cuda.synchronize()
+        if sync:
+            torch.cuda.synchronize()
         return [outs[i] for i in range(len(renderers))]
     except torch.cuda.OutOfMemoryError:
         torch.cuda.synchronize()
@@ -1232,6 +1391,7 @@ def render_lidar_panorama(
     elev_fov_cull: bool = True,
     with_ut: bool = True,
     with_eval3d: bool = True,
+    sector: "tuple[int, int] | None" = None,
 ) -> dict[str, torch.Tensor]:
     """Run the SplatAD spherical lidar raster once for one sensor at one frame.
 
@@ -1314,11 +1474,66 @@ def render_lidar_panorama(
     supply (it passes ``velocities=None``). Wiring that up is what would make
     this real rolling shutter. When ``None`` (default) the panorama is rendered
     from the single ``sensor_to_world`` pose.
+
+    Sector rendering
+    ----------------
+    ``sector=(k, S)`` renders only the ``k``-th of ``S`` equal azimuth wedges
+    (scan order: sector 0 starts at +180 deg) and returns ``(H, W/S)`` maps;
+    concatenating the ``S`` outputs along columns reproduces the full panorama.
+    In sector mode ``sensor_to_world`` / ``sensor_to_world_end`` are the poses
+    at the SECTOR's start/end (sweep fractions ``k/S`` and ``(k+1)/S``), so the
+    motion model is evaluated over the short window each wedge is actually
+    scanned in — this is what makes streaming sectors a *better* rolling
+    shutter than one whole-sweep pose pair. A fused azimuth-wedge cull
+    (see :func:`_lidar_cull_keep`) always runs in sector mode: unlike the
+    full-frame ``frustum_cull`` it removes ~``(S-1)/S`` of the Gaussians, which
+    is the point of sector streaming.
     """
     device = means.device
+    azim_cull = sector is not None and int(sector[1]) > 1
 
-    if frustum_cull and means.shape[0] > 0:
-        if elev_fov_cull:
+    # Static per-sensor(/sector) geometry from the per-(spec, device) cache:
+    # raster grid, tile boundaries, beam directions, kernel azimuth bounds.
+    geom = _panorama_geometry(lidar_spec, device, sector)
+    elevs_desc = geom.elevs_desc  # (H,) desc rad
+    azs_cw = geom.azs_cw  # (W,) CW rad
+    H, W = int(elevs_desc.shape[0]), int(azs_cw.shape[0])
+
+    # Rolling shutter: render from the MID-window pose and let the rasterizer
+    # displace each column by its own sweep phase (raster_pts[..., 3]) times the
+    # sensor's motion. Without a sweep-end pose the sweep is static and the
+    # whole panorama comes from the single given pose. Evaluated BEFORE the
+    # cull so (a) the cull sees the mid-window pose and (b) the sector wedge
+    # can be widened by the rotation the window actually contains.
+    render_s2w = sensor_to_world.to(device=device, dtype=torch.float32)
+    # Left as None without a sweep-end pose: the rasterizer's static fast path
+    # is selected by these being absent, not by them being zero, and passing
+    # zeros instead costs 48 -> 66 ms on the 5-sensor rig for no benefit.
+    lin_vel = None
+    ang_vel = None
+    sweep_time = None
+    rot_angle_rad = 0.0
+    if sensor_to_world_end is not None:
+        s2w_mid, lv, av, rot_angle_rad = _sweep_motion(
+            render_s2w,
+            sensor_to_world_end.to(device=device, dtype=torch.float32),
+            geom.window_s,
+        )
+        render_s2w = s2w_mid
+        lin_vel = lv.reshape(1, 3)
+        ang_vel = av.reshape(1, 3)
+        sweep_time = torch.full((1,), geom.rs_time_s, device=device)
+
+    if (frustum_cull or azim_cull) and means.shape[0] > 0:
+        # Sector mode culls by shell + azimuth wedge only, UNLESS the caller
+        # opted into the full frustum cull: the elevation band's linearized
+        # margin can drop returns the rasterizer's exact projected extent
+        # would keep (measured: a handful of cells on the top/bottom beams),
+        # and the production path deliberately runs with frustum_cull=False
+        # for exactly that reason. The azimuth wedge has no such caveat — its
+        # margin covers the projected extent by construction.
+        use_elev = bool(elev_fov_cull and frustum_cull)
+        if use_elev:
             # Use the sensor's ACTUAL beam-elevation extent (honouring an explicit
             # row_elevations_rad table), not the OT128/uniform defaults. Sensors
             # with a custom table (sensor_type="") previously fell back to the
@@ -1334,28 +1549,30 @@ def render_lidar_panorama(
             sin_max, cos_max = math.sin(_e_hi), math.cos(_e_hi)
         else:
             sin_min = cos_min = sin_max = cos_max = 0.0
-        # For a rolling-shutter sweep the sensor moves; pre-cull from the sweep
-        # midpoint so a boundary Gaussian isn't dropped for either endpoint (the
-        # exact per-column near/far gating still happens inside gsplat).
-        cull_s2w = sensor_to_world
-        if sensor_to_world_end is not None:
-            cull_s2w = sensor_to_world.clone()
-            cull_s2w[:3, 3] = 0.5 * (
-                sensor_to_world[:3, 3]
-                + sensor_to_world_end.to(cull_s2w.device, cull_s2w.dtype)[:3, 3]
-            )
+        # For a rolling-shutter sweep the sensor moves; pre-cull from the
+        # mid-window pose (render_s2w, computed above) so a boundary Gaussian
+        # isn't dropped for either endpoint (the exact per-column near/far
+        # gating still happens inside the rasterizer). The sector wedge is
+        # widened by half the window's rotation on each side — the wedge is
+        # expressed in the mid pose's frame while the columns are rendered
+        # from poses up to ±rot/2 away — plus a fixed slack for the motion
+        # model's linearization.
         keep = _lidar_cull_keep(
             means=means,
             scales=scales,
-            sensor_to_world=cull_s2w,
+            sensor_to_world=render_s2w,
             min_range_m=float(min_range_m),
             max_range_m=None if max_range_m is None else float(max_range_m),
             cull_scale_sigmas=float(cull_scale_sigmas),
-            elev_fov_cull=bool(elev_fov_cull),
+            elev_fov_cull=use_elev,
             sin_min=float(sin_min),
             cos_min=float(cos_min),
             sin_max=float(sin_max),
             cos_max=float(cos_max),
+            azim_cull=azim_cull,
+            az_center_rad=geom.az_center_rad,
+            az_halfwidth_rad=geom.az_halfwidth_rad,
+            az_pad_rad=0.5 * rot_angle_rad + 0.01,
         )
         # Index once, unconditionally: sharing the index buffer across the
         # six tensors avoids six independent mask scans, and skipping the
@@ -1373,28 +1590,12 @@ def render_lidar_panorama(
     # View-dependent raydrop: fold the higher SH bands into the per-Gaussian
     # scalar logit before it is composited by the rasterizer. Evaluated after
     # culling so the (potentially large) SH matmul only runs over kept Gaussians.
-    # The view ray uses the sweep-midpoint sensor origin (matching the cull) so a
-    # single evaluation approximates the whole rolling-shutter spin.
+    # The view ray uses the mid-window sensor origin (matching the cull) so a
+    # single evaluation approximates the whole rolling-shutter window.
     if raydrop_sh is not None and means.shape[0] > 0:
-        view_pos = sensor_to_world[:3, 3]
-        if sensor_to_world_end is not None:
-            view_pos = 0.5 * (
-                view_pos
-                + sensor_to_world_end.to(view_pos.device, view_pos.dtype)[:3, 3]
-            )
         raydrop_logit = _eval_view_dependent_raydrop(
-            means, view_pos, raydrop_logit, raydrop_sh
+            means, render_s2w[:3, 3], raydrop_logit, raydrop_sh
         )
-
-    # Beam table straight from the sensor spec (gsplat-independent): rows are the
-    # descending elevations, columns sweep +pi -> -pi (clockwise) -- the exact
-    # panorama layout the point-cloud / range-image back-projection expects.
-    # All static per-sensor geometry (raster grid, tile boundaries, beam
-    # directions) comes from the per-(spec, device) cache.
-    geom = _panorama_geometry(lidar_spec, device)
-    elevs_desc = geom.elevs_desc  # (H,) desc rad
-    azs_cw = geom.azs_cw  # (W,) CW rad
-    H, W = int(elevs_desc.shape[0]), int(azs_cw.shape[0])
 
     if means.shape[0] == 0:
         zero = torch.zeros((H, W), dtype=torch.float32, device=device)
@@ -1414,29 +1615,6 @@ def render_lidar_panorama(
     th, tw = _SPLATAD_TILE_HEIGHT, _SPLATAD_TILE_WIDTH
     raster_pts = geom.raster_pts
     tile_boundaries = geom.tile_boundaries
-
-    # Rolling shutter: render from the MID-sweep pose and let the rasterizer
-    # displace each column by its own sweep phase (raster_pts[..., 3]) times the
-    # sensor's motion. Without a sweep-end pose the sweep is static and the
-    # whole panorama comes from the single given pose.
-    render_s2w = sensor_to_world.to(device=device, dtype=torch.float32)
-    # Left as None without a sweep-end pose: the rasterizer's static fast path
-    # is selected by these being absent, not by them being zero, and passing
-    # zeros instead costs 48 -> 66 ms on the 5-sensor rig for no benefit.
-    lin_vel = None
-    ang_vel = None
-    sweep_time = None
-    if sensor_to_world_end is not None:
-        sweep_s = 1.0 / max(float(lidar_spec.spinning_frequency_hz), 1e-6)
-        s2w_mid, lv, av = _sweep_motion(
-            sensor_to_world.to(device=device, dtype=torch.float32),
-            sensor_to_world_end.to(device=device, dtype=torch.float32),
-            sweep_s,
-        )
-        render_s2w = s2w_mid
-        lin_vel = lv.reshape(1, 3)
-        ang_vel = av.reshape(1, 3)
-        sweep_time = torch.full((1,), sweep_s, device=device)
     viewmats = _rigid_inverse_4x4(render_s2w).unsqueeze(0)  # (C=1, 4, 4)
 
     # lidar_features = [intensity_sig, raydrop_logit] -> rendered feature channels.
@@ -1468,12 +1646,19 @@ def render_lidar_panorama(
         # the beam's own elevation instead of the row's band -- exact, and far
         # more restrictive (see isect_lidar_tiles).
         row_elevations=geom.row_elevations_asc if th == 1 else None,
+        # Always the FULL azimuth ring, even for a sector: the kernel's tile
+        # binning is hard-wired to a 360-deg ring, so keeping the bounds (and
+        # the resolution = full-frame column pitch) makes sector binning
+        # bit-identical to a full-frame render. The sector then rasterizes
+        # only its own tile columns via tile_col_offset; Gaussians outside
+        # the wedge were already removed by the azimuth pre-cull above.
         min_azimuth=-180.0,
         max_azimuth=180.0,
         min_elevation=geom.min_el_deg,
         max_elevation=geom.max_el_deg + 1e-3,
         n_elevation_channels=H,
-        azimuth_resolution=360.0 / float(W),
+        azimuth_resolution=geom.az_res_deg,
+        tile_col_offset=geom.tile_col_offset,
         tile_width=tw,
         tile_height=th,
         near_plane=float(min_range_m),
@@ -1697,12 +1882,16 @@ class LidarRenderer:
     def n_columns(self) -> int:
         return int(self.sensor_spec.n_columns)
 
-    def _empty_panorama(self) -> dict[str, torch.Tensor]:
+    def _empty_panorama(
+        self, sector: "tuple[int, int] | None" = None
+    ) -> dict[str, torch.Tensor]:
         """Zero-filled panorama output (no LiDAR returns): alpha/distance/intensity
         are 0 and every ray drops (raydrop_logit = DEFAULT_RAYDROP_LOGIT)."""
-        zero = torch.zeros(
-            (self.n_rows, self.n_columns), dtype=torch.float32, device=self.device
-        )
+        w = self.n_columns
+        if sector is not None and int(sector[1]) > 1:
+            c0, c1 = _sector_col_range(w, int(sector[0]), int(sector[1]))
+            w = c1 - c0
+        zero = torch.zeros((self.n_rows, w), dtype=torch.float32, device=self.device)
         return {
             "alpha": zero.clone(),
             "distance": zero.clone(),
@@ -1720,27 +1909,33 @@ class LidarRenderer:
         scene: "Scene",
         base_to_world_end: torch.Tensor | None = None,
         shared: "LidarGaussians | None" = None,
+        sector: "tuple[int, int] | None" = None,
     ) -> dict[str, torch.Tensor]:
-        """Render one LiDAR panorama.
+        """Render one LiDAR panorama (or one azimuth sector of it).
 
         Args:
             base_to_world: (4, 4) float32 tensor. Ego/base pose at the start of
                 the azimuth sweep (the whole panorama when no end pose is given).
+                In sector mode, the pose at the SECTOR's start.
             scene: The splatsim Scene providing Gaussians.
             base_to_world_end: Optional (4, 4) ego/base pose at the end of the
-                sweep. When given, the panorama is rendered from the midpoint of
-                the two poses — a motion-during-sweep approximation, not true
-                rolling shutter (see :func:`render_lidar_panorama`).
+                sweep (sector mode: of the sector). When given, the panorama is
+                rendered from the midpoint of the two poses — a motion-during-
+                sweep approximation, not true rolling shutter (see
+                :func:`render_lidar_panorama`).
             shared: Pre-gathered Gaussians from :func:`gather_lidar_rig`. When
                 given, this sensor skips its own LOD gather and rasterizes the
                 shared set — the point of the rig path: one gather and one
                 transient buffer for N sensors instead of N of each. ``None``
                 gathers per-sensor, as before.
+            sector: ``(k, S)`` renders only the ``k``-th of ``S`` azimuth
+                wedges and returns ``(H, ~W/S)`` maps — see
+                :func:`render_lidar_panorama`.
 
         Returns:
             ``{"alpha", "distance", "intensity", "raydrop_logit"}`` — each an
             (H, W) float32 tensor. ``H`` = sensor row count,
-            ``W`` = ``sensor_spec.n_columns``.
+            ``W`` = ``sensor_spec.n_columns`` (its sector slice in sector mode).
         """
         sensor_to_world = base_to_world.to(self.device) @ self._s2b_t
         sensor_to_world_end = None
@@ -1752,7 +1947,7 @@ class LidarRenderer:
                 base_to_world, scene, base_to_world_end=base_to_world_end
             )
         if shared is None or shared.means.shape[0] == 0:
-            return self._empty_panorama()
+            return self._empty_panorama(sector)
 
         return render_lidar_panorama(
             means=shared.means,
@@ -1774,6 +1969,7 @@ class LidarRenderer:
             elev_fov_cull=self.elev_fov_cull,
             with_ut=self.with_ut,
             with_eval3d=self.with_eval3d,
+            sector=sector,
         )
 
     def gather(
@@ -1956,9 +2152,11 @@ class LidarRenderer:
             panorama, drop_threshold=drop_threshold, alpha_threshold=alpha_threshold
         )
 
-        row_grid = torch.arange(self.n_rows, device=distance.device)[:, None].expand(
-            -1, self.n_columns
-        )  # (H, W) ring / laser-beam index
+        # Width from the panorama itself, not the spec: sector renders and
+        # sector concats both pack through here.
+        row_grid = torch.arange(distance.shape[0], device=distance.device)[
+            :, None
+        ].expand(-1, distance.shape[1])  # (H, W) ring / laser-beam index
 
         # ``panorama["points"]`` is the same back-projection (range x unit beam
         # direction) already produced by the render, so reuse it instead of
@@ -2004,9 +2202,10 @@ class LidarRenderer:
             .to(torch.uint8)
             .to(torch.int32)
         )
-        row_grid = torch.arange(self.n_rows, device=xyz.device, dtype=torch.int32)[
+        h, w = panorama["distance"].shape  # width-agnostic: sectors pack too
+        row_grid = torch.arange(h, device=xyz.device, dtype=torch.int32)[
             :, None
-        ].expand(-1, self.n_columns)
+        ].expand(-1, w)
         channel = row_grid[valid]
         # Little-endian byte layout 12..15: [intensity, return_type=0, ch_lo,
         # ch_hi] == int32 word (intensity | channel << 16), bit-cast to float32

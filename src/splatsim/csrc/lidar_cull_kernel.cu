@@ -1,6 +1,7 @@
 // Fused LiDAR cull kernel: computes a single boolean keep mask combining
-// the shell/frustum test (min_range, max_range) and the elevation-FOV test
-// against a spherical band around the sensor's up-axis.
+// the shell/frustum test (min_range, max_range), the elevation-FOV test
+// against a spherical band around the sensor's up-axis, and (optionally) an
+// azimuth-wedge test for sector rendering.
 //
 // All arithmetic is done in fp32; a single pass over means (Nx3) and
 // scales (Nx3) reads 24 bytes per gaussian and writes 1 byte to `keep`,
@@ -10,15 +11,18 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 namespace {
 
-template <bool USE_ELEV>
+template <bool USE_ELEV, bool USE_AZIM>
 __global__ void lidar_cull_kernel(
     const float* __restrict__ means,       // (N, 3) row-major
     const float* __restrict__ scales,      // (N, 3) row-major
     const float* __restrict__ sensor_pos,  // (3,) device pointer, read once per block
     const float* __restrict__ up_world,    // (3,) device pointer, ignored when !USE_ELEV
+    const float* __restrict__ fwd_world,   // (3,) sensor +x in world, ignored when !USE_AZIM
+    const float* __restrict__ left_world,  // (3,) sensor +y in world, ignored when !USE_AZIM
     const float min_range,
     const float max_range,        // <0 means "no upper bound"
     const float cull_scale_sigmas,
@@ -26,6 +30,9 @@ __global__ void lidar_cull_kernel(
     const float cos_min,
     const float sin_max,
     const float cos_max,
+    const float az_center,        // wedge centre azimuth [rad], sensor frame
+    const float az_halfwidth,     // wedge half-width [rad]
+    const float az_pad,           // fixed extra angular slack [rad]
     const int32_t N,
     bool* __restrict__ keep) {
   // Cache the sensor pose in shared memory so all N threads amortize a
@@ -34,10 +41,16 @@ __global__ void lidar_cull_kernel(
   // used to pay to read them as scalar kernel args.
   __shared__ float s_sensor[3];
   __shared__ float s_up[3];
+  __shared__ float s_fwd[3];
+  __shared__ float s_left[3];
   if (threadIdx.x < 3) {
     s_sensor[threadIdx.x] = sensor_pos[threadIdx.x];
     if (USE_ELEV) {
       s_up[threadIdx.x] = up_world[threadIdx.x];
+    }
+    if (USE_AZIM) {
+      s_fwd[threadIdx.x] = fwd_world[threadIdx.x];
+      s_left[threadIdx.x] = left_world[threadIdx.x];
     }
   }
   __syncthreads();
@@ -98,6 +111,27 @@ __global__ void lidar_cull_kernel(
     k = k && ((z_s - margin * cos_max) <= (dist * sin_max));
   }
 
+  // Azimuth-wedge test (sector rendering): keep iff the Gaussian's angular
+  // extent can overlap the wedge. The angular margin divides by the
+  // HORIZONTAL distance, not the slant range: azimuth is atan2(y, x), so a
+  // Gaussian near the elevation extremes subtends a wider azimuth arc than
+  // its slant-range extent suggests (by 1/cos(elev)); dividing by the slant
+  // range dropped real contributors on the top/bottom beams. The signed
+  // difference to the wedge centre is wrapped into [-pi, pi) so a wedge
+  // touching the +-180 deg seam still keeps far-side Gaussians.
+  if (USE_AZIM && k) {
+    const float x_s = dx * s_fwd[0] + dy * s_fwd[1] + dz * s_fwd[2];
+    const float y_s = dx * s_left[0] + dy * s_left[1] + dz * s_left[2];
+    const float az = atan2f(y_s, x_s);
+    constexpr float kPi = 3.14159265358979323846f;
+    // az - az_center is in (-2pi, 2pi); shift by +3pi (always positive),
+    // fmod into [0, 2pi), shift back to [-pi, pi).
+    const float d = fmodf(az - az_center + 3.0f * kPi, 2.0f * kPi) - kPi;
+    const float dist_h = sqrtf(x_s * x_s + y_s * y_s);
+    const float ang_margin = margin / fmaxf(dist_h, 1e-6f) + az_pad;
+    k = k && (fabsf(d) <= az_halfwidth + ang_margin);
+  }
+
   keep[i] = k;
 }
 
@@ -109,6 +143,8 @@ torch::Tensor lidar_cull_mask(
     const torch::Tensor& scales,         // (N, 3), float32, CUDA
     const torch::Tensor& sensor_pos,     // (3,), float32, CUDA — same device
     const torch::Tensor& up_world,       // (3,), float32, CUDA — ignored if !use_elev
+    const torch::Tensor& fwd_world,      // (3,), sensor +x in world — ignored if !use_azim
+    const torch::Tensor& left_world,     // (3,), sensor +y in world — ignored if !use_azim
     double min_range,
     double max_range,                    // pass negative to disable upper bound
     double cull_scale_sigmas,
@@ -116,7 +152,11 @@ torch::Tensor lidar_cull_mask(
     double sin_min,
     double cos_min,
     double sin_max,
-    double cos_max) {
+    double cos_max,
+    bool use_azim,
+    double az_center,
+    double az_halfwidth,
+    double az_pad) {
   TORCH_CHECK(means.is_cuda(), "means must be CUDA");
   TORCH_CHECK(scales.is_cuda(), "scales must be CUDA");
   TORCH_CHECK(means.dtype() == torch::kFloat32, "means must be float32");
@@ -137,50 +177,63 @@ torch::Tensor lidar_cull_mask(
     return keep;
   }
 
-  // sensor_pos / up_world stay on device: the kernel loads them once per
-  // block via shared memory. We coerce dtype/device to match `means` so
+  // sensor_pos / up_world / axes stay on device: the kernel loads them once
+  // per block via shared memory. We coerce dtype/device to match `means` so
   // the caller can pass a slice of the 4×4 pose matrix directly.
   auto sensor_dev = sensor_pos.detach().to(means.device(), torch::kFloat32).contiguous();
   auto up_dev = up_world.detach().to(means.device(), torch::kFloat32).contiguous();
+  auto fwd_dev = fwd_world.detach().to(means.device(), torch::kFloat32).contiguous();
+  auto left_dev = left_world.detach().to(means.device(), torch::kFloat32).contiguous();
   TORCH_CHECK(sensor_dev.numel() == 3, "sensor_pos must have exactly 3 elements");
   TORCH_CHECK(up_dev.numel() == 3, "up_world must have exactly 3 elements");
+  TORCH_CHECK(fwd_dev.numel() == 3, "fwd_world must have exactly 3 elements");
+  TORCH_CHECK(left_dev.numel() == 3, "left_world must have exactly 3 elements");
 
   const int block = 256;
   const int grid = static_cast<int>((N + block - 1) / block);
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  if (use_elev) {
-    lidar_cull_kernel<true><<<grid, block, 0, stream>>>(
-        means.data_ptr<float>(),
-        scales.data_ptr<float>(),
-        sensor_dev.data_ptr<float>(),
-        up_dev.data_ptr<float>(),
-        static_cast<float>(min_range),
-        static_cast<float>(max_range),
-        static_cast<float>(cull_scale_sigmas),
-        static_cast<float>(sin_min),
-        static_cast<float>(cos_min),
-        static_cast<float>(sin_max),
-        static_cast<float>(cos_max),
-        N,
-        keep.data_ptr<bool>());
+  auto launch = [&](auto use_elev_c, auto use_azim_c) {
+    lidar_cull_kernel<decltype(use_elev_c)::value, decltype(use_azim_c)::value>
+        <<<grid, block, 0, stream>>>(
+            means.data_ptr<float>(),
+            scales.data_ptr<float>(),
+            sensor_dev.data_ptr<float>(),
+            up_dev.data_ptr<float>(),
+            fwd_dev.data_ptr<float>(),
+            left_dev.data_ptr<float>(),
+            static_cast<float>(min_range),
+            static_cast<float>(max_range),
+            static_cast<float>(cull_scale_sigmas),
+            static_cast<float>(sin_min),
+            static_cast<float>(cos_min),
+            static_cast<float>(sin_max),
+            static_cast<float>(cos_max),
+            static_cast<float>(az_center),
+            static_cast<float>(az_halfwidth),
+            static_cast<float>(az_pad),
+            N,
+            keep.data_ptr<bool>());
+  };
+  if (use_elev && use_azim) {
+    launch(std::true_type{}, std::true_type{});
+  } else if (use_elev) {
+    launch(std::true_type{}, std::false_type{});
+  } else if (use_azim) {
+    launch(std::false_type{}, std::true_type{});
   } else {
-    lidar_cull_kernel<false><<<grid, block, 0, stream>>>(
-        means.data_ptr<float>(),
-        scales.data_ptr<float>(),
-        sensor_dev.data_ptr<float>(),
-        up_dev.data_ptr<float>(),
-        static_cast<float>(min_range),
-        static_cast<float>(max_range),
-        static_cast<float>(cull_scale_sigmas),
-        0.f, 1.f, 0.f, 1.f,   // unused
-        N,
-        keep.data_ptr<bool>());
+    launch(std::false_type{}, std::false_type{});
   }
   AT_CUDA_CHECK(cudaGetLastError());
   return keep;
 }
+
+// Bumped whenever a binding's signature OR semantics change: a pre-built .so
+// exporting an older version (or none) is stale and must not be used — see
+// _lidar_cull_ext. v3: the azimuth wedge margin divides by the horizontal
+// distance (v2 divided by slant range and under-kept high-elevation Gaussians).
+int64_t cull_ext_abi_version() { return 3; }
 
 
 // ── Scalar view-dependent raydrop SH evaluation ─────────────────────────
@@ -329,11 +382,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "lidar_cull_mask",
       &lidar_cull_mask,
-      "Fused frustum + elevation-FOV cull for LiDAR (CUDA)",
+      "Fused frustum + elevation-FOV + azimuth-wedge cull for LiDAR (CUDA)",
       pybind11::arg("means"),
       pybind11::arg("scales"),
       pybind11::arg("sensor_pos"),
       pybind11::arg("up_world"),
+      pybind11::arg("fwd_world"),
+      pybind11::arg("left_world"),
       pybind11::arg("min_range"),
       pybind11::arg("max_range"),
       pybind11::arg("cull_scale_sigmas"),
@@ -341,7 +396,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       pybind11::arg("sin_min"),
       pybind11::arg("cos_min"),
       pybind11::arg("sin_max"),
-      pybind11::arg("cos_max"));
+      pybind11::arg("cos_max"),
+      pybind11::arg("use_azim") = false,
+      pybind11::arg("az_center") = 0.0,
+      pybind11::arg("az_halfwidth") = 0.0,
+      pybind11::arg("az_pad") = 0.0);
+  m.def(
+      "cull_ext_abi_version",
+      &cull_ext_abi_version,
+      "ABI version of this extension build (staleness guard)");
   m.def(
       "raydrop_sh_eval",
       &raydrop_sh_eval,
