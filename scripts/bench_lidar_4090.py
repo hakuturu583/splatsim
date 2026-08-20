@@ -99,6 +99,19 @@ def main():
         default=0,
         help="post-LOD count scan stride (0 = ~24 grid points)",
     )
+    ap.add_argument(
+        "--sectors",
+        type=int,
+        default=1,
+        help="time one revolution as S azimuth-sector renders sharing one "
+        "gather (the gRPC sector-streaming path) instead of one full render",
+    )
+    ap.add_argument(
+        "--rolling",
+        action="store_true",
+        help="exercise the rolling-shutter (velocity) kernel path by passing "
+        "the next trajectory pose as the sweep end",
+    )
     args = ap.parse_args()
 
     dev = torch.device("cuda")
@@ -160,9 +173,43 @@ def main():
     # Interleaved rounds: cycle poses so per-pose clock state is comparable.
     per_pose_ms = {i: [] for i in sel}
     b2ws = {i: torch.from_numpy(poses[i]).to(dev) for i in sel}
+    ends = {
+        i: torch.from_numpy(poses[min(i + 1, n - 1)]).to(dev) if args.rolling else None
+        for i in sel
+    }
+    s_count = max(1, args.sectors)
+
+    def one_revolution(i: int) -> None:
+        if s_count == 1:
+            render_lidars_concurrent(rends, b2ws[i], scene, base_to_world_end=ends[i])
+            return
+        # The gRPC sector loop's cost model: ONE rig-wide gather per
+        # revolution, then S sector renders reusing it. (It interpolates a
+        # pose pair per sector; pose arithmetic is noise next to the render,
+        # so the same pair is reused here.)
+        shared = gather_lidar_rig(rends, b2ws[i], scene, base_to_world_end=ends[i])
+        for k in range(s_count):
+            render_lidars_concurrent(
+                rends,
+                b2ws[i],
+                scene,
+                base_to_world_end=ends[i],
+                shared=shared,
+                sector=(k, s_count),
+                sync=False,
+            )
+
+    if s_count > 1:
+        print(
+            f"[mode] sector streaming: {s_count} sectors/revolution"
+            + (" + rolling shutter" if args.rolling else "")
+        )
+        for _ in range(2):  # prime per-sector geometry caches
+            one_revolution(heavy)
+        torch.cuda.synchronize()
     for _ in range(args.iters):
         for i in sel:
-            ms = timed(lambda: render_lidars_concurrent(rends, b2ws[i], scene), 1)
+            ms = timed(lambda: one_revolution(i), 1)
             per_pose_ms[i].extend(ms)
 
     print("\n=== per-pose 5-sensor rig timing (ms/frame) ===")
