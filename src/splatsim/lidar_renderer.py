@@ -513,6 +513,21 @@ def _lidar_intrinsics(h: int, w: int, device_str: str) -> torch.Tensor:
 # public API.
 _USE_CUDA_CULL: bool = True
 
+# Sector-mode cull application: compaction (default) vs mask-based projection.
+#
+# Compaction (nonzero + index_select) pays a device→host sync per sensor per
+# sector, but every downstream op then scales with the survivors. The mask
+# path (SPLATSIM_LIDAR_SECTOR_MASK=1) instead hands the FULL arrays plus a
+# keep mask to the rasterizer — fully asynchronous, no compaction — but every
+# per-call full-length op (quats normalize, feature stack, isect scan/cumsum,
+# projection output writes) then runs over ALL N Gaussians per sector.
+# Measured on the 5-sensor rig at S=8 (4090, heavy pose, 5M Gaussians):
+# compaction 93 ms/revolution vs mask 129 ms — the ~1 ms/call of full-length
+# streaming beats the ~0.3 ms nonzero sync it saves, even with the syncs
+# serializing the streams. Mask is kept as an opt-in for regimes where the
+# balance flips (small N, many sectors, or a host thread that must not stall).
+_SECTOR_MASK: bool = os.environ.get("SPLATSIM_LIDAR_SECTOR_MASK", "0") == "1"
+
 
 def _lidar_cull_keep(
     *,
@@ -1049,15 +1064,18 @@ def _splatad_lidar_rasterization():
                 "build (no nvcc / CUDA toolkit detected). LiDAR rendering "
                 "requires this kernel and has no gsplat fallback."
             )
-        # Sector rendering needs the tile_col_offset support added in
-        # splatad_kernel 1.1.0; an older install would fail mid-frame with a
-        # TypeError, so reject it up front with an actionable message.
+        # Sector rendering needs tile_col_offset (splatad_kernel 1.1.0) and
+        # the mask-based projection valid_mask (1.2.0); an older install would
+        # fail mid-frame with a TypeError, so reject it up front with an
+        # actionable message.
         import inspect
 
-        if "tile_col_offset" not in inspect.signature(lidar_rasterization).parameters:
+        params = inspect.signature(lidar_rasterization).parameters
+        if "tile_col_offset" not in params or "valid_mask" not in params:
             raise RuntimeError(
                 "the installed splatad_kernel predates sector rendering "
-                "(no tile_col_offset); upgrade to splatad_kernel >= 1.1.0"
+                "(no tile_col_offset/valid_mask); upgrade to "
+                "splatad_kernel >= 1.2.0"
             )
         _SPLATAD_RAST = lidar_rasterization
     return _SPLATAD_RAST
@@ -1524,6 +1542,7 @@ def render_lidar_panorama(
         ang_vel = av.reshape(1, 3)
         sweep_time = torch.full((1,), geom.rs_time_s, device=device)
 
+    valid_mask = None
     if (frustum_cull or azim_cull) and means.shape[0] > 0:
         # Sector mode culls by shell + azimuth wedge only, UNLESS the caller
         # opted into the full frustum cull: the elevation band's linearized
@@ -1574,22 +1593,34 @@ def render_lidar_panorama(
             az_halfwidth_rad=geom.az_halfwidth_rad,
             az_pad_rad=0.5 * rot_angle_rad + 0.01,
         )
-        # Index once, unconditionally: sharing the index buffer across the
-        # six tensors avoids six independent mask scans, and skipping the
-        # `keep.all()` short-circuit avoids a device→host sync per frame.
-        idx = keep.nonzero(as_tuple=False).squeeze(-1)
-        means = means.index_select(0, idx)
-        quats = quats.index_select(0, idx)
-        scales = scales.index_select(0, idx)
-        opacities = opacities.index_select(0, idx)
-        intensity_sig = intensity_sig.index_select(0, idx)
-        raydrop_logit = raydrop_logit.index_select(0, idx)
-        if raydrop_sh is not None:
-            raydrop_sh = raydrop_sh.index_select(0, idx)
+        if azim_cull and not frustum_cull and _SECTOR_MASK:
+            # Mask-based projection (opt-in, see _SECTOR_MASK): hand the FULL
+            # arrays plus the keep mask to the rasterizer; the projection
+            # kernel early-outs masked Gaussians (radii = 0) before reading
+            # their data, so they cost one mask byte each — and there is no
+            # nonzero() device→host sync per sensor per sector.
+            valid_mask = keep
+        else:
+            # Compaction (default): shrinks every array so downstream ops and
+            # peak memory scale with the survivors.
+            # Index once, unconditionally: sharing the index buffer across the
+            # six tensors avoids six independent mask scans, and skipping the
+            # `keep.all()` short-circuit avoids a device→host sync per frame.
+            idx = keep.nonzero(as_tuple=False).squeeze(-1)
+            means = means.index_select(0, idx)
+            quats = quats.index_select(0, idx)
+            scales = scales.index_select(0, idx)
+            opacities = opacities.index_select(0, idx)
+            intensity_sig = intensity_sig.index_select(0, idx)
+            raydrop_logit = raydrop_logit.index_select(0, idx)
+            if raydrop_sh is not None:
+                raydrop_sh = raydrop_sh.index_select(0, idx)
 
     # View-dependent raydrop: fold the higher SH bands into the per-Gaussian
     # scalar logit before it is composited by the rasterizer. Evaluated after
-    # culling so the (potentially large) SH matmul only runs over kept Gaussians.
+    # culling so the (potentially large) SH matmul only runs over kept Gaussians
+    # (under the mask path it runs over the full set — the masked results are
+    # simply never rasterized).
     # The view ray uses the mid-window sensor origin (matching the cull) so a
     # single evaluation approximates the whole rolling-shutter window.
     if raydrop_sh is not None and means.shape[0] > 0:
@@ -1659,6 +1690,7 @@ def render_lidar_panorama(
         n_elevation_channels=H,
         azimuth_resolution=geom.az_res_deg,
         tile_col_offset=geom.tile_col_offset,
+        valid_mask=valid_mask,
         tile_width=tw,
         tile_height=th,
         near_plane=float(min_range_m),

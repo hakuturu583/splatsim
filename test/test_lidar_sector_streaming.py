@@ -218,9 +218,17 @@ def _gaussians(n: int = 20_000) -> dict[str, Any]:
 
 
 @cuda
-def test_static_sector_concat_matches_full_render_exactly() -> None:
+@pytest.mark.parametrize("sector_mask", [False, True], ids=["compact", "mask"])
+def test_static_sector_concat_matches_full_render_exactly(
+    sector_mask: bool, monkeypatch
+) -> None:
+    """Both cull applications — compaction (default) and the mask-based
+    projection (SPLATSIM_LIDAR_SECTOR_MASK=1) — must reproduce the full
+    render exactly."""
+    from splatsim import lidar_renderer as lr
     from splatsim.lidar_renderer import render_lidar_panorama
 
+    monkeypatch.setattr(lr, "_SECTOR_MASK", sector_mask)
     spec = _spec(n_columns=512, n_rows=32)
     kw: dict[str, Any] = dict(
         **_gaussians(), lidar_spec=spec, min_range_m=0.5, max_range_m=100.0

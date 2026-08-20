@@ -136,7 +136,7 @@ ppisp = { git = "https://github.com/nv-tlabs/ppisp.git", rev = "df33809f7b3b20ac
 # It compiles against the gsplat pinned below (its Utils.cuh/Common.h and the
 # glm headers it ships), so the two move together: bumping gsplat means
 # rebuilding the kernel, which the JIT does automatically.
-splatad-kernel = { git = "https://github.com/hakuturu583/splatad_kernel.git", rev = "22772b7b3bb2974c603781ed2e841ad5327c11e7" }
+splatad-kernel = { git = "https://github.com/hakuturu583/splatad_kernel.git", rev = "7e5945f2fdb6647de73e1b01bdb20b689b8fb5da" }
 
 # gsplat main pinned past PR #890 (Add LiDAR sensor support) to enable
 # camera_model="lidar" rasterization via RowOffsetStructuredSpinningLidarModelParameters.
