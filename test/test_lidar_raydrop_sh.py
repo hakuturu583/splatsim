@@ -245,7 +245,9 @@ class _FakeScene:
     def __init__(self, tensors: GaussianTensors) -> None:
         self._tensors = tensors
 
-    def collect_tensors(self, _cam_pos):  # noqa: D401 - signature match
+    def collect_tensors(self, _cam_pos, **_kwargs):  # noqa: D401 - signature match
+        # LOD / lidar-view kwargs (lod_count_scale, lidar_view, lod_max_distance)
+        # are accepted and ignored: this fake has no LOD index to filter.
         return [self._tensors]
 
 

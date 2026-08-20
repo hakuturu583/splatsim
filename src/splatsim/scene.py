@@ -97,12 +97,30 @@ class Scene:
         return self._lod_manager
 
     def collect_tensors(
-        self, camera_position: Tensor | None = None
+        self,
+        camera_position: Tensor | None = None,
+        lod_count_scale: float = 1.0,
+        lidar_view: bool = False,
+        lod_max_distance: float | None = None,
     ) -> list[GaussianTensors]:
         """Collect Gaussian tensors from all sources, applying LOD if enabled.
 
         Args:
-            camera_position: [3] float32 GPU tensor, or None to skip LOD.
+            camera_position: ``[3]`` float32 GPU tensor (or ``[S, 3]`` for a
+                rig — see :meth:`LodManager.filter`), or None to skip LOD.
+            lod_count_scale: Extra per-cell LOD decimation (``<1`` thins every
+                cell further; forwarded to :meth:`LodManager.filter`). Used by
+                the LiDAR renderer to cap Gaussian count on 360° scenes that the
+                camera-tuned tiers leave too dense. ``1.0`` = camera behaviour.
+            lidar_view: Forwarded to :meth:`LodManager.filter`: fuse the static
+                ``lidar_mask`` into the LOD gather and skip the (LiDAR-unused)
+                colors block. Only affects sources that go through the LOD
+                filter; unfiltered sources come back unchanged and the caller's
+                own ``lidar_mask`` handling still applies to them.
+            lod_max_distance: Forwarded to :meth:`LodManager.filter` as
+                ``max_distance`` — whole cells provably beyond this camera
+                distance are dropped before the gather (see there for the
+                exactness argument).
         """
         result: list[GaussianTensors] = []
         can_filter = (
@@ -119,6 +137,9 @@ class Scene:
                     self.background.tensors,
                     self.background.lod_index,
                     camera_position,
+                    count_scale=lod_count_scale,
+                    lidar_view=lidar_view,
+                    max_distance=lod_max_distance,
                 )
             else:
                 tensors = self.background.tensors
@@ -131,9 +152,17 @@ class Scene:
                 # Transform camera position into the rigid body's local frame
                 # so that octree cell distances are computed correctly.
                 rot_mat = quat_to_rotation_matrix(rb.rotation)  # [3, 3]
-                cam_local = rot_mat.T @ (camera_position - rb.position)
+                # Works for a single [3] position and for a rig's [S, 3].
+                cam_local = (camera_position.reshape(-1, 3) - rb.position) @ rot_mat
+                if camera_position.dim() == 1:
+                    cam_local = cam_local.reshape(3)
                 base = self._lod_manager.filter(
-                    rb.base_tensors, rb.lod_index, cam_local
+                    rb.base_tensors,
+                    rb.lod_index,
+                    cam_local,
+                    count_scale=lod_count_scale,
+                    lidar_view=lidar_view,
+                    max_distance=lod_max_distance,
                 )
                 tensors = apply_rigid_transform(base, rb.position, rb.rotation)
             else:

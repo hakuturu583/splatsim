@@ -191,7 +191,13 @@ class _FakeScene:
     def __init__(self, tensors: GaussianTensors) -> None:
         self._tensors = tensors
 
-    def collect_tensors(self, _cam_pos):  # noqa: D401 - signature match
+    def collect_tensors(  # noqa: D401 - signature match
+        self,
+        _cam_pos,
+        lod_count_scale: float = 1.0,
+        lidar_view: bool = False,
+        lod_max_distance: float | None = None,
+    ):
         return [self._tensors]
 
 
