@@ -528,6 +528,17 @@ _USE_CUDA_CULL: bool = True
 # balance flips (small N, many sectors, or a host thread that must not stall).
 _SECTOR_MASK: bool = os.environ.get("SPLATSIM_LIDAR_SECTOR_MASK", "0") == "1"
 
+# Depth-parallel rasterization (splatad_kernel >= 1.3.0): give each pixel 16
+# threads along the depth axis, lifting rasterization parallelism from #pixels
+# to 16x #pixels. This is what makes azimuth-sector renders fast — a sector
+# image is small (e.g. 32 x 450 px = 14k pixel-threads on a GPU that wants
+# 200k+) and its dense road-facing tiles carry lists of up to ~100k Gaussians
+# that a lone half-warp otherwise grinds through serially. Output is
+# deterministic but differs from the serial kernel at float-epsilon level in
+# the feature channels (alpha / median depth measure bit-identical).
+# SPLATSIM_LIDAR_DEPTH_LANES=0 restores the serial kernel.
+_DEPTH_LANES: bool = os.environ.get("SPLATSIM_LIDAR_DEPTH_LANES", "1") == "1"
+
 
 def _lidar_cull_keep(
     *,
@@ -1064,18 +1075,20 @@ def _splatad_lidar_rasterization():
                 "build (no nvcc / CUDA toolkit detected). LiDAR rendering "
                 "requires this kernel and has no gsplat fallback."
             )
-        # Sector rendering needs tile_col_offset (splatad_kernel 1.1.0) and
-        # the mask-based projection valid_mask (1.2.0); an older install would
-        # fail mid-frame with a TypeError, so reject it up front with an
-        # actionable message.
+        # Sector rendering needs tile_col_offset (splatad_kernel 1.1.0), the
+        # mask-based projection valid_mask (1.2.0) and depth_lanes (1.3.0); an
+        # older install would fail mid-frame with a TypeError, so reject it up
+        # front with an actionable message.
         import inspect
 
         params = inspect.signature(lidar_rasterization).parameters
-        if "tile_col_offset" not in params or "valid_mask" not in params:
+        if any(
+            p not in params for p in ("tile_col_offset", "valid_mask", "depth_lanes")
+        ):
             raise RuntimeError(
                 "the installed splatad_kernel predates sector rendering "
-                "(no tile_col_offset/valid_mask); upgrade to "
-                "splatad_kernel >= 1.2.0"
+                "(no tile_col_offset/valid_mask/depth_lanes); upgrade to "
+                "splatad_kernel >= 1.3.0"
             )
         _SPLATAD_RAST = lidar_rasterization
     return _SPLATAD_RAST
@@ -1691,6 +1704,7 @@ def render_lidar_panorama(
         azimuth_resolution=geom.az_res_deg,
         tile_col_offset=geom.tile_col_offset,
         valid_mask=valid_mask,
+        depth_lanes=_DEPTH_LANES,
         tile_width=tw,
         tile_height=th,
         near_plane=float(min_range_m),

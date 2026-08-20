@@ -287,6 +287,43 @@ def test_translating_sector_concat_stays_close_to_full_render() -> None:
     assert a.mean().item() < 5e-3
 
 
+@cuda
+def test_depth_lanes_match_serial_rasterization(monkeypatch) -> None:
+    """The depth-parallel rasterizer (16 lanes/pixel, associative composition)
+    must reproduce the serial kernel: alpha and median depth measure
+    bit-identical (the median is an exact selection; the thresholds are
+    resolved by re-walking the crossing lane with the serial logic), features
+    to float epsilon (a lane partial is scaled by the prefix transmittance,
+    which rounds differently from the serial running product)."""
+    from splatsim import lidar_renderer as lr
+    from splatsim.lidar_renderer import render_lidar_panorama
+
+    spec = _spec(n_columns=512, n_rows=32)
+    kw: dict[str, Any] = dict(
+        **_gaussians(), lidar_spec=spec, min_range_m=0.5, max_range_m=100.0
+    )
+    start = torch.eye(4, device="cuda")
+    start[2, 3] = 1.5
+    end = start.clone()
+    end[:3, 3] += torch.tensor([0.8, 0.2, 0.0], device="cuda")
+
+    outs = {}
+    for lanes in (False, True):
+        monkeypatch.setattr(lr, "_DEPTH_LANES", lanes)
+        outs[lanes] = {
+            "static": render_lidar_panorama(sensor_to_world=start, **kw),
+            "rolling": render_lidar_panorama(
+                sensor_to_world=start, sensor_to_world_end=end, **kw
+            ),
+        }
+    for mode in ("static", "rolling"):
+        a, b = outs[False][mode], outs[True][mode]
+        assert torch.equal(a["alpha"], b["alpha"]), mode
+        assert torch.equal(a["distance"], b["distance"]), mode
+        for key in ("intensity", "raydrop_logit"):
+            assert torch.allclose(a[key], b[key], atol=1e-5), (mode, key)
+
+
 # ── the gRPC sector loop ─────────────────────────────────────────────────
 
 
