@@ -3,13 +3,14 @@
 A scene USDZ archive bundles:
 
 * ``default.usda`` — USD stage referencing ``scene.json`` and the SPZ chunks.
-* ``scene.json`` — splatsim.scene/v2 metadata (``world.ecef_anchor``, render
-  defaults, ``extras`` sidecar references, ...).
+* ``scene.json`` — splatsim.scene/v2 or /v3 metadata (``world.ecef_anchor``,
+  render defaults, ``extras`` references, and — for v3 — the chunk index).
 * ``chunks/chunk_NNNNNN.spz`` — Niantic SPZ binaries whose numeric axes are
-  already baked in the scene's Z-up ENU world frame.
+  already baked in the scene's Z-up ENU world frame. v3 bundles embed the
+  per-Gaussian LiDAR attributes inside each chunk as an SPZ (NGSP v4)
+  extension record; v2 bundles carry them in ``.lidar`` sidecar files.
 
-3dgs_io only ships a writer (``save_scene_usdz``); this module is splatsim's
-reader.
+This module is splatsim's reader for both layouts.
 """
 
 from __future__ import annotations
@@ -35,15 +36,18 @@ if typing.TYPE_CHECKING:
 _3dgs_io = _importlib.import_module("3dgs_io")
 _frame_convention = _importlib.import_module("3dgs_io.frame_convention")
 _spz_io = _importlib.import_module("3dgs_io.spz_io")
-_decode_lidar_sidecar = _3dgs_io.decode_lidar_sidecar
+_decode_lidar_extension = _3dgs_io.decode_lidar_extension
+_extract_lidar_extension = _3dgs_io.extract_lidar_extension
 _load_spz = _spz_io.load_spz_world
 _parse_rig_trajectories = _3dgs_io.parse_rig_trajectories
 _validate_frame_convention = _frame_convention.validate_frame_convention
 _validate_rigid_transform = _frame_convention.validate_rigid_transform
 
+_SUPPORTED_SCENE_SCHEMAS = ("splatsim.scene/v2", "splatsim.scene/v3")
+
 
 def read_scene_json(usdz_path: str | Path) -> dict[str, Any]:
-    """Read and validate a frame-explicit v2 ``scene.json``."""
+    """Read and validate a frame-explicit v2/v3 ``scene.json``."""
     with zipfile.ZipFile(usdz_path) as zf:
         if "scene.json" not in zf.namelist():
             raise ValueError(
@@ -52,8 +56,10 @@ def read_scene_json(usdz_path: str | Path) -> dict[str, Any]:
         meta = json.loads(zf.read("scene.json"))
     if not isinstance(meta, dict):
         raise ValueError(f"{usdz_path}: scene.json must be a JSON object")
-    if meta.get("schema") != "splatsim.scene/v2":
-        raise ValueError(f"{usdz_path}: scene.json must use splatsim.scene/v2")
+    if meta.get("schema") not in _SUPPORTED_SCENE_SCHEMAS:
+        raise ValueError(
+            f"{usdz_path}: scene.json must use one of {_SUPPORTED_SCENE_SCHEMAS}"
+        )
     world = meta.get("world")
     if not isinstance(world, dict):
         raise ValueError(f"{usdz_path}: scene.json is missing world metadata")
@@ -78,16 +84,21 @@ def load_spz_scene(
     with the scene's ``ecef_anchor`` (row-major 4x4, ENU world→ECEF) read
     from ``scene.json`` (``world.ecef_anchor``).
 
-    The embedded ``tileset.json`` is deliberately not interpreted. In the v2
-    format every SPZ chunk already contains world-frame coordinates, so the
-    chunks can be loaded directly without Cesium tile transforms.
+    Both bundle layouts are supported: v3 lists its chunks in
+    ``scene.json.gaussians.chunks`` and embeds the LiDAR attributes inside
+    each chunk SPZ as an extension record; v2 enumerates ``chunks/*.spz``
+    with ``.lidar`` sidecar files (its embedded Cesium ``tileset.json`` is
+    deliberately not interpreted — every chunk already contains world-frame
+    coordinates).
     """
     usdz_path = Path(usdz_path)
     meta = read_scene_json(usdz_path)
     ecef_anchor = _validate_rigid_transform(
         meta["world"]["ecef_anchor"], where="scene world.ecef_anchor"
     )
-    ext_meta = meta["gaussians"].get("ext_attributes")
+    gaussians = meta["gaussians"]
+    ext_meta = gaussians.get("ext_attributes")
+    is_v3 = meta["schema"] == "splatsim.scene/v3"
     sidecar_suffix: str | None = None
     if ext_meta is not None:
         if not isinstance(ext_meta, dict):
@@ -97,77 +108,115 @@ def load_spz_scene(
                 f"{usdz_path}: unsupported gaussian extension "
                 f"{ext_meta.get('extension')!r}"
             )
-        sidecar_suffix = ext_meta.get("sidecar_suffix")
-        if not isinstance(sidecar_suffix, str) or not sidecar_suffix.startswith("."):
-            raise ValueError(f"{usdz_path}: invalid gaussian extension sidecar_suffix")
+        if is_v3:
+            if ext_meta.get("container") != "spz_extension":
+                raise ValueError(
+                    f"{usdz_path}: scene/v3 LiDAR attributes must use the "
+                    f"spz_extension container, got {ext_meta.get('container')!r}"
+                )
+        else:
+            sidecar_suffix = ext_meta.get("sidecar_suffix")
+            if not isinstance(sidecar_suffix, str) or not sidecar_suffix.startswith(
+                "."
+            ):
+                raise ValueError(
+                    f"{usdz_path}: invalid gaussian extension sidecar_suffix"
+                )
 
     tensor_list: list[GaussianTensors] = []
     with zipfile.ZipFile(usdz_path) as zf:
-        chunk_names = sorted(
-            n for n in zf.namelist() if n.startswith("chunks/") and n.endswith(".spz")
-        )
+        if is_v3:
+            index = gaussians.get("chunks")
+            if not isinstance(index, list) or not index:
+                raise ValueError(f"{usdz_path}: scene/v3 has no gaussians.chunks index")
+            chunk_names = [entry["uri"] for entry in index]
+        else:
+            chunk_names = sorted(
+                n
+                for n in zf.namelist()
+                if n.startswith("chunks/") and n.endswith(".spz")
+            )
         if not chunk_names:
             raise ValueError(f"{usdz_path}: no SPZ chunks found under chunks/")
         for name in chunk_names:
+            data = zf.read(name)
             with tempfile.NamedTemporaryFile(suffix=".spz") as tmp:
-                tmp.write(zf.read(name))
+                tmp.write(data)
                 tmp.flush()
                 cloud = _load_spz(tmp.name)
             if cloud.num_points == 0:
                 continue
             tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
-            if sidecar_suffix is not None:
-                sidecar_name = str(Path(name).with_suffix(sidecar_suffix))
-                if sidecar_name not in zf.namelist():
-                    raise ValueError(
-                        f"{usdz_path}: missing LiDAR sidecar {sidecar_name}"
-                    )
-                attrs = _decode_lidar_sidecar(zf.read(sidecar_name))
-                intensity = attrs.get("lidar_intensity_raw")
-                raydrop = attrs.get("lidar_raydrop_logit")
-                if intensity is None or raydrop is None:
-                    raise ValueError(
-                        f"{usdz_path}: incomplete LiDAR attributes in {sidecar_name}"
-                    )
-                if (
-                    len(intensity) != cloud.num_points
-                    or len(raydrop) != cloud.num_points
-                ):
-                    raise ValueError(
-                        f"{usdz_path}: LiDAR sidecar count does not match {name}"
-                    )
-                tensors.intensity_raw = torch.from_numpy(intensity).to(device)
-                tensors.raydrop_logit = torch.from_numpy(raydrop).to(device)
-                # Optional per-Gaussian LiDAR participation mask (3dgs_io >=
-                # v1.1.0). Absent for old 2-channel sidecars → leave None
-                # (all Gaussians participate). Stored {0.0, 1.0} floats;
-                # threshold to a bool tensor on the render device.
-                mask = attrs.get("lidar_mask")
-                if mask is not None:
-                    if len(mask) != cloud.num_points:
+            if ext_meta is not None:
+                if is_v3:
+                    attrs = _extract_lidar_extension(data)
+                    if attrs is None:
                         raise ValueError(
-                            f"{usdz_path}: LiDAR sidecar count does not match {name}"
+                            f"{usdz_path}: chunk {name} is missing its LiDAR "
+                            "extension record"
                         )
-                    tensors.lidar_mask = torch.as_tensor(mask, device=device) > 0.5
-                # Optional view-dependent (SH) raydrop bands (3dgs_io >= v1.2.0,
-                # version-2 sidecar). Shape (num_points, (deg+1)**2 - 1): the
-                # higher-order bands only; the DC term is in lidar_raydrop_logit.
-                # Absent for version-1 sidecars → leave None (scalar raydrop).
-                raydrop_sh = attrs.get("raydrop_sh")
-                if raydrop_sh is not None:
-                    if raydrop_sh.shape[0] != cloud.num_points:
+                else:
+                    assert sidecar_suffix is not None  # noqa: S101
+                    sidecar_name = str(Path(name).with_suffix(sidecar_suffix))
+                    if sidecar_name not in zf.namelist():
                         raise ValueError(
-                            f"{usdz_path}: LiDAR sidecar count does not match {name}"
+                            f"{usdz_path}: missing LiDAR sidecar {sidecar_name}"
                         )
-                    tensors.raydrop_sh = torch.from_numpy(
-                        np.ascontiguousarray(raydrop_sh)
-                    ).to(device)
+                    attrs = _decode_lidar_extension(zf.read(sidecar_name))
+                _attach_lidar_attrs(
+                    tensors, attrs, cloud.num_points, device, usdz_path, name
+                )
             tensor_list.append(tensors)
 
     if not tensor_list:
         raise ValueError(f"{usdz_path}: SPZ chunks contain no gaussians")
 
     return _concat_tensors(tensor_list), ecef_anchor
+
+
+def _attach_lidar_attrs(
+    tensors: GaussianTensors,
+    attrs: dict[str, np.ndarray],
+    num_points: int,
+    device: torch.device,
+    usdz_path: Path,
+    chunk_name: str,
+) -> None:
+    """Move a decoded LiDAR attribute dict onto the chunk's tensors."""
+    intensity = attrs.get("lidar_intensity_raw")
+    raydrop = attrs.get("lidar_raydrop_logit")
+    if intensity is None or raydrop is None:
+        raise ValueError(f"{usdz_path}: incomplete LiDAR attributes for {chunk_name}")
+    if len(intensity) != num_points or len(raydrop) != num_points:
+        raise ValueError(
+            f"{usdz_path}: LiDAR attribute count does not match {chunk_name}"
+        )
+    tensors.intensity_raw = torch.from_numpy(intensity).to(device)
+    tensors.raydrop_logit = torch.from_numpy(raydrop).to(device)
+    # Optional per-Gaussian LiDAR participation mask (3dgs_io >= v1.1.0).
+    # Absent for old 2-channel payloads → leave None (all Gaussians
+    # participate). Stored {0.0, 1.0} floats; threshold to a bool tensor on
+    # the render device.
+    mask = attrs.get("lidar_mask")
+    if mask is not None:
+        if len(mask) != num_points:
+            raise ValueError(
+                f"{usdz_path}: LiDAR attribute count does not match {chunk_name}"
+            )
+        tensors.lidar_mask = torch.as_tensor(mask, device=device) > 0.5
+    # Optional view-dependent (SH) raydrop bands (3dgs_io >= v1.2.0,
+    # version-2 payload). Shape (num_points, (deg+1)**2 - 1): the
+    # higher-order bands only; the DC term is in lidar_raydrop_logit.
+    # Absent for version-1 payloads → leave None (scalar raydrop).
+    raydrop_sh = attrs.get("raydrop_sh")
+    if raydrop_sh is not None:
+        if raydrop_sh.shape[0] != num_points:
+            raise ValueError(
+                f"{usdz_path}: LiDAR attribute count does not match {chunk_name}"
+            )
+        tensors.raydrop_sh = torch.from_numpy(np.ascontiguousarray(raydrop_sh)).to(
+            device
+        )
 
 
 def first_camera(rigs: list[Any], name: str | None = None) -> Any | None:

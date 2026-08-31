@@ -90,6 +90,15 @@ build-constraint-dependencies = ["torch>=2.7,<2.8"]
 [tool.uv.extra-build-dependencies]
 ppisp = ["torch"]
 
+# spz v3.0.0 (pulled transitively via 3dgs-io v2.0.0, needed to read the NGSP
+# v4 chunks of scene/v3 bundles): force spz's CMake down the FetchContent path
+# for zstd — distro zstd CMake configs (e.g. Ubuntu 24.04) expose a non-PIC
+# libzstd.a that cannot be linked into the Python shared module. Mirrors the
+# same setting in 3dgs_io's own pyproject (uv does not propagate it from a git
+# dependency).
+[tool.uv.extra-build-variables]
+spz = { CMAKE_ARGS = "-DCMAKE_DISABLE_FIND_PACKAGE_zstd=TRUE" }
+
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
@@ -104,19 +113,17 @@ torchvision = [
   { index = "pytorch-cu128" },
 ]
 
-# 3dgs_io v1.2.0: adds an optional view-dependent (SH) per-Gaussian raydrop
-# trailing block to the EXT_gaussian_lidar sidecar (version-2 sidecar;
-# decode_lidar_sidecar may now return a "raydrop_sh" (N, (deg+1)**2-1) float32
-# array of the higher-order SH bands — the DC term stays in
-# lidar_raydrop_logit; absent for version-1 sidecars). v1.1.0 added the optional
-# per-Gaussian `lidar_mask` channel (decode_lidar_sidecar may return a
-# "lidar_mask" (N,) float32 array in {0,1}; 1 = participates in LiDAR /
-# near-field, 0 = appearance-only / far-field; absent for old 2-channel
-# sidecars). v1.0.0 was the first tagged release with the frame-explicit v2
-# scene USDZ work (issue #39). Only the scene USDZ readers (load_spz,
-# decode_lidar_sidecar, parse_rig_trajectories, ...) are used; splatsim no
-# longer loads 3D Tiles tilesets.
-3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v1.2.0" }
+# 3dgs_io v2.0.1 (splatsim.scene/v3): per-Gaussian LiDAR attributes ride
+# inside each chunk SPZ as an NGSP v4 extension record (extract_lidar_extension)
+# instead of `.lidar` sidecar files, the chunk index lives in
+# scene.json.gaussians.chunks, and bundles carry no Cesium tileset.json.
+# decode_lidar_sidecar was renamed decode_lidar_extension (payload format
+# unchanged: lidar_intensity_raw / lidar_raydrop_logit, optional lidar_mask
+# channel from v1.1.0, optional raydrop_sh trailing block from v1.2.0).
+# splatsim keeps reading v2 (sidecar) bundles through the same renamed decoder.
+# Only the scene USDZ readers (load_spz, decode_lidar_extension,
+# extract_lidar_extension, parse_rig_trajectories, ...) are used.
+3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v2.0.1" }
 
 # t4-devkit: WebAuto / T4 dataset devkit, used by the optional 'eval' extra to
 # pull the GT ego trajectory + GT LiDAR scans. Not published to PyPI; pin to the

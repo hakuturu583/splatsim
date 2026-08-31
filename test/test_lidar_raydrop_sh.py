@@ -141,7 +141,7 @@ def _scene_doc() -> dict:
 
 def _write_scene(tmp_path, attrs: dict, count: int):
     usdz_path = tmp_path / "scene.usdz"
-    sidecar = _3dgs_io.encode_lidar_sidecar(attrs, count=count)
+    sidecar = _3dgs_io.encode_lidar_extension(attrs, count=count)
     with zipfile.ZipFile(usdz_path, "w") as zf:
         zf.writestr("scene.json", json.dumps(_scene_doc()))
         zf.writestr("chunks/chunk_000000.spz", b"spz")
