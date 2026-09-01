@@ -27,7 +27,11 @@ from typing import Any
 import numpy as np
 import torch
 
-from splatsim._conversions import GaussianTensors, cloud_to_tensors
+from splatsim._conversions import (
+    GaussianTensors,
+    attach_lidar_attrs,
+    cloud_to_tensors,
+)
 from splatsim._geometry import mat4, quat_to_matrix, slerp
 
 if typing.TYPE_CHECKING:
@@ -163,8 +167,12 @@ def load_spz_scene(
                             f"{usdz_path}: missing LiDAR sidecar {sidecar_name}"
                         )
                     attrs = _decode_lidar_extension(zf.read(sidecar_name))
-                _attach_lidar_attrs(
-                    tensors, attrs, cloud.num_points, device, usdz_path, name
+                attach_lidar_attrs(
+                    tensors,
+                    attrs,
+                    cloud.num_points,
+                    device,
+                    source=f"{usdz_path}: {name}",
                 )
             tensor_list.append(tensors)
 
@@ -172,51 +180,6 @@ def load_spz_scene(
         raise ValueError(f"{usdz_path}: SPZ chunks contain no gaussians")
 
     return _concat_tensors(tensor_list), ecef_anchor
-
-
-def _attach_lidar_attrs(
-    tensors: GaussianTensors,
-    attrs: dict[str, np.ndarray],
-    num_points: int,
-    device: torch.device,
-    usdz_path: Path,
-    chunk_name: str,
-) -> None:
-    """Move a decoded LiDAR attribute dict onto the chunk's tensors."""
-    intensity = attrs.get("lidar_intensity_raw")
-    raydrop = attrs.get("lidar_raydrop_logit")
-    if intensity is None or raydrop is None:
-        raise ValueError(f"{usdz_path}: incomplete LiDAR attributes for {chunk_name}")
-    if len(intensity) != num_points or len(raydrop) != num_points:
-        raise ValueError(
-            f"{usdz_path}: LiDAR attribute count does not match {chunk_name}"
-        )
-    tensors.intensity_raw = torch.from_numpy(intensity).to(device)
-    tensors.raydrop_logit = torch.from_numpy(raydrop).to(device)
-    # Optional per-Gaussian LiDAR participation mask (3dgs_io >= v1.1.0).
-    # Absent for old 2-channel payloads → leave None (all Gaussians
-    # participate). Stored {0.0, 1.0} floats; threshold to a bool tensor on
-    # the render device.
-    mask = attrs.get("lidar_mask")
-    if mask is not None:
-        if len(mask) != num_points:
-            raise ValueError(
-                f"{usdz_path}: LiDAR attribute count does not match {chunk_name}"
-            )
-        tensors.lidar_mask = torch.as_tensor(mask, device=device) > 0.5
-    # Optional view-dependent (SH) raydrop bands (3dgs_io >= v1.2.0,
-    # version-2 payload). Shape (num_points, (deg+1)**2 - 1): the
-    # higher-order bands only; the DC term is in lidar_raydrop_logit.
-    # Absent for version-1 payloads → leave None (scalar raydrop).
-    raydrop_sh = attrs.get("raydrop_sh")
-    if raydrop_sh is not None:
-        if raydrop_sh.shape[0] != num_points:
-            raise ValueError(
-                f"{usdz_path}: LiDAR attribute count does not match {chunk_name}"
-            )
-        tensors.raydrop_sh = torch.from_numpy(np.ascontiguousarray(raydrop_sh)).to(
-            device
-        )
 
 
 def first_camera(rigs: list[Any], name: str | None = None) -> Any | None:

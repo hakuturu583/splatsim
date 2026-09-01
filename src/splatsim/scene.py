@@ -9,11 +9,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from splatsim._conversions import (
-    GaussianTensors,
-    apply_rigid_transform,
-    quat_to_rotation_matrix,
-)
+from splatsim._conversions import GaussianTensors, quat_to_rotation_matrix
+from splatsim.actor_assets import ActorAssetLibrary
 from splatsim.background import Background
 from splatsim.dataclass import SceneConfig
 from splatsim.lod import LodIndex, LodManager
@@ -42,12 +39,14 @@ class Scene:
         rigid_bodies: dict[str, RigidBody] | None = None,
         lod_manager: LodManager | None = None,
         ppisp_tables: "PpispTables | None" = None,
+        actor_library: "ActorAssetLibrary | None" = None,
     ) -> None:
         self.background = background
         self._rigid_bodies: dict[str, RigidBody] = rigid_bodies or {}
         self._lod_manager = lod_manager
         self._lod_enabled = lod_manager is not None
         self.ppisp_tables = ppisp_tables
+        self._actor_library = actor_library
 
     # --- rigid body access ---------------------------------------------------
 
@@ -67,6 +66,53 @@ class Scene:
 
     def add_rigid_body(self, name: str, rigid_body: RigidBody) -> None:
         self._rigid_bodies[name] = rigid_body
+
+    @property
+    def actor_library(self) -> ActorAssetLibrary | None:
+        """The background bundle's rigid actor assets, if it ships any.
+
+        ``None`` until something loads it — :meth:`from_config` does so when
+        the config lists actors, and :meth:`spawn_actor` on demand.
+        """
+        return self._actor_library
+
+    def spawn_actor(
+        self,
+        asset_id: str,
+        name: str,
+        *,
+        position: tuple[float, float, float] | Tensor | None = None,
+        rotation: tuple[float, float, float, float] | Tensor | None = None,
+        world_position: bool = True,
+    ) -> RigidBody:
+        """Add a rigid dynamic object from the bundle's actor asset bank.
+
+        The scenario owns the pose from here on: call
+        :meth:`set_pose` with ``name`` each frame. ``position`` is read in the
+        bundle's ENU world frame unless ``world_position`` is ``False``;
+        ``rotation`` is ``wxyz``.
+        """
+        if name in self._rigid_bodies:
+            raise ValueError(f"a rigid body named {name!r} is already in the scene")
+        if self._actor_library is None:
+            if self.background is None:
+                raise ValueError(
+                    "no actor asset bank loaded and no background USDZ to load one from"
+                )
+            self._actor_library = ActorAssetLibrary(
+                self.background.source_path,
+                device=self.background.tile_local_centroid.device,
+                use_sh=self.background.use_sh,
+                lod_manager=self._lod_manager,
+            )
+        body = self._actor_library.spawn(
+            asset_id,
+            position=position,
+            rotation=rotation,
+            background=self.background if world_position else None,
+        )
+        self._rigid_bodies[name] = body
+        return body
 
     def remove_rigid_body(self, name: str) -> RigidBody:
         return self._rigid_bodies.pop(name)
@@ -164,7 +210,7 @@ class Scene:
                     lidar_view=lidar_view,
                     max_distance=lod_max_distance,
                 )
-                tensors = apply_rigid_transform(base, rb.position, rb.rotation)
+                tensors = rb.posed(base)
             else:
                 tensors = rb.tensors
             result.append(tensors)
@@ -193,7 +239,7 @@ class Scene:
             device = torch.device(config.renderer.device)
 
         has_bg = config.background_usdz is not None
-        total = int(has_bg) + len(config.rigid_bodies)
+        total = int(has_bg) + len(config.rigid_bodies) + len(config.actors)
         step = 0
 
         lod_manager: LodManager | None = None
@@ -225,6 +271,12 @@ class Scene:
                     centroid=background.tile_local_centroid,
                 )
 
+        if config.actors and background is None:
+            raise ValueError(
+                "scene config lists actors but has no background_usdz to load "
+                "the actor asset bank from"
+            )
+
         rigid_bodies: dict[str, RigidBody] = {}
         for rb_cfg in config.rigid_bodies:
             rb = RigidBody(
@@ -241,12 +293,29 @@ class Scene:
             if rb.lod_index is not None:
                 _log_lod_tiers(rb_cfg.name, rb.lod_index)
 
-        return Scene(
+        scene = Scene(
             background=background,
             rigid_bodies=rigid_bodies,
             lod_manager=lod_manager,
             ppisp_tables=ppisp_tables,
         )
+
+        # Configured actors go through the same entry point a scenario uses, so
+        # the bank is loaded once, on first spawn, and the name-collision rule
+        # has one definition.
+        for actor_cfg in config.actors:
+            scene.spawn_actor(
+                actor_cfg.asset_id,
+                actor_cfg.name,
+                position=actor_cfg.position,
+                rotation=actor_cfg.rotation,
+                world_position=actor_cfg.world_position,
+            )
+            step += 1
+            if progress is not None:
+                progress(step, total, actor_cfg.name)
+
+        return scene
 
 
 def _log_lod_tiers(name: str, lod_index: LodIndex) -> None:

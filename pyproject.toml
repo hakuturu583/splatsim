@@ -113,7 +113,14 @@ torchvision = [
   { index = "pytorch-cu128" },
 ]
 
-# 3dgs_io v2.0.1 (splatsim.scene/v3): per-Gaussian LiDAR attributes ride
+# 3dgs_io v2.1.0 adds splatsim.actor_assets/v1: rigid dynamic-object ("actor")
+# assets carried in a scene USDZ as actor_assets.json plus one object-local
+# NGSP v4 SPZ per asset (parse_actor_assets / decode_actor_asset). The payload
+# is the same container the background chunks use, so an actor's Gaussians and
+# its per-Gaussian LiDAR attributes come through the readers splatsim already
+# has. See splatsim/actor_assets.py.
+#
+# v2.0.1 (splatsim.scene/v3): per-Gaussian LiDAR attributes ride
 # inside each chunk SPZ as an NGSP v4 extension record (extract_lidar_extension)
 # instead of `.lidar` sidecar files, the chunk index lives in
 # scene.json.gaussians.chunks, and bundles carry no Cesium tileset.json.
@@ -122,8 +129,9 @@ torchvision = [
 # channel from v1.1.0, optional raydrop_sh trailing block from v1.2.0).
 # splatsim keeps reading v2 (sidecar) bundles through the same renamed decoder.
 # Only the scene USDZ readers (load_spz, decode_lidar_extension,
-# extract_lidar_extension, parse_rig_trajectories, ...) are used.
-3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v2.0.1" }
+# extract_lidar_extension, parse_actor_assets, parse_rig_trajectories, ...)
+# are used.
+3dgs-io = { git = "https://github.com/autowarefoundation/3dgs_io.git", tag = "v2.1.0" }
 
 # t4-devkit: WebAuto / T4 dataset devkit, used by the optional 'eval' extra to
 # pull the GT ego trajectory + GT LiDAR scans. Not published to PyPI; pin to the
