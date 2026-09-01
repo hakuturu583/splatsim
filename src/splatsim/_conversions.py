@@ -175,10 +175,73 @@ def quat_multiply(q1: Tensor, q2: Tensor) -> Tensor:
     )  # [N, 4]
 
 
+#: Highest SH band the 3DGS / SPZ colour layout carries.
+MAX_SH_DEGREE = 3
+
+#: Beyond this much pitch/roll, rotating the colour SH about ``+Z`` alone is no
+#: longer a faithful re-expression of the bands (see :func:`rotate_sh_about_z`).
+MAX_NON_YAW_RAD = 0.035  # ~2 degrees
+
+
+def yaw_from_quat(rotation: Tensor) -> tuple[Tensor, Tensor]:
+    """Split a wxyz quaternion into its ``+Z`` yaw and the residual tilt.
+
+    Returns ``(yaw, tilt)`` where ``yaw`` is the rotation about ``+Z`` and
+    ``tilt`` is the largest remaining out-of-plane angle, i.e. how far the
+    orientation departs from a pure yaw. Both are 0-dim tensors on the input's
+    device so callers stay on-device.
+    """
+    rot = quat_to_rotation_matrix(rotation)  # [3, 3]
+    # Heading is where the body's +X points once projected onto the ground
+    # plane; the tilt is how far the body's own +Z has left world +Z, which is
+    # zero for a pure yaw and pi for an upside-down body.
+    yaw = torch.atan2(rot[1, 0], rot[0, 0])
+    tilt = torch.acos(rot[2, 2].clamp(-1.0, 1.0))
+    return yaw, tilt
+
+
+def rotate_sh_about_z(colors: Tensor, yaw: Tensor) -> Tensor:
+    """Rotate real-SH colour coefficients about ``+Z`` by ``yaw``.
+
+    ``colors`` is ``[N, K, 3]`` in the 3DGS / SPZ layout: index 0 is the DC
+    band and the rest cover bands ``1..degree`` with ``m`` ascending from
+    ``-l`` to ``+l`` inside each band. Rotation about the SH polar axis mixes
+    only the ``(m, -m)`` pair, so this is exact and closed-form — no Wigner-D
+    machinery — and the DC band is rotation-invariant.
+
+    This is the torch counterpart of ``3dgs_io.rotate_sh_about_z``: the
+    returned coefficients evaluate at direction ``d`` to what the input
+    evaluated at ``R_z(yaw) @ d``, which is exactly what instancing an
+    object-local asset through a world pose needs.
+    """
+    if colors.dim() != 3:
+        raise ValueError(
+            f"rotate_sh_about_z expects [N, K, 3] colors, got {tuple(colors.shape)}"
+        )
+    out = colors.clone()
+    coefs = colors.shape[1] - 1  # bands 1.. (index 0 is DC, invariant)
+    for degree in range(1, MAX_SH_DEGREE + 1):
+        base = degree * degree  # +1 for the DC slot vs the 3dgs_io indexing
+        if base + 2 * degree > coefs:
+            break
+        for m in range(1, degree + 1):
+            angle = m * yaw
+            cos_m, sin_m = torch.cos(angle), torch.sin(angle)
+            i_pos = base + degree + m
+            i_neg = base + degree - m
+            c_pos = colors[:, i_pos, :]
+            c_neg = colors[:, i_neg, :]
+            out[:, i_pos, :] = c_pos * cos_m + c_neg * sin_m
+            out[:, i_neg, :] = -c_pos * sin_m + c_neg * cos_m
+    return out
+
+
 def apply_rigid_transform(
     tensors: GaussianTensors,
     position: Tensor,
     rotation: Tensor,
+    *,
+    rotate_sh: bool = False,
 ) -> GaussianTensors:
     """Apply a rigid body transform (translation + rotation) to Gaussian tensors.
 
@@ -186,6 +249,16 @@ def apply_rigid_transform(
         tensors: Base Gaussian tensors to transform.
         position: [3] world-space translation.
         rotation: [4] wxyz quaternion for orientation.
+        rotate_sh: Re-express the view-dependent colour SH in the world frame.
+            Off by default so existing rigid bodies keep their behaviour;
+            :class:`~splatsim.actor_assets.ActorAssetLibrary` turns it on,
+            because a dynamic actor's heading changes every frame and leaving
+            its specular bands in the object frame makes highlights spin with
+            the car. Only the yaw component is applied (see
+            :func:`rotate_sh_about_z`); a pose tilted more than
+            :data:`MAX_NON_YAW_RAD` out of the ground plane is reported by
+            :meth:`~splatsim.rigid_body.RigidBody.sh_rotation_tilt` rather than
+            silently approximated.
 
     Returns:
         New GaussianTensors with transformed means and quats.
@@ -198,17 +271,24 @@ def apply_rigid_transform(
     # Compose quaternions
     new_quats = quat_multiply(rotation, tensors.quats)
 
+    colors = tensors.colors
+    if rotate_sh and tensors.sh_degree > 0 and colors.dim() == 3:
+        yaw, _tilt = yaw_from_quat(rotation)
+        colors = rotate_sh_about_z(colors, yaw)
+
     return GaussianTensors(
         means=new_means,
         quats=new_quats,
         scales=tensors.scales,
         opacities=tensors.opacities,
-        colors=tensors.colors,
+        colors=colors,
         sh_degree=tensors.sh_degree,
         intensity_raw=tensors.intensity_raw,
         raydrop_logit=tensors.raydrop_logit,
         lidar_mask=tensors.lidar_mask,
-        # SH raydrop coefficients are carried through unchanged, mirroring how
-        # `colors` (the colour SH coefficients) are left un-rotated here.
+        # Raydrop SH is evaluated by the LiDAR renderer at the sensor-ray
+        # direction; it would need the same yaw rotation as `colors` to be
+        # correct for a posed actor. Left unrotated for now — the LiDAR path
+        # does not yet consume actor assets.
         raydrop_sh=tensors.raydrop_sh,
     )
