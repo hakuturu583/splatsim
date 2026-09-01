@@ -16,8 +16,8 @@ build-constraints = [{ name = "torch", specifier = ">=2.7,<2.8", index = "https:
 
 [[package]]
 name = "3dgs-io"
-version = "2.0.1"
-source = { git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v2.0.1#ffe97234a0c45b75ebdd8518a068d47ed76fa33d" }
+version = "2.1.0"
+source = { git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v2.1.0#8852d07901c836c6e2297b61742e60345508a9d2" }
 dependencies = [
     { name = "numpy", marker = "sys_platform == 'linux'" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' and sys_platform == 'linux'" },
@@ -1998,7 +1998,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v2.0.1" },
+    { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v2.1.0" },
     { name = "cyclonedds", marker = "extra == 'dds'", specifier = ">=11.0.1" },
     { name = "grpcio", specifier = ">=1.60.0" },
     { name = "grpcio-tools", specifier = ">=1.60.0" },
