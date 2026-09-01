@@ -112,7 +112,9 @@ def test_shared_gather_costs_one_buffer_not_n() -> None:
     b2w = torch.eye(4, device=device)
 
     shared = gather_lidar_rig(rends, b2w, scene)
-    per_sensor_total = sum(r.gather(b2w, scene).nbytes() for r in rends)
+    per_sensor = [r.gather(b2w, scene) for r in rends]
+    assert all(g is not None for g in per_sensor)
+    per_sensor_total = sum(g.nbytes() for g in per_sensor if g is not None)
     assert shared is not None
     # Union of 4 nearby mounts stays far below the sum of 4 separate gathers.
     assert shared.nbytes() < per_sensor_total * 0.6
@@ -270,7 +272,7 @@ def test_side_streams_wait_for_the_shared_gather() -> None:
     # The rig caches its side streams, so the pool must be (re)built from the
     # recording subclass for this test to observe the waits.
     lr_mod._STREAM_POOL.clear()
-    torch.cuda.Stream = _RecordingStream  # type: ignore[misc]
+    torch.cuda.Stream = _RecordingStream  # ty: ignore[invalid-assignment]
     try:
         rends = [
             LidarRenderer(
@@ -334,7 +336,7 @@ def test_side_streams_are_reused_across_frames() -> None:
         seen.append(self.cuda_stream)
         return real_wait(self, other)
 
-    torch.cuda.Stream.wait_stream = _spy  # type: ignore[assignment]
+    torch.cuda.Stream.wait_stream = _spy  # ty: ignore[invalid-assignment]
     try:
         rounds = []
         for _ in range(4):
