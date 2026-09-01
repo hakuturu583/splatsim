@@ -155,12 +155,29 @@ helpers:
   splatsim pose is `wxyz`. Route bundle poses through
   `splatsim.actor_assets.pose_from_track_frame`.
 
-Actors re-express their view-dependent colour SH when posed, unlike the
-pre-existing `RigidBodyConfig` bodies — a moving car's heading changes every
-frame, and leaving its specular bands in the object frame makes highlights spin
-with the car. The rotation is exact for the yaw-only poses road vehicles have;
-`RigidBody.sh_rotation_is_exact` reports when a pose is tilted far enough out of
-the ground plane for it to be an approximation.
+### View-dependent bands, camera and LiDAR
+
+Actors re-express **both** their view-dependent band sets when posed, unlike the
+pre-existing `RigidBodyConfig` bodies:
+
+- **colour SH** — leaving the specular bands in the object frame makes
+  highlights spin with the car;
+- **`raydrop_sh`** — the LiDAR renderer evaluates drop probability along the
+  world-space sensor→Gaussian ray, so unrotated bands sample a car facing east
+  with the pattern it had facing north. The scalar `raydrop_logit` is the
+  band-0 term and is rotation-invariant, so it needs nothing.
+
+Both go through the same closed-form `+Z` rotation off a single yaw, which is
+exact for the yaw-only poses road vehicles have.
+`RigidBody.sh_rotation_tilt` / `.sh_rotation_is_exact` report when a pose is
+tilted far enough out of the ground plane for it to be an approximation.
+
+Everything else on the LiDAR path already treats an actor like any other
+source: `lidar_mask` is applied per-source before the scene concat (so an asset
+without one participates fully), assets that carry no raydrop bands are
+zero-padded to the scene's SH width and contribute only their scalar logit, and
+the LOD `lidar_view` gather thins the actor's object-frame Gaussians before the
+pose is applied.
 
 Actors can also be declared in a scene config, for static props and spawn
 points:

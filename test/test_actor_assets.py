@@ -22,11 +22,13 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from scipy.spatial.transform import Rotation
 
 from splatsim._conversions import (
     MAX_NON_YAW_RAD,
     GaussianTensors,
     apply_rigid_transform,
+    rotate_raydrop_sh_about_z,
     rotate_sh_about_z,
 )
 from splatsim.actor_assets import (
@@ -34,7 +36,10 @@ from splatsim.actor_assets import (
     pose_from_track_frame,
     world_to_tile_local,
 )
+from splatsim.dataclass import LodConfig
+from splatsim.lod import LodManager
 from splatsim.rigid_body import RigidBody
+from splatsim.scene import Scene
 
 _3dgs_io = importlib.import_module("3dgs_io")
 _spz = importlib.import_module("spz")
@@ -83,6 +88,7 @@ def _source(
     n: int = 32,
     seed: int = 0,
     with_lidar: bool = False,
+    raydrop_sh_degree: int = 0,
     sh_degree: int = 0,
 ) -> Any:
     rng = np.random.default_rng(seed + 7)
@@ -93,6 +99,9 @@ def _source(
             "lidar_raydrop_logit": np.full(n, -0.5, dtype=np.float32),
             "lidar_mask": (rng.random(n) > 0.5).astype(np.float32),
         }
+        if raydrop_sh_degree:
+            coefs = (raydrop_sh_degree + 1) ** 2 - 1
+            ext["raydrop_sh"] = rng.standard_normal((n, coefs)).astype(np.float32)
     return ActorAssetSource(
         asset_id=asset_id,
         cloud=_object_local_cloud(n, seed=seed, sh_degree=sh_degree),
@@ -360,7 +369,7 @@ def test_sh_z_rotation_leaves_the_dc_band_alone() -> None:
 def _tensors_with_sh(n: int = 8, k: int = 16) -> GaussianTensors:
     rng = np.random.default_rng(11)
     return GaussianTensors(
-        means=torch.zeros(n, 3),
+        means=torch.tensor(rng.standard_normal((n, 3)), dtype=torch.float32),
         quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * n),
         scales=torch.ones(n, 3),
         opacities=torch.ones(n),
@@ -382,7 +391,7 @@ def test_rigid_transform_rotates_sh_only_when_asked() -> None:
     turned = apply_rigid_transform(base, position, rotation, rotate_sh=True)
     assert not torch.allclose(turned.colors, base.colors)
     torch.testing.assert_close(
-        turned.colors, rotate_sh_about_z(base.colors, torch.tensor(yaw))
+        turned.colors, rotate_sh_about_z(base.colors, torch.tensor(-yaw))
     )
 
 
@@ -480,3 +489,239 @@ def test_spawning_from_a_track_pose_lands_on_the_tracked_box(tmp_path: Path) -> 
     rot = torch.tensor([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
     back = (body.tensors.means - body.position) @ rot
     assert bool((back.abs() <= torch.tensor(CAR_SIZE) / 2 + 1e-4).all())
+
+
+# ---------------------------------------------------------------------------
+# View-dependent raydrop (the LiDAR half of the same problem)
+# ---------------------------------------------------------------------------
+
+
+def _eval_raydrop(bands: np.ndarray, logit: float, d: np.ndarray) -> float:
+    """Evaluate raydrop the way ``lidar_renderer`` packs and evaluates it.
+
+    The renderer puts ``raydrop_logit / SH_C0`` in the DC slot and the bands at
+    ``1:k``, then reads channel 0 back out of ``gsplat.spherical_harmonics`` —
+    so the bands ride the same 3DGS basis the colours do, one index apart.
+    """
+    coeffs = np.zeros(len(bands) + 1)
+    coeffs[0] = logit / _SH_C0
+    coeffs[1:] = bands
+    return float(_sh_basis(d)[: len(coeffs)] @ coeffs)
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3])
+@pytest.mark.parametrize("yaw_deg", [0.0, 47.0, -133.0, 180.0])
+def test_raydrop_sh_z_rotation_is_exact(degree: int, yaw_deg: float) -> None:
+    """``f_world(d) == f_object(R_z(yaw) @ d)`` for the DC-less raydrop layout."""
+    rng = np.random.default_rng(7)
+    coefs = (degree + 1) ** 2 - 1
+    bands = torch.tensor(rng.standard_normal((1, coefs)), dtype=torch.float64)
+    logit = float(rng.standard_normal())
+    yaw = math.radians(yaw_deg)
+    rotated = rotate_raydrop_sh_about_z(bands, torch.tensor(yaw, dtype=torch.float64))
+
+    c, s = math.cos(yaw), math.sin(yaw)
+    rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    for _ in range(20):
+        d = rng.standard_normal(3)
+        d /= np.linalg.norm(d)
+        assert _eval_raydrop(rotated[0].numpy(), logit, d) == pytest.approx(
+            _eval_raydrop(bands[0].numpy(), logit, rot @ d), abs=1e-12
+        )
+
+
+def test_raydrop_sh_rotation_rejects_the_colour_layout() -> None:
+    with pytest.raises(ValueError, match=r"expects \[N, K\] bands"):
+        rotate_raydrop_sh_about_z(torch.zeros(4, 15, 3), torch.tensor(0.5))
+
+
+def _tensors_with_raydrop(n: int = 6, coefs: int = 15, *, sh_degree: int = 3):
+    rng = np.random.default_rng(13)
+    colors = (
+        torch.tensor(rng.standard_normal((n, 16, 3)), dtype=torch.float32)
+        if sh_degree
+        else torch.rand(n, 3)
+    )
+    return GaussianTensors(
+        means=torch.zeros(n, 3),
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * n),
+        scales=torch.ones(n, 3),
+        opacities=torch.ones(n),
+        colors=colors,
+        sh_degree=sh_degree,
+        raydrop_logit=torch.tensor(rng.standard_normal(n), dtype=torch.float32),
+        raydrop_sh=torch.tensor(rng.standard_normal((n, coefs)), dtype=torch.float32),
+    )
+
+
+def test_rigid_transform_rotates_raydrop_bands_with_the_colours() -> None:
+    base = _tensors_with_raydrop()
+    yaw = math.radians(40.0)
+    rotation = torch.tensor([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)])
+
+    plain = apply_rigid_transform(base, torch.zeros(3), rotation)
+    torch.testing.assert_close(plain.raydrop_sh, base.raydrop_sh)
+
+    turned = apply_rigid_transform(base, torch.zeros(3), rotation, rotate_sh=True)
+    assert base.raydrop_sh is not None
+    torch.testing.assert_close(
+        turned.raydrop_sh,
+        rotate_raydrop_sh_about_z(base.raydrop_sh, torch.tensor(-yaw)),
+    )
+    # The band-0 drop logit is rotation-invariant, so it must come through as-is.
+    torch.testing.assert_close(turned.raydrop_logit, base.raydrop_logit)
+
+
+def test_raydrop_bands_rotate_even_for_an_rgb_mode_asset() -> None:
+    """``raydrop_sh`` does not depend on ``sh_degree`` — an RGB asset can have it."""
+    base = _tensors_with_raydrop(sh_degree=0)
+    yaw = math.radians(70.0)
+    turned = apply_rigid_transform(
+        base,
+        torch.zeros(3),
+        torch.tensor([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]),
+        rotate_sh=True,
+    )
+    torch.testing.assert_close(turned.colors, base.colors)  # nothing to rotate
+    assert turned.raydrop_sh is not None and base.raydrop_sh is not None
+    assert not torch.allclose(turned.raydrop_sh, base.raydrop_sh)
+
+
+def test_spawned_actors_carry_and_rotate_their_raydrop_bands(tmp_path: Path) -> None:
+    """End to end: a bank asset's view-dependent raydrop survives and follows the pose."""
+    n = 32
+    usdz = _write_scene_usdz(
+        tmp_path / "scene.usdz",
+        [_source(n=n, with_lidar=True, raydrop_sh_degree=2)],
+    )
+    library = ActorAssetLibrary(usdz, device=CPU)
+    body = library.spawn("sedan_0007")
+
+    base = body.base_tensors
+    assert base.raydrop_sh is not None
+    assert base.raydrop_sh.shape == (n, (2 + 1) ** 2 - 1)
+
+    yaw = math.radians(55.0)
+    body.set_pose((0.0, 0.0, 0.0), (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)))
+    torch.testing.assert_close(
+        body.tensors.raydrop_sh,
+        rotate_raydrop_sh_about_z(base.raydrop_sh, torch.tensor(-yaw)),
+    )
+
+
+def test_the_lod_lidar_gather_still_hands_back_rotated_raydrop(
+    tmp_path: Path,
+) -> None:
+    """The path the LiDAR renderer actually takes: LOD gather, then pose.
+
+    ``Scene.collect_tensors(lidar_view=True)`` thins the actor's *object-frame*
+    Gaussians and then poses the subset, so the raydrop bands must come back
+    re-expressed in world — the LOD branch used to be a second place that could
+    forget.
+    """
+    usdz = _write_scene_usdz(
+        tmp_path / "scene.usdz", [_source(n=64, with_lidar=True, raydrop_sh_degree=2)]
+    )
+    manager = LodManager(LodConfig())
+    library = ActorAssetLibrary(usdz, device=CPU, lod_manager=manager)
+    body = library.spawn("sedan_0007")
+    yaw = math.radians(25.0)
+    body.set_pose((0.0, 0.0, 0.0), (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)))
+
+    scene = Scene(rigid_bodies={"car_01": body}, lod_manager=manager)
+    (posed,) = scene.collect_tensors(torch.zeros(3), lidar_view=True)
+
+    assert posed.raydrop_sh is not None
+    base_bands = body.base_tensors.raydrop_sh
+    assert base_bands is not None
+    # The gather selects a subset in the object frame; whichever rows survive,
+    # they must be the rotated ones.
+    expected = rotate_raydrop_sh_about_z(base_bands, torch.tensor(-yaw))
+    assert posed.raydrop_sh.shape[1] == expected.shape[1]
+    for row in posed.raydrop_sh:
+        assert bool((expected - row).abs().sum(dim=1).min() < 1e-5)
+
+
+# ---------------------------------------------------------------------------
+# The invariant the band rotation actually has to satisfy
+# ---------------------------------------------------------------------------
+#
+# Asserting that `apply_rigid_transform` agrees with `rotate_*_about_z` only
+# proves the two agree — it says nothing about which way round the rotation
+# goes, and an inverted one is silently plausible. These two evaluate the bands
+# along a real ray instead: a posed actor must answer, in the world frame, what
+# the object-frame asset answers along the same ray seen from the object frame.
+
+
+def _object_frame_ray_setup(yaw_deg: float = 63.0):
+    """A posed body plus the sensor position expressed in both frames."""
+    yaw = math.radians(yaw_deg)
+    rot = Rotation.from_euler("z", yaw)
+    translation = torch.tensor([10.0, -4.0, 0.8])
+    sensor_world = torch.tensor([30.0, 12.0, 2.0])
+    sensor_object = torch.tensor(
+        rot.inv().apply((sensor_world - translation).numpy()), dtype=torch.float32
+    )
+    return yaw, rot, translation, sensor_world, sensor_object
+
+
+def test_a_posed_actor_drops_rays_the_way_its_object_frame_asset_does() -> None:
+    """The LiDAR invariant: world-frame raydrop == object-frame raydrop, same ray."""
+    from splatsim.lidar_renderer import _eval_view_dependent_raydrop
+
+    rng = np.random.default_rng(4)
+    n, coefs = 40, 8
+    base = GaussianTensors(
+        means=torch.tensor(rng.standard_normal((n, 3)), dtype=torch.float32),
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * n),
+        scales=torch.ones(n, 3),
+        opacities=torch.ones(n),
+        colors=torch.rand(n, 3),
+        sh_degree=0,
+        raydrop_logit=torch.tensor(rng.standard_normal(n), dtype=torch.float32),
+        raydrop_sh=torch.tensor(rng.standard_normal((n, coefs)), dtype=torch.float32),
+    )
+    yaw, rot, translation, sensor_world, sensor_object = _object_frame_ray_setup()
+
+    body = RigidBody(base, device=CPU, rotate_sh=True)
+    body.set_pose(
+        tuple(translation.tolist()), (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
+    )
+    posed = body.tensors
+    assert posed.raydrop_logit is not None and base.raydrop_logit is not None
+
+    got = _eval_view_dependent_raydrop(
+        posed.means, sensor_world, posed.raydrop_logit, posed.raydrop_sh
+    )
+    want = _eval_view_dependent_raydrop(
+        base.means, sensor_object, base.raydrop_logit, base.raydrop_sh
+    )
+    torch.testing.assert_close(got, want, atol=1e-4, rtol=0)
+
+    # And the unrotated bands really would have been wrong — otherwise this
+    # test would pass for a no-op implementation.
+    unrotated = apply_rigid_transform(base, body.position, body.rotation)
+    assert unrotated.raydrop_logit is not None
+    wrong = _eval_view_dependent_raydrop(
+        unrotated.means, sensor_world, unrotated.raydrop_logit, unrotated.raydrop_sh
+    )
+    assert float((wrong - want).abs().max()) > 0.5
+
+
+def test_a_posed_actor_shades_the_way_its_object_frame_asset_does() -> None:
+    """The same invariant for colour SH, evaluated along the camera ray."""
+    import gsplat
+
+    n = 24
+    base = _tensors_with_sh(n=n)
+    yaw, rot, translation, eye_world, eye_object = _object_frame_ray_setup(-41.0)
+
+    body = RigidBody(base, device=CPU, rotate_sh=True)
+    body.set_pose(
+        tuple(translation.tolist()), (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
+    )
+    posed = body.tensors
+
+    got = gsplat.spherical_harmonics(3, posed.means - eye_world, posed.colors)
+    want = gsplat.spherical_harmonics(3, base.means - eye_object, base.colors)
+    torch.testing.assert_close(got, want, atol=1e-4, rtol=0)

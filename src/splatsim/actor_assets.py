@@ -11,7 +11,11 @@ bounding box, metric scale — in the same NGSP v4 SPZ container the background
 chunks use, carrying the same optional per-Gaussian LiDAR extension record. So
 an actor's Gaussians go through :func:`~splatsim._conversions.cloud_to_tensors`
 and :func:`~splatsim._conversions.attach_lidar_attrs` exactly like a chunk
-does; nothing about an actor is a special kind of Gaussian.
+does; nothing about an actor is a special kind of Gaussian. That holds on the
+LiDAR path too: intensity, raydrop and the participation mask reach the LiDAR
+renderer through the same fields a background chunk uses, and posing an actor
+re-expresses its view-dependent ``raydrop_sh`` in the world frame the same way
+it does its colour SH.
 
 Poses come from outside
 -----------------------

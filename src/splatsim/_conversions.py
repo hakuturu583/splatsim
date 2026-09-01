@@ -228,10 +228,12 @@ MAX_SH_DEGREE = 3
 #: longer a faithful re-expression of the bands (see :func:`rotate_sh_about_z`).
 MAX_NON_YAW_RAD = 0.035  # ~2 degrees
 
-#: ``{(coefs, device, dtype): (order, partner, sign)}`` — see
+#: ``{(coefs, device, dtype, dc_offset): (order, partner, sign)}`` — see
 #: :func:`_sh_yaw_mixing_tables`. Keyed on everything the tables depend on, so a
 #: scene's actors share one set no matter how many instances are posed per frame.
-_SH_TABLE_CACHE: dict[tuple[int, str, torch.dtype], tuple[Tensor, Tensor, Tensor]] = {}
+_SH_TABLE_CACHE: dict[
+    tuple[int, str, torch.dtype, int], tuple[Tensor, Tensor, Tensor]
+] = {}
 
 
 def yaw_from_quat(rotation: Tensor) -> Tensor:
@@ -261,16 +263,21 @@ def tilt_from_quat(rotation: Tensor) -> Tensor:
 
 
 def _sh_yaw_mixing_tables(
-    coefs: int, device: torch.device, dtype: torch.dtype
+    coefs: int, device: torch.device, dtype: torch.dtype, dc_offset: int
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Per-coefficient ``(order, partner index, sine sign)`` for a ``+Z`` rotation.
 
     Rotating real SH about the polar axis mixes only the ``(m, -m)`` pair
     within each band, so the whole rotation is one gather plus one blend once
-    these three tables are known. They depend on nothing but the coefficient
-    count, so they are built once per ``(coefs, device)`` and cached.
+    these three tables are known.
+
+    ``dc_offset`` is ``1`` when band 0 occupies index 0 (the colour layout) and
+    ``0`` when the DC term is stored outside the array (the raydrop layout,
+    whose band-0 value lives in the scalar ``raydrop_logit``). Everything else
+    about the two layouts is identical, which is why one table builder serves
+    both.
     """
-    key = (coefs, str(device), dtype)
+    key = (coefs, str(device), dtype, dc_offset)
     cached = _SH_TABLE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -278,7 +285,7 @@ def _sh_yaw_mixing_tables(
     partner = list(range(coefs))  # the (m, -m) partner; self when m == 0
     sign = [0.0] * coefs  # +1 on the m > 0 slot, -1 on the m < 0 slot
     for degree in range(1, MAX_SH_DEGREE + 1):
-        base = degree * degree  # +1 for the DC slot vs 3dgs_io's DC-less layout
+        base = degree * degree - 1 + dc_offset
         if base + 2 * degree >= coefs:
             break
         for m in range(1, degree + 1):
@@ -287,7 +294,7 @@ def _sh_yaw_mixing_tables(
             partner[i_pos], partner[i_neg] = i_neg, i_pos
             sign[i_pos], sign[i_neg] = 1.0, -1.0
     tables = (
-        # In the colours' own dtype: a float32 table would quietly round a
+        # In the coefficients' own dtype: a float32 table would quietly round a
         # float64 rotation down to single precision.
         torch.tensor(order, device=device, dtype=dtype),
         torch.tensor(partner, device=device, dtype=torch.long),
@@ -295,6 +302,26 @@ def _sh_yaw_mixing_tables(
     )
     _SH_TABLE_CACHE[key] = tables
     return tables
+
+
+def _rotate_sh_bands(coeffs: Tensor, yaw: Tensor, *, dc_offset: int) -> Tensor:
+    """Mix each ``(m, -m)`` pair of ``coeffs`` for a ``+Z`` rotation by ``yaw``.
+
+    Accepts the two coefficient layouts splatsim carries — ``[N, K, 3]`` colour
+    bands and ``[N, K]`` scalar raydrop bands — since the rotation touches the
+    band axis only.
+    """
+    order, partner, sign = _sh_yaw_mixing_tables(
+        coeffs.shape[1], coeffs.device, coeffs.dtype, dc_offset
+    )
+    angle = order * yaw
+    cos_m = torch.cos(angle)
+    sin_m = torch.sin(angle) * sign
+    if coeffs.dim() == 3:
+        return (
+            coeffs * cos_m[None, :, None] + coeffs[:, partner, :] * sin_m[None, :, None]
+        )
+    return coeffs * cos_m[None, :] + coeffs[:, partner] * sin_m[None, :]
 
 
 def rotate_sh_about_z(colors: Tensor, yaw: Tensor) -> Tensor:
@@ -319,13 +346,29 @@ def rotate_sh_about_z(colors: Tensor, yaw: Tensor) -> Tensor:
         raise ValueError(
             f"rotate_sh_about_z expects [N, K, 3] colors, got {tuple(colors.shape)}"
         )
-    order, partner, sign = _sh_yaw_mixing_tables(
-        colors.shape[1], colors.device, colors.dtype
-    )
-    angle = order * yaw
-    cos_m = torch.cos(angle).unsqueeze(0).unsqueeze(-1)  # [1, K, 1]
-    sin_m = (torch.sin(angle) * sign).unsqueeze(0).unsqueeze(-1)
-    return colors * cos_m + colors[:, partner, :] * sin_m
+    return _rotate_sh_bands(colors, yaw, dc_offset=1)
+
+
+def rotate_raydrop_sh_about_z(raydrop_sh: Tensor, yaw: Tensor) -> Tensor:
+    """Rotate view-dependent raydrop bands about ``+Z`` by ``yaw``.
+
+    ``raydrop_sh`` is ``[N, (degree + 1)**2 - 1]``: a single scalar channel
+    holding bands ``1..degree`` only, because the band-0 term lives in the
+    scalar ``raydrop_logit`` (which is rotation-invariant and needs nothing).
+    Same closed form as :func:`rotate_sh_about_z`, one index shift apart.
+
+    The LiDAR renderer evaluates these along the world-space sensor-to-Gaussian
+    ray, exactly as gsplat evaluates colour SH along the camera ray. So a posed
+    actor's bands have to be re-expressed in the world frame for the same reason
+    its colours do — otherwise the drop probability of a car facing east is
+    sampled with the angular pattern it had facing north.
+    """
+    if raydrop_sh.dim() != 2:
+        raise ValueError(
+            "rotate_raydrop_sh_about_z expects [N, K] bands, got "
+            f"{tuple(raydrop_sh.shape)}"
+        )
+    return _rotate_sh_bands(raydrop_sh, yaw, dc_offset=0)
 
 
 def apply_rigid_transform(
@@ -341,12 +384,15 @@ def apply_rigid_transform(
         tensors: Base Gaussian tensors to transform.
         position: [3] world-space translation.
         rotation: [4] wxyz quaternion for orientation.
-        rotate_sh: Re-express the view-dependent colour SH in the world frame.
-            Off by default so existing rigid bodies keep their behaviour;
+        rotate_sh: Re-express the view-dependent bands — colour SH *and*
+            ``raydrop_sh`` — in the world frame. Off by default so existing
+            rigid bodies keep their behaviour;
             :class:`~splatsim.actor_assets.ActorAssetLibrary` turns it on,
-            because a dynamic actor's heading changes every frame and leaving
-            its specular bands in the object frame makes highlights spin with
-            the car. Only the yaw component is applied (see
+            because a dynamic actor's heading changes every frame: leaving its
+            specular bands in the object frame makes highlights spin with the
+            car, and leaving its raydrop bands there samples the drop
+            probability of a car facing east with the pattern it had facing
+            north. Only the yaw component is applied (see
             :func:`rotate_sh_about_z`); a pose tilted more than
             :data:`MAX_NON_YAW_RAD` out of the ground plane is reported by
             :meth:`~splatsim.rigid_body.RigidBody.sh_rotation_tilt` rather than
@@ -364,8 +410,26 @@ def apply_rigid_transform(
     new_quats = quat_multiply(rotation, tensors.quats)
 
     colors = tensors.colors
-    if rotate_sh and tensors.sh_degree > 0 and colors.dim() == 3:
-        colors = rotate_sh_about_z(colors, yaw_from_quat(rotation))
+    raydrop_sh = tensors.raydrop_sh
+    # The colour bands and the raydrop bands are the same kind of quantity —
+    # a per-Gaussian angular pattern evaluated along a world-space ray — so
+    # they rotate together, off one yaw. `raydrop_sh` is independent of
+    # `sh_degree`: an RGB-mode asset can still carry view-dependent raydrop.
+    rotates_colors = rotate_sh and tensors.sh_degree > 0 and colors.dim() == 3
+    rotates_raydrop = rotate_sh and raydrop_sh is not None
+    if rotates_colors or rotates_raydrop:
+        # NEGATIVE yaw. The rotators re-express coefficients so that
+        # ``f_out(d) == f_in(R_z(angle) @ d)``; instancing needs the world-frame
+        # bands to answer for the object frame, ``f_world(d) == f_object(R^-1 d)``
+        # — the inverse. (3dgs_io's extract_actor_asset goes the other way,
+        # world -> object, and passes +yaw.) Easy to get backwards, and only a
+        # test that evaluates the bands along a real ray catches it.
+        yaw = -yaw_from_quat(rotation)
+        if rotates_colors:
+            colors = rotate_sh_about_z(colors, yaw)
+        if rotates_raydrop:
+            assert raydrop_sh is not None  # noqa: S101 - implied by rotates_raydrop
+            raydrop_sh = rotate_raydrop_sh_about_z(raydrop_sh, yaw)
 
     return GaussianTensors(
         means=new_means,
@@ -377,9 +441,5 @@ def apply_rigid_transform(
         intensity_raw=tensors.intensity_raw,
         raydrop_logit=tensors.raydrop_logit,
         lidar_mask=tensors.lidar_mask,
-        # Raydrop SH is evaluated by the LiDAR renderer at the sensor-ray
-        # direction; it would need the same yaw rotation as `colors` to be
-        # correct for a posed actor. Left unrotated for now — the LiDAR path
-        # does not yet consume actor assets.
-        raydrop_sh=tensors.raydrop_sh,
+        raydrop_sh=raydrop_sh,
     )
