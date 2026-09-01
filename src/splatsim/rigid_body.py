@@ -14,7 +14,7 @@ from splatsim._conversions import (
     GaussianTensors,
     apply_rigid_transform,
     cloud_to_tensors,
-    yaw_from_quat,
+    tilt_from_quat,
 )
 from splatsim.lod import LodIndex, LodManager
 
@@ -24,50 +24,28 @@ class RigidBody:
 
     def __init__(
         self,
-        source: str | Path,
+        source: str | Path | GaussianTensors,
         *,
         device: torch.device = torch.device("cuda"),
         use_sh: bool = False,
         lod_manager: LodManager | None = None,
         rotate_sh: bool = False,
     ) -> None:
-        self._init_from_tensors(
-            cloud_to_tensors(_load_cloud(source), device, use_sh=use_sh),
-            device=device,
-            lod_manager=lod_manager,
-            rotate_sh=rotate_sh,
-        )
+        """Load a rigid body from a file, or wrap tensors already on the device.
 
-    @classmethod
-    def from_tensors(
-        cls,
-        base_tensors: GaussianTensors,
-        *,
-        device: torch.device,
-        lod_manager: LodManager | None = None,
-        rotate_sh: bool = False,
-    ) -> RigidBody:
-        """Build a rigid body from tensors that are already on the device.
-
-        Used by :class:`~splatsim.actor_assets.ActorAssetLibrary`, whose
-        Gaussians arrive from a scene bundle's asset bank rather than a
-        standalone file — and whose base tensors are shared between every
-        instance spawned from the same asset.
+        Passing :class:`~splatsim._conversions.GaussianTensors` is how
+        :class:`~splatsim.actor_assets.ActorAssetLibrary` spawns instances: the
+        Gaussians come from a scene bundle's asset bank rather than a
+        standalone file, and every instance of one asset shares them.
+        ``use_sh`` applies to the file path only — tensors arrive already
+        converted.
         """
-        body = cls.__new__(cls)
-        body._init_from_tensors(
-            base_tensors, device=device, lod_manager=lod_manager, rotate_sh=rotate_sh
+        base_tensors = (
+            source
+            if isinstance(source, GaussianTensors)
+            else cloud_to_tensors(_load_cloud(source), device, use_sh=use_sh)
         )
-        return body
 
-    def _init_from_tensors(
-        self,
-        base_tensors: GaussianTensors,
-        *,
-        device: torch.device,
-        lod_manager: LodManager | None,
-        rotate_sh: bool,
-    ) -> None:
         # LOD: sort base tensors by importance and store tier boundaries.
         self._lod_index: LodIndex | None = None
         if lod_manager is not None:
@@ -113,42 +91,46 @@ class RigidBody:
         return self._base_tensors
 
     @property
-    def rotate_sh(self) -> bool:
-        """Whether posing this body also re-expresses its colour SH in world.
-
-        See :func:`splatsim._conversions.apply_rigid_transform`.
-        """
-        return self._rotate_sh
-
-    @property
     def sh_rotation_tilt(self) -> float:
         """Radians this body's pose departs from a pure yaw.
 
         Colour SH is re-expressed by rotating about ``+Z`` only, which is exact
-        for the yaw-only poses road vehicles have. A caller that poses a body
-        far off the ground plane can read this to know the view-dependent
-        colour is approximate; ``0.0`` when :attr:`rotate_sh` is off, since
-        nothing is being approximated.
+        for the yaw-only poses road vehicles have; past
+        :data:`~splatsim._conversions.MAX_NON_YAW_RAD` the view-dependent
+        colour is an approximation. ``0.0`` when the body does not rotate its
+        SH at all, since nothing is being approximated.
+
+        Reads a device scalar back to the host, so treat it as a setup-time or
+        assertion-time check rather than something to poll every frame.
         """
         if not self._rotate_sh:
             return 0.0
-        _yaw, tilt = yaw_from_quat(self.rotation)
-        return float(tilt)
+        return float(tilt_from_quat(self.rotation))
 
     @property
     def sh_rotation_is_exact(self) -> bool:
         """True while the current pose is within :data:`MAX_NON_YAW_RAD` of a yaw."""
         return self.sh_rotation_tilt <= MAX_NON_YAW_RAD
 
-    @property
-    def tensors(self) -> GaussianTensors:
-        """Return transformed tensors with current pose applied."""
+    def posed(self, base: GaussianTensors | None = None) -> GaussianTensors:
+        """Apply this body's current pose to ``base`` (default: its own tensors).
+
+        The one place a body's transform is spelled out. ``base`` lets a caller
+        that has already thinned the Gaussians — the LOD gather in
+        :meth:`splatsim.scene.Scene.collect_tensors` — pose the subset without
+        having to re-derive how this body wants to be transformed.
+        """
         return apply_rigid_transform(
-            self._base_tensors,
+            self._base_tensors if base is None else base,
             self.position,
             self.rotation,
             rotate_sh=self._rotate_sh,
         )
+
+    @property
+    def tensors(self) -> GaussianTensors:
+        """Return transformed tensors with current pose applied."""
+        return self.posed()
 
     @property
     def lod_index(self) -> LodIndex | None:

@@ -131,6 +131,52 @@ def cloud_to_tensors(
     )
 
 
+def attach_lidar_attrs(
+    tensors: GaussianTensors,
+    attrs: dict[str, np.ndarray],
+    num_points: int,
+    device: torch.device,
+    *,
+    source: str,
+) -> None:
+    """Move a decoded LiDAR attribute dict onto a cloud's tensors.
+
+    Shared by the two readers that produce Gaussians from a scene bundle —
+    background chunks (:mod:`splatsim._usdz`) and rigid actor assets
+    (:mod:`splatsim.actor_assets`) — because an actor's per-Gaussian LiDAR
+    attributes are the same payload a chunk's are. ``source`` labels the
+    payload in error messages.
+    """
+    intensity = attrs.get("lidar_intensity_raw")
+    raydrop = attrs.get("lidar_raydrop_logit")
+    if intensity is None or raydrop is None:
+        raise ValueError(f"{source}: incomplete LiDAR attributes")
+    if len(intensity) != num_points or len(raydrop) != num_points:
+        raise ValueError(f"{source}: LiDAR attribute count does not match")
+    tensors.intensity_raw = torch.from_numpy(intensity).to(device)
+    tensors.raydrop_logit = torch.from_numpy(raydrop).to(device)
+    # Optional per-Gaussian LiDAR participation mask (3dgs_io >= v1.1.0).
+    # Absent for old 2-channel payloads → leave None (all Gaussians
+    # participate). Stored {0.0, 1.0} floats; threshold to a bool tensor on
+    # the render device.
+    mask = attrs.get("lidar_mask")
+    if mask is not None:
+        if len(mask) != num_points:
+            raise ValueError(f"{source}: LiDAR attribute count does not match")
+        tensors.lidar_mask = torch.as_tensor(mask, device=device) > 0.5
+    # Optional view-dependent (SH) raydrop bands (3dgs_io >= v1.2.0,
+    # version-2 payload). Shape (num_points, (deg+1)**2 - 1): the
+    # higher-order bands only; the DC term is in lidar_raydrop_logit.
+    # Absent for version-1 payloads → leave None (scalar raydrop).
+    raydrop_sh = attrs.get("raydrop_sh")
+    if raydrop_sh is not None:
+        if raydrop_sh.shape[0] != num_points:
+            raise ValueError(f"{source}: LiDAR attribute count does not match")
+        tensors.raydrop_sh = torch.from_numpy(np.ascontiguousarray(raydrop_sh)).to(
+            device
+        )
+
+
 def quat_to_rotation_matrix(q: Tensor) -> Tensor:
     """Convert a (w,x,y,z) quaternion to a 3x3 rotation matrix.
 
@@ -182,22 +228,73 @@ MAX_SH_DEGREE = 3
 #: longer a faithful re-expression of the bands (see :func:`rotate_sh_about_z`).
 MAX_NON_YAW_RAD = 0.035  # ~2 degrees
 
+#: ``{(coefs, device, dtype): (order, partner, sign)}`` — see
+#: :func:`_sh_yaw_mixing_tables`. Keyed on everything the tables depend on, so a
+#: scene's actors share one set no matter how many instances are posed per frame.
+_SH_TABLE_CACHE: dict[tuple[int, str, torch.dtype], tuple[Tensor, Tensor, Tensor]] = {}
 
-def yaw_from_quat(rotation: Tensor) -> tuple[Tensor, Tensor]:
-    """Split a wxyz quaternion into its ``+Z`` yaw and the residual tilt.
 
-    Returns ``(yaw, tilt)`` where ``yaw`` is the rotation about ``+Z`` and
-    ``tilt`` is the largest remaining out-of-plane angle, i.e. how far the
-    orientation departs from a pure yaw. Both are 0-dim tensors on the input's
-    device so callers stay on-device.
+def yaw_from_quat(rotation: Tensor) -> Tensor:
+    """The ``+Z`` heading of a wxyz quaternion, as a 0-dim tensor on its device.
+
+    This is a *body* heading — zero along ``+X``, the frame every scene-bundle
+    pose uses. Not to be confused with the viewer yaw in
+    :mod:`splatsim.viewer` / :mod:`splatsim._usdz`, which is measured off a
+    camera forward vector with zero along ``-Y``.
+
+    Read straight off the quaternion rather than through
+    :func:`quat_to_rotation_matrix`: this sits on the per-frame transform path
+    and only two matrix entries are wanted.
     """
-    rot = quat_to_rotation_matrix(rotation)  # [3, 3]
-    # Heading is where the body's +X points once projected onto the ground
-    # plane; the tilt is how far the body's own +Z has left world +Z, which is
-    # zero for a pure yaw and pi for an upside-down body.
-    yaw = torch.atan2(rot[1, 0], rot[0, 0])
-    tilt = torch.acos(rot[2, 2].clamp(-1.0, 1.0))
-    return yaw, tilt
+    _w, x, y, z = rotation.unbind()
+    return torch.atan2(2.0 * (x * y + _w * z), 1.0 - 2.0 * (y * y + z * z))
+
+
+def tilt_from_quat(rotation: Tensor) -> Tensor:
+    """How far a wxyz quaternion departs from a pure ``+Z`` yaw, in radians.
+
+    The angle between the body's own ``+Z`` and world ``+Z``: zero for a pure
+    yaw, ``pi`` for an upside-down body. 0-dim tensor on the input's device.
+    """
+    _w, x, y, _z = rotation.unbind()
+    return torch.acos((1.0 - 2.0 * (x * x + y * y)).clamp(-1.0, 1.0))
+
+
+def _sh_yaw_mixing_tables(
+    coefs: int, device: torch.device, dtype: torch.dtype
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Per-coefficient ``(order, partner index, sine sign)`` for a ``+Z`` rotation.
+
+    Rotating real SH about the polar axis mixes only the ``(m, -m)`` pair
+    within each band, so the whole rotation is one gather plus one blend once
+    these three tables are known. They depend on nothing but the coefficient
+    count, so they are built once per ``(coefs, device)`` and cached.
+    """
+    key = (coefs, str(device), dtype)
+    cached = _SH_TABLE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    order = [0] * coefs  # |m| per coefficient; 0 leaves the coefficient alone
+    partner = list(range(coefs))  # the (m, -m) partner; self when m == 0
+    sign = [0.0] * coefs  # +1 on the m > 0 slot, -1 on the m < 0 slot
+    for degree in range(1, MAX_SH_DEGREE + 1):
+        base = degree * degree  # +1 for the DC slot vs 3dgs_io's DC-less layout
+        if base + 2 * degree >= coefs:
+            break
+        for m in range(1, degree + 1):
+            i_pos, i_neg = base + degree + m, base + degree - m
+            order[i_pos] = order[i_neg] = m
+            partner[i_pos], partner[i_neg] = i_neg, i_pos
+            sign[i_pos], sign[i_neg] = 1.0, -1.0
+    tables = (
+        # In the colours' own dtype: a float32 table would quietly round a
+        # float64 rotation down to single precision.
+        torch.tensor(order, device=device, dtype=dtype),
+        torch.tensor(partner, device=device, dtype=torch.long),
+        torch.tensor(sign, device=device, dtype=dtype),
+    )
+    _SH_TABLE_CACHE[key] = tables
+    return tables
 
 
 def rotate_sh_about_z(colors: Tensor, yaw: Tensor) -> Tensor:
@@ -213,27 +310,22 @@ def rotate_sh_about_z(colors: Tensor, yaw: Tensor) -> Tensor:
     returned coefficients evaluate at direction ``d`` to what the input
     evaluated at ``R_z(yaw) @ d``, which is exactly what instancing an
     object-local asset through a world pose needs.
+
+    Runs on the per-frame transform path, so it is a whole-tensor blend rather
+    than a loop over bands: ``cos`` is ``1`` and ``sin`` is ``0`` on the DC and
+    ``m == 0`` slots, which leaves them untouched for free.
     """
     if colors.dim() != 3:
         raise ValueError(
             f"rotate_sh_about_z expects [N, K, 3] colors, got {tuple(colors.shape)}"
         )
-    out = colors.clone()
-    coefs = colors.shape[1] - 1  # bands 1.. (index 0 is DC, invariant)
-    for degree in range(1, MAX_SH_DEGREE + 1):
-        base = degree * degree  # +1 for the DC slot vs the 3dgs_io indexing
-        if base + 2 * degree > coefs:
-            break
-        for m in range(1, degree + 1):
-            angle = m * yaw
-            cos_m, sin_m = torch.cos(angle), torch.sin(angle)
-            i_pos = base + degree + m
-            i_neg = base + degree - m
-            c_pos = colors[:, i_pos, :]
-            c_neg = colors[:, i_neg, :]
-            out[:, i_pos, :] = c_pos * cos_m + c_neg * sin_m
-            out[:, i_neg, :] = -c_pos * sin_m + c_neg * cos_m
-    return out
+    order, partner, sign = _sh_yaw_mixing_tables(
+        colors.shape[1], colors.device, colors.dtype
+    )
+    angle = order * yaw
+    cos_m = torch.cos(angle).unsqueeze(0).unsqueeze(-1)  # [1, K, 1]
+    sin_m = (torch.sin(angle) * sign).unsqueeze(0).unsqueeze(-1)
+    return colors * cos_m + colors[:, partner, :] * sin_m
 
 
 def apply_rigid_transform(
@@ -273,8 +365,7 @@ def apply_rigid_transform(
 
     colors = tensors.colors
     if rotate_sh and tensors.sh_degree > 0 and colors.dim() == 3:
-        yaw, _tilt = yaw_from_quat(rotation)
-        colors = rotate_sh_about_z(colors, yaw)
+        colors = rotate_sh_about_z(colors, yaw_from_quat(rotation))
 
     return GaussianTensors(
         means=new_means,

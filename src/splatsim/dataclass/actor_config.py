@@ -28,7 +28,7 @@ class ActorConfig:
     world_position: bool = True
 
     def __post_init__(self) -> None:
-        if not self.asset_id:
-            raise ValueError("ActorConfig.asset_id must not be empty")
+        # An unknown or empty asset_id is reported by ActorAssetLibrary with the
+        # available ids listed, which beats anything this could say.
         if not self.name:
             self.name = self.asset_id

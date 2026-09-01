@@ -9,11 +9,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from splatsim._conversions import (
-    GaussianTensors,
-    apply_rigid_transform,
-    quat_to_rotation_matrix,
-)
+from splatsim._conversions import GaussianTensors, quat_to_rotation_matrix
 from splatsim.actor_assets import ActorAssetLibrary
 from splatsim.background import Background
 from splatsim.dataclass import SceneConfig
@@ -214,9 +210,7 @@ class Scene:
                     lidar_view=lidar_view,
                     max_distance=lod_max_distance,
                 )
-                tensors = apply_rigid_transform(
-                    base, rb.position, rb.rotation, rotate_sh=rb.rotate_sh
-                )
+                tensors = rb.posed(base)
             else:
                 tensors = rb.tensors
             result.append(tensors)
@@ -277,18 +271,10 @@ class Scene:
                     centroid=background.tile_local_centroid,
                 )
 
-        actor_library: ActorAssetLibrary | None = None
-        if config.actors:
-            if background is None or config.background_usdz is None:
-                raise ValueError(
-                    "scene config lists actors but has no background_usdz to "
-                    "load the actor asset bank from"
-                )
-            actor_library = ActorAssetLibrary(
-                config.background_usdz,
-                device=device,
-                use_sh=config.use_sh,
-                lod_manager=lod_manager,
+        if config.actors and background is None:
+            raise ValueError(
+                "scene config lists actors but has no background_usdz to load "
+                "the actor asset bank from"
             )
 
         rigid_bodies: dict[str, RigidBody] = {}
@@ -307,30 +293,29 @@ class Scene:
             if rb.lod_index is not None:
                 _log_lod_tiers(rb_cfg.name, rb.lod_index)
 
+        scene = Scene(
+            background=background,
+            rigid_bodies=rigid_bodies,
+            lod_manager=lod_manager,
+            ppisp_tables=ppisp_tables,
+        )
+
+        # Configured actors go through the same entry point a scenario uses, so
+        # the bank is loaded once, on first spawn, and the name-collision rule
+        # has one definition.
         for actor_cfg in config.actors:
-            if actor_cfg.name in rigid_bodies:
-                raise ValueError(
-                    f"actor {actor_cfg.name!r} collides with an existing rigid "
-                    "body name; give it a distinct `name`"
-                )
-            assert actor_library is not None  # noqa: S101 - guarded above
-            rigid_bodies[actor_cfg.name] = actor_library.spawn(
+            scene.spawn_actor(
                 actor_cfg.asset_id,
+                actor_cfg.name,
                 position=actor_cfg.position,
                 rotation=actor_cfg.rotation,
-                background=background if actor_cfg.world_position else None,
+                world_position=actor_cfg.world_position,
             )
             step += 1
             if progress is not None:
                 progress(step, total, actor_cfg.name)
 
-        return Scene(
-            background=background,
-            rigid_bodies=rigid_bodies,
-            lod_manager=lod_manager,
-            ppisp_tables=ppisp_tables,
-            actor_library=actor_library,
-        )
+        return scene
 
 
 def _log_lod_tiers(name: str, lod_index: LodIndex) -> None:

@@ -10,7 +10,7 @@ Each asset is a Gaussian cloud authored in the canonical object-local frame —
 bounding box, metric scale — in the same NGSP v4 SPZ container the background
 chunks use, carrying the same optional per-Gaussian LiDAR extension record. So
 an actor's Gaussians go through :func:`~splatsim._conversions.cloud_to_tensors`
-and :func:`~splatsim._usdz._attach_lidar_attrs` exactly like a background chunk
+and :func:`~splatsim._conversions.attach_lidar_attrs` exactly like a chunk
 does; nothing about an actor is a special kind of Gaussian.
 
 Poses come from outside
@@ -44,13 +44,18 @@ import json
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol
 
 import torch
 from torch import Tensor
 
-from splatsim._conversions import GaussianTensors, cloud_to_tensors
-from splatsim._usdz import _attach_lidar_attrs, read_scene_json
+from splatsim._conversions import (
+    GaussianTensors,
+    attach_lidar_attrs,
+    cloud_to_tensors,
+)
+from splatsim._geometry import quat_xyzw_to_wxyz
+from splatsim._usdz import read_scene_json
 from splatsim.lod import LodManager
 from splatsim.rigid_body import RigidBody
 
@@ -61,7 +66,6 @@ _decode_actor_asset = _3dgs_io.decode_actor_asset
 ACTOR_ASSETS_SCENE_KEY = "actor_assets"
 
 
-@runtime_checkable
 class TileLocalFrame(Protocol):
     """Anything that knows the scene's tile-local recentring offset.
 
@@ -86,7 +90,6 @@ class ActorAssetInfo:
     n_points: int
     sh_degree: int
     has_lidar_attributes: bool
-    metadata: dict[str, Any]
 
 
 def world_to_tile_local(
@@ -123,7 +126,7 @@ def pose_from_track_frame(
     Accepts anything with ``translation`` and ``rotation`` attributes.
     """
     tx, ty, tz = (float(v) for v in frame.translation)
-    qx, qy, qz, qw = (float(v) for v in frame.rotation)
+    qw, qx, qy, qz = quat_xyzw_to_wxyz(frame.rotation)
     return (tx, ty, tz), (qw, qx, qy, qz)
 
 
@@ -165,8 +168,12 @@ class ActorAssetLibrary:
                 cloud, attrs = _decode_actor_asset(asset, zf.read(str(asset.uri)))
                 tensors = cloud_to_tensors(cloud, device, use_sh=use_sh)
                 if attrs:
-                    _attach_lidar_attrs(
-                        tensors, attrs, cloud.num_points, device, path, str(asset.uri)
+                    attach_lidar_attrs(
+                        tensors,
+                        attrs,
+                        cloud.num_points,
+                        device,
+                        source=f"{path}: {asset.uri}",
                     )
                 self._base[asset.asset_id] = tensors
                 self._infos[asset.asset_id] = ActorAssetInfo(
@@ -178,7 +185,6 @@ class ActorAssetLibrary:
                     n_points=int(asset.n_points),
                     sh_degree=int(asset.sh_degree),
                     has_lidar_attributes=asset.ext_attributes is not None,
-                    metadata=dict(asset.metadata),
                 )
         for instance in bank.instances:
             self._bound_tracks.setdefault(instance.asset_id, []).append(
@@ -186,12 +192,6 @@ class ActorAssetLibrary:
             )
 
     # --- inspection ----------------------------------------------------------
-
-    def __contains__(self, asset_id: str) -> bool:
-        return asset_id in self._base
-
-    def __len__(self) -> int:
-        return len(self._base)
 
     @property
     def asset_ids(self) -> list[str]:
@@ -238,7 +238,7 @@ class ActorAssetLibrary:
         :func:`splatsim._conversions.apply_rigid_transform`.
         """
         self._require(asset_id)
-        body = RigidBody.from_tensors(
+        body = RigidBody(
             self._base[asset_id],
             device=self._device,
             lod_manager=self._lod_manager,
@@ -258,12 +258,3 @@ class ActorAssetLibrary:
                 f"{self._path}: no actor asset {asset_id!r}; "
                 f"available: {sorted(self._base)}"
             )
-
-
-def has_actor_assets(source_path: str | Path) -> bool:
-    """True when a scene USDZ carries an actor asset bank."""
-    try:
-        meta = read_scene_json(source_path)
-    except (ValueError, KeyError, zipfile.BadZipFile):
-        return False
-    return bool((meta.get("extras") or {}).get(ACTOR_ASSETS_SCENE_KEY))

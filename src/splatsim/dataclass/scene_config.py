@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from splatsim._geometry import quat_xyzw_to_wxyz
 from splatsim.dataclass.actor_config import ActorConfig
 from splatsim.dataclass.lod_config import LodConfig
 from splatsim.dataclass.lidar_config import LidarConfig
@@ -26,7 +27,7 @@ def _lidar_sensors_from_rigs(rigs) -> list[LidarConfig]:
         for cal in getattr(rig, "lidars", None) or []:
             ext = cal.extrinsics
             tx, ty, tz = (float(v) for v in ext.translation)
-            qx, qy, qz, qw = (float(v) for v in ext.rotation)  # xyzw
+            qw, qx, qy, qz = quat_xyzw_to_wxyz(ext.rotation)
             model = getattr(cal, "lidar_model", None)
             params = dict(model.parameters) if model is not None else {}
             elevation = params.get("elevation_deg")

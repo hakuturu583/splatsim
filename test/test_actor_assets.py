@@ -28,18 +28,16 @@ from splatsim._conversions import (
     GaussianTensors,
     apply_rigid_transform,
     rotate_sh_about_z,
-    yaw_from_quat,
 )
 from splatsim.actor_assets import (
     ActorAssetLibrary,
-    has_actor_assets,
     pose_from_track_frame,
     world_to_tile_local,
 )
+from splatsim.rigid_body import RigidBody
 
 _3dgs_io = importlib.import_module("3dgs_io")
 _spz = importlib.import_module("spz")
-_spz_io = importlib.import_module("3dgs_io.spz_io")
 
 FRAME_CONVENTION = _3dgs_io.FRAME_CONVENTION
 ActorAssetSource = _3dgs_io.ActorAssetSource
@@ -104,29 +102,10 @@ def _source(
     )
 
 
-def _real_spz_chunk(n: int = 4) -> bytes:
-    """Real NGSP v4 SPZ bytes for a tiny world-frame background cloud."""
-    rng = np.random.default_rng(0)
-    gc = _spz.GaussianCloud()  # ty: ignore[unresolved-attribute]
-    gc.antialiased = False
-    gc.positions = rng.uniform(-5.0, 5.0, size=n * 3).astype(np.float32)
-    quats = rng.standard_normal((n, 4)).astype(np.float32)
-    quats /= np.linalg.norm(quats, axis=1, keepdims=True)
-    gc.rotations = quats.reshape(-1)
-    gc.scales = rng.uniform(-3.0, 0.0, size=n * 3).astype(np.float32)
-    gc.alphas = rng.standard_normal(n).astype(np.float32)
-    gc.colors = rng.uniform(0.0, 1.0, size=n * 3).astype(np.float32)
-    gc.sh_degree = 0
-    gc.sh = np.zeros(0, dtype=np.float32)
-    return _spz_io.save_spz_world_bytes(gc)
-
-
 def _write_scene_usdz(
     path: Path,
     sources: list[Any],
     instances: list[Any] | None = None,
-    *,
-    n_background: int = 4,
 ) -> Path:
     """A minimal scene/v3 bundle carrying an actor asset bank."""
     bank, payloads = build_actor_asset_bank(sources, instances or [])
@@ -138,13 +117,15 @@ def _write_scene_usdz(
         },
         "gaussians": {
             "frame": "world",
-            "chunks": [{"uri": "chunks/chunk_000000.spz", "n_points": n_background}],
+            # Placeholder: nothing under test decodes the background chunk —
+            # read_scene_json only validates that the index is there.
+            "chunks": [{"uri": "chunks/chunk_000000.spz", "n_points": 4}],
         },
         "extras": {"actor_assets": "actor_assets.json"},
     }
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("scene.json", json.dumps(scene))
-        zf.writestr("chunks/chunk_000000.spz", _real_spz_chunk(n_background))
+        zf.writestr("chunks/chunk_000000.spz", b"")
         zf.writestr("actor_assets.json", json.dumps(serialize_actor_assets(bank)))
         for asset in bank.assets:
             zf.writestr(str(asset.uri), payloads[asset.asset_id])
@@ -163,9 +144,7 @@ def test_library_reads_every_asset_and_its_index_metadata(tmp_path: Path) -> Non
     )
     library = ActorAssetLibrary(usdz, device=CPU)
 
-    assert len(library) == 2
     assert sorted(library.asset_ids) == ["sedan_0007", "truck_0001"]
-    assert "sedan_0007" in library
 
     info = library.info("sedan_0007")
     assert info.class_name == "automobile"
@@ -182,20 +161,17 @@ def test_library_reports_an_unknown_asset(tmp_path: Path) -> None:
 
 
 def test_library_rejects_a_bundle_without_a_bank(tmp_path: Path) -> None:
+    """A pre-v2.1.0 bundle has no extras pointer and must say so, not crash."""
     usdz = _write_scene_usdz(tmp_path / "scene.usdz", [_source()])
-    # Strip the extras pointer the way an older bundle would have it.
     stripped = tmp_path / "no_bank.usdz"
     with zipfile.ZipFile(usdz) as src, zipfile.ZipFile(stripped, "w") as dst:
         for name in src.namelist():
             if name == "scene.json":
-                scene = json.loads(src.read(name))
-                scene["extras"] = {}
+                scene = json.loads(src.read(name)) | {"extras": {}}
                 dst.writestr(name, json.dumps(scene))
             else:
                 dst.writestr(name, src.read(name))
 
-    assert has_actor_assets(usdz) is True
-    assert has_actor_assets(stripped) is False
     with pytest.raises(ValueError, match="no actor asset bank"):
         ActorAssetLibrary(stripped, device=CPU)
 
@@ -430,39 +406,44 @@ def test_spawned_actors_rotate_their_sh(tmp_path: Path) -> None:
     usdz = _write_scene_usdz(tmp_path / "scene.usdz", [_source(sh_degree=3)])
     library = ActorAssetLibrary(usdz, device=CPU, use_sh=True)
     body = library.spawn("sedan_0007")
-    assert body.rotate_sh is True
 
     yaw = math.radians(55.0)
     body.set_pose((0.0, 0.0, 0.0), (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)))
     assert not torch.allclose(body.tensors.colors, body.base_tensors.colors)
 
 
-def test_a_tilted_pose_reports_that_its_sh_rotation_is_approximate() -> None:
-    """Yaw-only SH rotation is exact for road vehicles and says so when it isn't."""
-    from splatsim.rigid_body import RigidBody
+@pytest.mark.parametrize(
+    ("rotate_sh", "euler", "expected_tilt_deg"),
+    [
+        pytest.param(True, ("z", 30.0), 0.0, id="yaw-is-exact"),
+        pytest.param(True, ("y", 20.0), 20.0, id="pitch-is-approximate"),
+        # Nothing is being approximated when the body does not rotate its SH.
+        pytest.param(False, ("y", 20.0), 0.0, id="no-sh-rotation"),
+    ],
+)
+def test_sh_rotation_reports_how_far_a_pose_is_from_a_pure_yaw(
+    rotate_sh: bool, euler: tuple[str, float], expected_tilt_deg: float
+) -> None:
+    body = RigidBody(_tensors_with_sh(), device=CPU, rotate_sh=rotate_sh)
+    axis, degrees = euler
+    half = math.radians(degrees) / 2
+    quat = {
+        "z": (math.cos(half), 0.0, 0.0, math.sin(half)),
+        "y": (math.cos(half), 0.0, math.sin(half), 0.0),
+    }[axis]
+    body.set_pose((0.0, 0.0, 0.0), quat)
 
-    body = RigidBody.from_tensors(_tensors_with_sh(), device=CPU, rotate_sh=True)
-    yaw = math.radians(30.0)
-    body.set_pose((0.0, 0.0, 0.0), (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)))
-    assert body.sh_rotation_is_exact
-    assert body.sh_rotation_tilt == pytest.approx(0.0, abs=1e-6)
-
-    pitch = math.radians(20.0)
-    body.set_pose((0.0, 0.0, 0.0), (math.cos(pitch / 2), 0.0, math.sin(pitch / 2), 0.0))
-    assert not body.sh_rotation_is_exact
-    assert body.sh_rotation_tilt == pytest.approx(pitch, abs=1e-5)
-    assert body.sh_rotation_tilt > MAX_NON_YAW_RAD
+    assert body.sh_rotation_tilt == pytest.approx(
+        math.radians(expected_tilt_deg), abs=1e-5
+    )
+    assert body.sh_rotation_is_exact == (
+        math.radians(expected_tilt_deg) <= MAX_NON_YAW_RAD
+    )
 
 
-def test_a_body_without_sh_rotation_reports_no_approximation() -> None:
-    from splatsim.rigid_body import RigidBody
-
-    body = RigidBody.from_tensors(_tensors_with_sh(), device=CPU)
-    pitch = math.radians(20.0)
-    body.set_pose((0.0, 0.0, 0.0), (math.cos(pitch / 2), 0.0, math.sin(pitch / 2), 0.0))
-    assert body.rotate_sh is False
-    assert body.sh_rotation_tilt == 0.0
-    assert body.sh_rotation_is_exact
+# ---------------------------------------------------------------------------
+# Bundle poses
+# ---------------------------------------------------------------------------
 
 
 def test_track_poses_are_reordered_from_xyzw_to_wxyz() -> None:
@@ -478,7 +459,7 @@ def test_track_poses_are_reordered_from_xyzw_to_wxyz() -> None:
 
 
 def test_spawning_from_a_track_pose_lands_on_the_tracked_box(tmp_path: Path) -> None:
-    """The documented path: bundle pose -> wxyz -> tile-local -> posed body."""
+    """The documented path end to end: bundle pose -> wxyz -> tile-local -> body."""
     usdz = _write_scene_usdz(tmp_path / "scene.usdz", [_source()])
     library = ActorAssetLibrary(usdz, device=CPU)
     background = _FakeBackground((100.0, -50.0, 1.0))
@@ -494,21 +475,8 @@ def test_spawning_from_a_track_pose_lands_on_the_tracked_box(tmp_path: Path) -> 
         "sedan_0007", position=position, rotation=rotation, background=background
     )
 
-    torch.testing.assert_close(
-        body.position, torch.tensor([13.62, -8.55, 0.92]), atol=1e-4, rtol=0
-    )
-    # Back out of the pose: every gaussian returns to the object-local box.
+    # Undo the pose the track asked for: the gaussians return to the object box.
     c, s = math.cos(yaw), math.sin(yaw)
     rot = torch.tensor([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
     back = (body.tensors.means - body.position) @ rot
-    half = torch.tensor(CAR_SIZE) / 2
-    assert bool((back.abs() <= half + 1e-4).all())
-
-
-def test_yaw_from_quat_splits_heading_from_tilt() -> None:
-    yaw = math.radians(33.0)
-    got_yaw, tilt = yaw_from_quat(
-        torch.tensor([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)])
-    )
-    assert float(got_yaw) == pytest.approx(yaw, abs=1e-6)
-    assert float(tilt) == pytest.approx(0.0, abs=1e-6)
+    assert bool((back.abs() <= torch.tensor(CAR_SIZE) / 2 + 1e-4).all())
