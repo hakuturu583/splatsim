@@ -16,8 +16,8 @@ build-constraints = [{ name = "torch", specifier = ">=2.7,<2.8", index = "https:
 
 [[package]]
 name = "3dgs-io"
-version = "1.2.0"
-source = { git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v1.2.0#e14c03f8900ca35a61b3af4cdacf211741660338" }
+version = "2.0.1"
+source = { git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v2.0.1#ffe97234a0c45b75ebdd8518a068d47ed76fa33d" }
 dependencies = [
     { name = "numpy", marker = "sys_platform == 'linux'" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' and sys_platform == 'linux'" },
@@ -1998,7 +1998,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v1.2.0" },
+    { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v2.0.1" },
     { name = "cyclonedds", marker = "extra == 'dds'", specifier = ">=11.0.1" },
     { name = "grpcio", specifier = ">=1.60.0" },
     { name = "grpcio-tools", specifier = ">=1.60.0" },
@@ -2038,7 +2038,7 @@ dev = [
 [[package]]
 name = "spz"
 version = "1.1.0"
-source = { git = "https://github.com/nianticlabs/spz.git?rev=v2.1.0#2cf0be04d86b5f9632d9073ccbbe3b1e6a609f31" }
+source = { git = "https://github.com/nianticlabs/spz.git?rev=v3.0.0#5bf2945de1a003cee07133b1e495fe9c6ffdc7e7" }
 dependencies = [
     { name = "numpy", marker = "sys_platform == 'linux'" },
 ]
