@@ -192,19 +192,41 @@ include = ["launch/**"]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
 
-# scenarios also imports ament_index_python (ROS 2 only, not pip-installable).
+# scenarios also imports ament_index_python (ROS 2 only, not pip-installable)
+# and autoware_carla_scenario, whose sensor-config dataclasses it constructs by
+# keyword — invisible base classes, so the same unknown-argument cascade as the
+# carla_integration block below.
 [[tool.ty.overrides]]
 include = ["src/scenarios/**"]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
+unknown-argument = "ignore"
 
 # Generated protobuf/gRPC stubs are produced at build time and gitignored,
 # so they are absent during CI type-checking. This also covers tests that
 # import those stubs (e.g. test_grpc_lod.py's rendering_service_pb2 import).
 [[tool.ty.overrides]]
-include = ["src/splatsim/grpc_service/**", "test/test_grpc_lod.py"]
+include = [
+    "src/splatsim/grpc_service/**",
+    "test/test_grpc_lod.py",
+    "test/test_grpc_pose_stream.py",
+]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
+
+# The CARLA integration imports `carla` and `autoware_carla_scenario`, neither of
+# which is pip-installable, so the whole subtree is unresolvable in CI. Beyond the
+# imports themselves this hides base classes: SplatSimLidarSensorConfig is a
+# dataclass deriving from autoware_carla_scenario's LidarSensorConfig, so ty
+# synthesises __init__ from the visible fields only and reports every inherited
+# field as an unknown argument. The same blindness makes the module's existing
+# suppressions look unused.
+[[tool.ty.overrides]]
+include = ["src/splatsim/carla_integration/**"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+unknown-argument = "ignore"
+unused-ignore-comment = "ignore"
 
 # The LiDAR eval script depends on the optional `eval` extra (t4-devkit,
 # rerun-sdk), which is not installed in the default/CI environment.

@@ -20,8 +20,11 @@ def test_pose_buffer_get_earliest() -> None:
     assert buf.get_earliest() is None
     for t in (10, 20, 30):
         buf.append(TimestampedPose(t, (float(t), 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)))
-    assert buf.get_earliest().time_ns == 10
-    assert buf.get_latest().time_ns == 30
+    earliest = buf.get_earliest()
+    latest = buf.get_latest()
+    assert earliest is not None and latest is not None
+    assert earliest.time_ns == 10
+    assert latest.time_ns == 30
 
 
 def test_sweep_time_ns() -> None:
