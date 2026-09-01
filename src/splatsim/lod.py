@@ -247,11 +247,25 @@ class LodManager:
             )  # [C]
 
         # 2. Tier selection per cell
+        #
+        # Gate each tier on the cell's NEAREST point (center distance minus the
+        # cell's half-diagonal), not its center. Octree leaves are density-
+        # adaptive, so a sparse region can stay one large cell (radius tens of
+        # metres). Using the center distance made a large cell the sensor was
+        # standing at the EDGE of read as "far" and drop to a coarser tier, then
+        # snap to the fine tier the instant the moving ego crossed far enough
+        # that the center fell under the threshold -- a step change in Gaussian
+        # count (e.g. tier0 1.0 -> tier1 0.5 is a 2x density jump) right at the
+        # cell boundary. The nearest-point convention matches the whole-cell
+        # max-range cull below and removes that boundary pop.
         max_d = lod_index.tier_max_distances_t  # [T]
+        near_dists = (dists - lod_index.cell_radius).clamp_min(0.0)  # [C]
         tier_idx = (
-            (dists.unsqueeze(1) <= max_d.unsqueeze(0)).to(torch.int64).argmax(dim=1)
+            (near_dists.unsqueeze(1) <= max_d.unsqueeze(0))
+            .to(torch.int64)
+            .argmax(dim=1)
         )  # [C]
-        exceeds_all = dists > max_d[-1]
+        exceeds_all = near_dists > max_d[-1]
         tier_idx[exceeds_all] = len(lod_index.tier_max_distances) - 1
 
         # 3. Per-cell selected counts
