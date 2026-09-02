@@ -7,13 +7,15 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Sequence
 
 import grpc
 import torch
 
 from cyclonedds.domain import DomainParticipant
 
+from splatsim._conversions import GaussianTensors
+from splatsim.actor_assets import world_to_tile_local
 from splatsim.background import Background
 from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
 from splatsim.cyclonedds.msg_types import Time
@@ -38,6 +40,7 @@ from splatsim.lidar_renderer import (
     render_lidars_concurrent,
 )
 from splatsim.renderer import Renderer, render_cameras_concurrent
+from splatsim.rigid_body import RigidBody
 from splatsim.scene import Scene
 
 logger = logging.getLogger(__name__)
@@ -164,6 +167,21 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         self._rig_frame_rate: float = 10.0
         self._rig_render_count: int = 0
 
+        # Dynamic objects ("actors"): rigid Gaussian bodies placed by
+        # SpawnActor and driven per frame by the `actors` field of the pose
+        # streams. Only the servicer-side bookkeeping lives here; the bodies
+        # themselves are in the Scene, alongside the background.
+        self._use_sh: bool = False
+        # Per instance: True when its poses arrive in the bundle's ENU world
+        # frame and must have the scene origin subtracted (see SpawnActor).
+        self._actor_world_frame: dict[str, bool] = {}
+        # Gaussians of standalone object files, keyed by (path, use_sh), so
+        # spawning the same file repeatedly costs one upload.
+        self._actor_file_assets: dict[tuple[str, bool], GaussianTensors] = {}
+        # Instance ids seen in a pose stream but never spawned; kept so the
+        # warning is logged once instead of every frame.
+        self._unknown_actor_ids: set[str] = set()
+
     def _warmup(self, what: str, render_once: Callable[[], object]) -> None:
         """Render one throwaway frame so CUDA module loads / kernel JIT happen
         here instead of stalling the first streamed pose (measured ~320 ms of
@@ -213,6 +231,12 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 self._scene = Scene(background=background, lod_manager=lod_manager)
                 if request.HasField("enable_lod"):
                     self._scene.lod_enabled = request.enable_lod
+                # A new scene means new bodies: nothing spawned against the
+                # previous one survives, so drop its bookkeeping too.
+                self._use_sh = request.use_sh
+                self._actor_world_frame.clear()
+                self._actor_file_assets.clear()
+                self._unknown_actor_ids.clear()
                 logger.info(
                     "Scene loaded: %d Gaussians (LoD %s)",
                     background.num_gaussians,
@@ -335,6 +359,270 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 message=message,
             )
 
+    # --- dynamic objects ("actors") ------------------------------------------
+
+    def ListActorAssets(
+        self,
+        request: pb2.ListActorAssetsRequest,
+        context: grpc.ServicerContext,
+    ) -> pb2.ListActorAssetsResponse:
+        """Report the rigid dynamic-object assets the loaded scene bundle ships.
+
+        The bank is read from the scene USDZ on first use, so a scene that
+        carries none answers with ``success=False`` and the reason rather than
+        an empty list that looks like a loaded-but-empty bank.
+        """
+        with self._lock:
+            scene = self._scene
+            if not self._initialized or scene is None:
+                return pb2.ListActorAssetsResponse(
+                    success=False,
+                    message="Scene not initialized. Call Initialize first.",
+                )
+            try:
+                library = scene.ensure_actor_library()
+            except Exception as exc:
+                logger.info("No actor asset bank available: %s", exc)
+                return pb2.ListActorAssetsResponse(success=False, message=str(exc))
+
+            assets = []
+            for asset_id in library.asset_ids:
+                info = library.info(asset_id)
+                dx, dy, dz = info.size
+                assets.append(
+                    pb2.ActorAssetInfo(
+                        asset_id=info.asset_id,
+                        class_name=info.class_name,
+                        size=pb2.Vector3(x=dx, y=dy, z=dz),
+                        n_points=info.n_points,
+                        sh_degree=info.sh_degree,
+                        has_lidar_attributes=info.has_lidar_attributes,
+                    )
+                )
+            return pb2.ListActorAssetsResponse(success=True, assets=assets)
+
+    def SpawnActor(
+        self,
+        request: pb2.SpawnActorRequest,
+        context: grpc.ServicerContext,
+    ) -> pb2.SpawnActorResponse:
+        """Place a dynamic object in the already-loaded scene.
+
+        The body joins the scene the render loop is already gathering, so it
+        shows up in the next frame of every stream — camera, LiDAR and rig
+        alike — and from then on its pose is whatever the streams' ``actors``
+        field last said (see :meth:`_apply_actor_poses`).
+
+        Gaussians come either from the bundle's own asset bank (``asset_id``)
+        or from a standalone object file on the server (``asset_path``), for
+        scenes whose bundle ships no bank. Either way instances of one asset
+        share a single upload.
+        """
+        with self._lock:
+            scene = self._scene
+            if not self._initialized or scene is None:
+                return pb2.SpawnActorResponse(
+                    success=False,
+                    message="Scene not initialized. Call Initialize first.",
+                )
+            name = request.instance_id
+            if not name:
+                return pb2.SpawnActorResponse(
+                    success=False, message="instance_id is required"
+                )
+            if name in scene:
+                return pb2.SpawnActorResponse(
+                    success=False,
+                    message=f"a rigid body named {name!r} is already in the scene",
+                )
+            if request.world_frame and scene.background is None:
+                return pb2.SpawnActorResponse(
+                    success=False,
+                    message=(
+                        "world_frame needs a scene background to take the "
+                        "tile-local origin from"
+                    ),
+                )
+
+            # Registered before the pose is read: _actor_pose_from_msg looks it
+            # up to decide whether to subtract the scene origin.
+            self._actor_world_frame[name] = request.world_frame
+            try:
+                position, rotation = (
+                    self._actor_pose_from_msg(request.pose, name)
+                    if request.HasField("pose")
+                    else (None, None)
+                )
+                if request.asset_path:
+                    body = self._rigid_body_from_path(request.asset_path)
+                elif request.asset_id:
+                    body = scene.ensure_actor_library().spawn(
+                        request.asset_id,
+                        # background=None: _actor_pose_from_msg has already
+                        # done the tile-local conversion, if any was wanted.
+                        background=None,
+                    )
+                else:
+                    raise ValueError("either asset_id or asset_path is required")
+                if position is not None or rotation is not None:
+                    body.set_pose(
+                        body.position if position is None else position, rotation
+                    )
+                mismatch = self._actor_pack_error(body)
+                if mismatch is not None:
+                    raise ValueError(mismatch)
+                scene.add_rigid_body(name, body)
+            except Exception as exc:
+                self._actor_world_frame.pop(name, None)
+                logger.exception("SpawnActor(%s) failed", name)
+                return pb2.SpawnActorResponse(success=False, message=str(exc))
+
+            # A previously unknown id may now be spawned; let it warn again if
+            # it is removed and referenced later.
+            self._unknown_actor_ids.discard(name)
+            logger.info(
+                "Spawned actor %r (%s, %d Gaussians, %s frame)",
+                name,
+                request.asset_path or request.asset_id,
+                body.num_gaussians,
+                "world" if request.world_frame else "tile-local",
+            )
+            return pb2.SpawnActorResponse(success=True, n_gaussians=body.num_gaussians)
+
+    def RemoveActor(
+        self,
+        request: pb2.RemoveActorRequest,
+        context: grpc.ServicerContext,
+    ) -> pb2.RemoveActorResponse:
+        """Take a spawned dynamic object out of the scene.
+
+        It disappears from the next rendered frame; its asset stays cached, so
+        spawning it again does not re-upload the Gaussians.
+        """
+        with self._lock:
+            scene = self._scene
+            if not self._initialized or scene is None:
+                return pb2.RemoveActorResponse(
+                    success=False,
+                    message="Scene not initialized. Call Initialize first.",
+                )
+            name = request.instance_id
+            if name not in scene:
+                return pb2.RemoveActorResponse(
+                    success=False,
+                    message=f"no rigid body named {name!r} in the scene",
+                )
+            scene.remove_rigid_body(name)
+            self._actor_world_frame.pop(name, None)
+            logger.info("Removed actor %r", name)
+            return pb2.RemoveActorResponse(success=True)
+
+    def _rigid_body_from_path(self, asset_path: str) -> RigidBody:
+        """Instantiate a standalone Gaussian object file as a rigid body.
+
+        The file's Gaussians are read once per ``(path, use_sh)`` and shared by
+        every instance spawned from it, the way the bundle's asset bank shares
+        its own — fifty copies of one vehicle cost one upload and fifty poses.
+        Colour SH is re-expressed on every pose, as it is for bank actors: a
+        dynamic object changes heading, and leaving the specular bands in the
+        object frame spins the highlights with it.
+        """
+        device = self._device or torch.device("cuda")
+        key = (asset_path, self._use_sh)
+        base = self._actor_file_assets.get(key)
+        if base is None:
+            base = RigidBody(
+                asset_path, device=device, use_sh=self._use_sh
+            ).base_tensors
+            self._actor_file_assets[key] = base
+        return RigidBody(
+            base,
+            device=device,
+            lod_manager=self._scene.lod_manager if self._scene else None,
+            rotate_sh=True,
+        )
+
+    def _actor_pack_error(self, body: RigidBody) -> str | None:
+        """Why *body* could not be rendered next to the background, if so.
+
+        A gather concatenates the colour block of every source in the scene, so
+        a body whose colours are shaped differently from the background's — an
+        SH asset in a scene loaded without SH, or two different SH degrees —
+        aborts the render thread on the next frame. Spawning is the last moment
+        a client is still listening, so the mismatch is reported here instead
+        of taking the stream down later.
+        """
+        scene = self._scene
+        if scene is None or scene.background is None:
+            return None
+        background = scene.background.tensors.colors
+        actor = body.base_tensors.colors
+        if background.shape[1:] == actor.shape[1:]:
+            return None
+        return (
+            f"actor colours {tuple(actor.shape[1:])} do not match the scene's "
+            f"{tuple(background.shape[1:])} (scene loaded with "
+            f"use_sh={self._use_sh}); the two cannot be rendered together"
+        )
+
+    def _actor_pose_from_msg(
+        self, pose: pb2.Pose, instance_id: str
+    ) -> tuple[
+        tuple[float, float, float] | torch.Tensor,
+        tuple[float, float, float, float] | None,
+    ]:
+        """Convert a wire pose into the ``(position, rotation)`` a body takes.
+
+        Two proto3 details are handled here. The position is moved into the
+        renderer's tile-local frame when this instance was spawned with
+        ``world_frame`` — the same recentring
+        :func:`splatsim.actor_assets.world_to_tile_local` does for scenario
+        code. And an all-zero quaternion, which is what a client that fills in
+        only a position sends, is not a rotation at all: it means "keep the
+        one you have" rather than collapsing the body.
+        """
+        p, r = pose.position, pose.rotation
+        position: tuple[float, float, float] | torch.Tensor = (p.x, p.y, p.z)
+        scene = self._scene
+        if (
+            self._actor_world_frame.get(instance_id)
+            and scene is not None
+            and scene.background is not None
+        ):
+            position = world_to_tile_local(position, scene.background)
+        rotation = (r.w, r.x, r.y, r.z)
+        return position, None if rotation == (0.0, 0.0, 0.0, 0.0) else rotation
+
+    def _apply_actor_poses(self, actors: Sequence[pb2.ActorPose]) -> None:
+        """Move spawned dynamic objects to the poses a stream message carried.
+
+        Called from the render thread immediately before a frame is rendered,
+        so the actors a frame shows are the ones its own pose message
+        described — and, on a rig, every sensor sees them at the same instant.
+
+        A pose for an instance that was never spawned is ignored (warned about
+        once per id): a stale entry in a client's actor list must not kill a
+        running stream.
+        """
+        scene = self._scene
+        if scene is None:
+            return
+        for actor in actors:
+            body = scene.rigid_bodies.get(actor.instance_id)
+            if body is None:
+                if actor.instance_id not in self._unknown_actor_ids:
+                    self._unknown_actor_ids.add(actor.instance_id)
+                    logger.warning(
+                        "Ignoring pose for actor %r: not spawned", actor.instance_id
+                    )
+                continue
+            if not actor.HasField("pose"):
+                continue
+            position, rotation = self._actor_pose_from_msg(
+                actor.pose, actor.instance_id
+            )
+            body.set_pose(position, rotation)
+
     def StreamCameraData(
         self,
         request_iterator: Iterator[pb2.CameraData],
@@ -389,6 +677,11 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         real spinning LiDAR, whose cloud stamped at ``t`` was swept over
         ``[t - sweep, t]``. ``None`` keeps the static single-pose behaviour.
 
+        Dynamic objects ride along on the same messages: whatever ``actors``
+        the newest message carried is applied to the scene by the render
+        thread just before it renders, so a frame's actors and its sensor pose
+        come from the same message.
+
         ``sector_hooks`` switches the render thread to SECTOR STREAMING (see
         :func:`_lidar_sector_count`): instead of one whole-sweep render per
         frame, revolutions are pinned to the pose timeline and each azimuth
@@ -403,6 +696,11 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         render_failed = threading.Event()
         frames_rendered = 0
         poses_received = 0
+        # Actor poses from the newest message, read by the render thread. The
+        # reader swaps in a whole new tuple per message and the render thread
+        # only ever reads the reference, so this needs no lock; a message
+        # without actors leaves the previous poses standing.
+        latest_actors: tuple[pb2.ActorPose, ...] = ()
 
         frame_period_s = 1.0 / frame_rate
 
@@ -451,6 +749,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                             latest.position[2],
                         )
 
+                    self._apply_actor_poses(latest_actors)
                     render_and_publish(latest, render_time_ns, sweep_start)
                     frames_rendered += 1
                     pose_buffer.trim_before(render_time_ns)
@@ -528,6 +827,11 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                         end = _pose_at(sector_end_ns)
                         if start is None or end is None:
                             break
+                        if k == 0:
+                            # The rig-wide Gaussian gather happens on sector 0
+                            # and is reused for the rest of the revolution, so
+                            # actors move once per revolution, not per sector.
+                            self._apply_actor_poses(latest_actors)
                         outputs.append(sector_hooks.render_sector(start, end, k, state))
                         k += 1
                         if k == n_sectors:
@@ -570,6 +874,12 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 )
                 pose_buffer.append(pose)
                 poses_received += 1
+                # getattr, not data.actors: a stamp and a pose are all this
+                # loop requires of a message, and the sector-streaming tests
+                # drive it with stand-ins that carry nothing else.
+                actors = getattr(data, "actors", None)
+                if actors:
+                    latest_actors = tuple(actors)
 
                 if poses_received <= 3 or poses_received % 100 == 0:
                     logger.info(

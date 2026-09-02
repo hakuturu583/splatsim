@@ -72,8 +72,30 @@ class Scene:
         """The background bundle's rigid actor assets, if it ships any.
 
         ``None`` until something loads it — :meth:`from_config` does so when
-        the config lists actors, and :meth:`spawn_actor` on demand.
+        the config lists actors, and :meth:`ensure_actor_library` (which
+        :meth:`spawn_actor` goes through) on demand.
         """
+        return self._actor_library
+
+    def ensure_actor_library(self) -> ActorAssetLibrary:
+        """Return the bundle's actor asset bank, loading it on first use.
+
+        :meth:`spawn_actor` goes through here; so does anything that only wants
+        to *look* at what the bundle ships (the gRPC ``ListActorAssets``
+        handler) without spawning anything. Raises when there is no background
+        USDZ to read a bank from, or when that bundle carries none.
+        """
+        if self._actor_library is None:
+            if self.background is None:
+                raise ValueError(
+                    "no actor asset bank loaded and no background USDZ to load one from"
+                )
+            self._actor_library = ActorAssetLibrary(
+                self.background.source_path,
+                device=self.background.tile_local_centroid.device,
+                use_sh=self.background.use_sh,
+                lod_manager=self._lod_manager,
+            )
         return self._actor_library
 
     def spawn_actor(
@@ -94,18 +116,7 @@ class Scene:
         """
         if name in self._rigid_bodies:
             raise ValueError(f"a rigid body named {name!r} is already in the scene")
-        if self._actor_library is None:
-            if self.background is None:
-                raise ValueError(
-                    "no actor asset bank loaded and no background USDZ to load one from"
-                )
-            self._actor_library = ActorAssetLibrary(
-                self.background.source_path,
-                device=self.background.tile_local_centroid.device,
-                use_sh=self.background.use_sh,
-                lod_manager=self._lod_manager,
-            )
-        body = self._actor_library.spawn(
+        body = self.ensure_actor_library().spawn(
             asset_id,
             position=position,
             rotation=rotation,
@@ -191,7 +202,11 @@ class Scene:
                 tensors = self.background.tensors
             result.append(tensors)
 
-        for rb in self._rigid_bodies.values():
+        # Snapshot: the gRPC service spawns and removes dynamic objects
+        # from its request-handler threads while the render thread is in
+        # here, and mutating the dict mid-iteration would raise. A body
+        # added during a gather simply lands in the next frame.
+        for rb in list(self._rigid_bodies.values()):
             if can_filter and rb.lod_index is not None:
                 assert self._lod_manager is not None  # noqa: S101
                 assert camera_position is not None  # noqa: S101

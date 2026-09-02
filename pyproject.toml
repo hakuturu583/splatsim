@@ -218,6 +218,7 @@ include = [
     "src/splatsim/grpc_service/**",
     "test/test_grpc_lod.py",
     "test/test_grpc_pose_stream.py",
+    "test/test_grpc_actors.py",
 ]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"

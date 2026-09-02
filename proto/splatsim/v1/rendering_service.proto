@@ -85,6 +85,9 @@ message InitializeResponse {
 message CameraData {
   Timestamp stamp = 1;
   Pose pose = 2;
+  // Poses for dynamic objects spawned with SpawnActor, applied to the scene
+  // just before this frame is rendered. See ActorPose.
+  repeated ActorPose actors = 3;
 }
 
 message StreamSummary {
@@ -168,6 +171,10 @@ message RigData {
   // base_link → world pose. Every registered LiDAR and camera is rendered
   // from this single pose via its own extrinsic.
   Pose pose = 2;
+  // Poses for dynamic objects spawned with SpawnActor, applied to the scene
+  // just before this frame is rendered — so every sensor on the rig sees the
+  // actors at the same instant. See ActorPose.
+  repeated ActorPose actors = 3;
 }
 
 message RigSummary {
@@ -182,6 +189,9 @@ message LidarData {
   // base_link → world pose (position + wxyz quaternion). The server applies
   // the sensor→base extrinsic from InitializeLidar internally.
   Pose pose = 2;
+  // Poses for dynamic objects spawned with SpawnActor, applied to the scene
+  // just before this frame is rendered. See ActorPose.
+  repeated ActorPose actors = 3;
 }
 
 // ── Level-of-Detail control ──────────────────────────────────────────
@@ -197,6 +207,78 @@ message SetLodResponse {
   // index was pre-computed for the scene (nothing to filter).
   bool enabled = 2;
   string message = 3;
+}
+
+// ── Dynamic objects (actors) ─────────────────────────────────────────
+
+// Where an actor's poses are expressed.
+//
+// Background re-centres a scene on its own Gaussian centroid, so the
+// renderer's frame ("tile-local") is the bundle's ENU world frame minus the
+// centroid reported as InitializeResponse.scene_origin. Camera / LiDAR / rig
+// poses are streamed tile-local, so actors default to the same frame; set
+// world_frame on SpawnActor to hand the server raw ENU world coordinates
+// instead and have it subtract the origin. The choice is fixed per instance
+// at spawn time and applies to every ActorPose that follows.
+
+message ActorAssetInfo {
+  string asset_id = 1;
+  string class_name = 2;
+  Vector3 size = 3;      // declared box (dx, dy, dz) in metres, object frame
+  uint32 n_points = 4;
+  uint32 sh_degree = 5;
+  bool has_lidar_attributes = 6;
+}
+
+message ListActorAssetsRequest {}
+
+message ListActorAssetsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated ActorAssetInfo assets = 3;
+}
+
+message SpawnActorRequest {
+  // Instance name, unique within the scene. This is the id ActorPose updates
+  // and RemoveActor refer to.
+  string instance_id = 1;
+  // Asset from the loaded scene's actor bank (see ListActorAssets). Ignored
+  // when asset_path is set.
+  string asset_id = 2;
+  // Server-side path to a standalone Gaussian object (.spz / .ply / .glb /
+  // .gltf), for scenes whose bundle ships no actor bank. Takes precedence
+  // over asset_id. Loaded once per path: further instances share the upload.
+  string asset_path = 3;
+  // Initial pose. An unset pose spawns at the origin with identity rotation;
+  // an all-zero quaternion keeps the identity rotation.
+  Pose pose = 4;
+  // Interpret this instance's poses (this one and every streamed ActorPose)
+  // as ENU world coordinates rather than tile-local ones.
+  bool world_frame = 5;
+}
+
+message SpawnActorResponse {
+  bool success = 1;
+  string message = 2;
+  uint32 n_gaussians = 3;
+}
+
+message RemoveActorRequest {
+  string instance_id = 1;
+}
+
+message RemoveActorResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ActorPose {
+  // Instance name given to SpawnActor. An unknown id is ignored (logged once)
+  // rather than failing the stream.
+  string instance_id = 1;
+  // Position in the frame chosen at spawn; rotation is a wxyz quaternion. An
+  // all-zero quaternion keeps the actor's current rotation.
+  Pose pose = 2;
 }
 
 // ── Service definition ───────────────────────────────────────────────
@@ -230,4 +312,14 @@ service RenderingService {
   // Toggle Level-of-Detail filtering on the already-loaded scene at runtime.
   // Requires Initialize to have been called first.
   rpc SetLod(SetLodRequest) returns (SetLodResponse);
+
+  // List the rigid dynamic-object assets the loaded scene bundle ships.
+  rpc ListActorAssets(ListActorAssetsRequest) returns (ListActorAssetsResponse);
+
+  // Place a dynamic object in the already-loaded scene. Its pose is then
+  // driven per frame through the `actors` field of the pose streams above.
+  rpc SpawnActor(SpawnActorRequest) returns (SpawnActorResponse);
+
+  // Remove a previously spawned dynamic object from the scene.
+  rpc RemoveActor(RemoveActorRequest) returns (RemoveActorResponse);
 }
