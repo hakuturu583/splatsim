@@ -62,10 +62,47 @@ class Scene:
 
     @property
     def rigid_body_list(self) -> list[RigidBody]:
+        """The bodies in the scene, as a snapshot.
+
+        Gathers and the viewer iterate this rather than the live dict, so a
+        body added or removed while one is running lands in the next frame
+        instead of raising mid-iteration.
+        """
         return list(self._rigid_bodies.values())
 
     def add_rigid_body(self, name: str, rigid_body: RigidBody) -> None:
+        """Add a body to the scene, refusing one a gather could not pack.
+
+        A gather concatenates the colour block of every source it collects
+        (see :func:`splatsim.renderer._pack`), so a body whose colours are
+        shaped differently from what the scene already holds — an SH object in
+        a scene loaded without SH, or two different SH degrees — would abort a
+        render thread mid-frame with a bare ``torch.cat`` error. Every spawn
+        path funnels through here, which makes this the one place to turn that
+        into something the caller can still act on.
+        """
+        mismatch = self._colors_mismatch(rigid_body)
+        if mismatch is not None:
+            raise ValueError(f"{name}: {mismatch}")
         self._rigid_bodies[name] = rigid_body
+
+    def _colors_mismatch(self, rigid_body: RigidBody) -> str | None:
+        """Why *rigid_body* could not be concatenated with this scene, if so."""
+        if self.background is not None:
+            held = self.background.tensors
+        elif self._rigid_bodies:
+            held = next(iter(self._rigid_bodies.values())).base_tensors
+        else:
+            return None
+        colors = rigid_body.base_tensors.colors
+        if held.colors.shape[1:] == colors.shape[1:]:
+            return None
+        return (
+            f"colours {tuple(colors.shape[1:])} (SH degree "
+            f"{rigid_body.base_tensors.sh_degree}) cannot be rendered together "
+            f"with the scene's {tuple(held.colors.shape[1:])} (SH degree "
+            f"{held.sh_degree})"
+        )
 
     @property
     def actor_library(self) -> ActorAssetLibrary | None:
@@ -122,7 +159,7 @@ class Scene:
             rotation=rotation,
             background=self.background if world_position else None,
         )
-        self._rigid_bodies[name] = body
+        self.add_rigid_body(name, body)
         return body
 
     def remove_rigid_body(self, name: str) -> RigidBody:
@@ -202,11 +239,7 @@ class Scene:
                 tensors = self.background.tensors
             result.append(tensors)
 
-        # Snapshot: the gRPC service spawns and removes dynamic objects
-        # from its request-handler threads while the render thread is in
-        # here, and mutating the dict mid-iteration would raise. A body
-        # added during a gather simply lands in the next frame.
-        for rb in list(self._rigid_bodies.values()):
+        for rb in self.rigid_body_list:  # a snapshot; see the property
             if can_filter and rb.lod_index is not None:
                 assert self._lod_manager is not None  # noqa: S101
                 assert camera_position is not None  # noqa: S101

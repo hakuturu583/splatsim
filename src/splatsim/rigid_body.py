@@ -29,6 +29,7 @@ class RigidBody:
         device: torch.device = torch.device("cuda"),
         use_sh: bool = False,
         lod_manager: LodManager | None = None,
+        lod_index: LodIndex | None = None,
         rotate_sh: bool = False,
     ) -> None:
         """Load a rigid body from a file, or wrap tensors already on the device.
@@ -39,7 +40,18 @@ class RigidBody:
         standalone file, and every instance of one asset shares them.
         ``use_sh`` applies to the file path only — tensors arrive already
         converted.
+
+        ``lod_manager`` sorts the Gaussians by importance and builds the tier
+        index, which REORDERS them: each instance that precomputes ends up
+        holding its own copy of the whole cloud. Pass ``lod_index`` instead
+        (with the already-sorted tensors ``precompute`` returned) to reuse one
+        instance's work and keep sharing the upload — the sort is pose- and
+        instance-independent, so one index is valid for every instance of an
+        asset. Passing both is an error.
         """
+        if lod_manager is not None and lod_index is not None:
+            raise ValueError("pass either lod_manager or lod_index, not both")
+
         base_tensors = (
             source
             if isinstance(source, GaussianTensors)
@@ -47,7 +59,7 @@ class RigidBody:
         )
 
         # LOD: sort base tensors by importance and store tier boundaries.
-        self._lod_index: LodIndex | None = None
+        self._lod_index: LodIndex | None = lod_index
         if lod_manager is not None:
             base_tensors, self._lod_index = lod_manager.precompute(base_tensors)
 

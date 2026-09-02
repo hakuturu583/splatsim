@@ -186,11 +186,12 @@ stub.StreamRigData(poses())
 ```
 
 `actors` rides on the pose messages of all three streams (`StreamCameraData`,
-`StreamLidarData`, `StreamRigData`) and is applied to the scene right before
-the frame is rendered, so a frame's objects and its ego pose come from the same
-message — and on a rig, every sensor sees the objects at one instant. Leaving
-`actors` out of a message keeps the previous poses, so a client may move objects
-at a lower rate than it streams poses.
+`StreamLidarData`, `StreamRigData`). The newest poses the stream has delivered
+are applied to the scene right before the frame is rendered — so a frame's
+objects are as fresh as its ego pose, and on a rig every sensor sees them at one
+instant. Leaving `actors` out of a message keeps the previous poses, so a client
+may move objects at a lower rate than it streams poses (the server then skips
+the update entirely rather than re-uploading unchanged poses).
 
 Two differences from the Python API, both because the wire is not the scenario:
 

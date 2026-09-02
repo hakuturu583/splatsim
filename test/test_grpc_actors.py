@@ -15,10 +15,10 @@ GPU and no scene bundle are needed to exercise the servicer's own logic.
 from __future__ import annotations
 
 import time
-from types import SimpleNamespace
 from typing import Any, cast
 
 import grpc
+import pytest
 import torch
 
 from splatsim._conversions import GaussianTensors
@@ -37,30 +37,29 @@ _CPU = torch.device("cpu")
 
 
 class _FakeBackground:
-    """The two attributes the servicer reads off a Background.
+    """The two attributes of a Background that the actor paths reach for.
 
     ``tile_local_centroid`` is what ``world_to_tile_local`` recentres against;
-    ``tensors.colors`` is what the spawn-time compatibility check compares an
-    actor's colour block with.
+    ``tensors`` is what ``Scene.add_rigid_body`` compares a new body's colour
+    block against.
     """
 
     def __init__(
-        self, centroid: tuple[float, float, float], colors: torch.Tensor | None = None
+        self, centroid: tuple[float, float, float], sh_degree: int = 0
     ) -> None:
         self.tile_local_centroid = torch.tensor(centroid, dtype=torch.float32)
-        self.tensors = SimpleNamespace(
-            colors=torch.zeros(2, 3) if colors is None else colors
-        )
+        self.tensors = _tensors(2, sh_degree=sh_degree)
 
 
-def _tensors(n: int = 4) -> GaussianTensors:
+def _tensors(n: int = 4, sh_degree: int = 0) -> GaussianTensors:
+    k = (sh_degree + 1) ** 2
     return GaussianTensors(
         means=torch.zeros(n, 3),
         quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * n),
         scales=torch.ones(n, 3),
         opacities=torch.ones(n),
-        colors=torch.rand(n, 3),
-        sh_degree=0,
+        colors=torch.rand(n, 3) if sh_degree == 0 else torch.rand(n, k, 3),
+        sh_degree=sh_degree,
     )
 
 
@@ -73,13 +72,17 @@ def _servicer_with_body(
     """A servicer holding a scene with one spawned body, ready to be posed."""
     servicer = RenderingServiceServicer()
     scene = Scene(background=None, lod_manager=LodManager(LodConfig()))
+    sh_degree = 0
     if background is not None:
         scene.background = cast(Any, background)
-    body = RigidBody(_tensors(), device=_CPU)
+        # Match the background, or the body would not be addable at all.
+        sh_degree = background.tensors.sh_degree
+    body = RigidBody(_tensors(sh_degree=sh_degree), device=_CPU)
     scene.add_rigid_body(name, body)
     servicer._scene = scene
     servicer._device = _CPU
     servicer._initialized = True
+    # What a successful SpawnActor would have recorded for this instance.
     servicer._actor_world_frame[name] = world_frame
     return servicer, body
 
@@ -195,21 +198,53 @@ def test_remove_actor_takes_the_body_out_of_the_scene() -> None:
     assert "no rigid body" in again.message
 
 
-def test_spawn_rejects_colours_the_scene_cannot_render_with() -> None:
+def test_scene_rejects_colours_it_cannot_gather_with() -> None:
     """A mismatched colour block would abort the render thread on the next
-    frame; the client hears about it while it is still listening."""
-    sh_background = _FakeBackground((0.0, 0.0, 0.0), colors=torch.zeros(2, 16, 3))
+    frame; the caller hears about it while it is still listening.
+
+    The check sits on ``add_rigid_body``, so SpawnActor's failure response and
+    the Python API's exception are the same rule seen from two sides.
+    """
+    sh_background = _FakeBackground((0.0, 0.0, 0.0), sh_degree=3)
     servicer, _ = _servicer_with_body(background=sh_background)
-    rgb_body = RigidBody(_tensors(), device=_CPU)
+    assert servicer._scene is not None
 
-    error = servicer._actor_pack_error(rgb_body)
-    assert error is not None
-    assert "use_sh" in error
+    with pytest.raises(ValueError, match="cannot be rendered together"):
+        servicer._scene.add_rigid_body("rgb_car", RigidBody(_tensors(), device=_CPU))
 
 
-def test_spawn_accepts_matching_colours() -> None:
+def test_scene_accepts_matching_colours() -> None:
     servicer, _ = _servicer_with_body(background=_FakeBackground((0.0, 0.0, 0.0)))
-    assert servicer._actor_pack_error(RigidBody(_tensors(), device=_CPU)) is None
+    assert servicer._scene is not None
+    servicer._scene.add_rigid_body("car_02", RigidBody(_tensors(), device=_CPU))
+    assert "car_02" in servicer._scene
+
+
+def test_instances_share_lod_sorted_tensors() -> None:
+    """What makes the file-asset cache worth having.
+
+    ``LodManager.precompute`` REORDERS the Gaussians, so a body that
+    precomputes holds its own copy of the whole cloud — 24 MB for a 100k-point
+    SH vehicle. Handing the sorted tensors and their index to the next instance
+    keeps every copy of one asset on a single upload.
+    """
+    manager = LodManager(LodConfig())
+    sorted_tensors, index = manager.precompute(_tensors(32))
+
+    first = RigidBody(sorted_tensors, device=_CPU, lod_index=index, rotate_sh=True)
+    second = RigidBody(sorted_tensors, device=_CPU, lod_index=index, rotate_sh=True)
+
+    assert first.base_tensors is sorted_tensors
+    assert second.base_tensors is first.base_tensors
+    assert second.lod_index is index
+
+
+def test_rigid_body_refuses_both_lod_inputs() -> None:
+    """Precomputing over a prebuilt index would silently discard the index."""
+    manager = LodManager(LodConfig())
+    _, index = manager.precompute(_tensors(8))
+    with pytest.raises(ValueError, match="not both"):
+        RigidBody(_tensors(), device=_CPU, lod_manager=manager, lod_index=index)
 
 
 # --- pose application -------------------------------------------------------
