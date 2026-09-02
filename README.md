@@ -155,6 +155,60 @@ helpers:
   splatsim pose is `wxyz`. Route bundle poses through
   `splatsim.actor_assets.pose_from_track_frame`.
 
+### Over gRPC
+
+The rendering service places and drives the same objects, so a client that
+already streams sensor poses does not need a second channel for the traffic
+around them:
+
+```python
+stub.Initialize(pb2.InitializeRequest(scene_path="scene.usdz", ...))
+
+# What the bundle ships
+for asset in stub.ListActorAssets(pb2.ListActorAssetsRequest()).assets:
+    print(asset.asset_id, asset.class_name, asset.size)
+
+stub.SpawnActor(pb2.SpawnActorRequest(
+    instance_id="car_01",
+    asset_id="sedan_0007",          # or asset_path="/data/sedan.spz"
+    pose=pb2.Pose(position=..., rotation=...),
+))
+
+def poses():
+    for stamp, ego, actors in scenario:
+        yield pb2.RigData(
+            stamp=stamp,
+            pose=ego,
+            actors=[pb2.ActorPose(instance_id="car_01", pose=actors["car_01"])],
+        )
+
+stub.StreamRigData(poses())
+```
+
+`actors` rides on the pose messages of all three streams (`StreamCameraData`,
+`StreamLidarData`, `StreamRigData`). The newest poses the stream has delivered
+are applied to the scene right before the frame is rendered — so a frame's
+objects are as fresh as its ego pose, and on a rig every sensor sees them at one
+instant. Leaving `actors` out of a message keeps the previous poses, so a client
+may move objects at a lower rate than it streams poses (the server then skips
+the update entirely rather than re-uploading unchanged poses).
+
+Two differences from the Python API, both because the wire is not the scenario:
+
+- **Frame.** Camera / LiDAR / rig poses are streamed tile-local, so actors
+  default to the same frame rather than to the world frame `spawn_actor` uses.
+  Set `world_frame` on `SpawnActor` to send ENU world coordinates and have the
+  server subtract the origin it reported in `InitializeResponse.scene_origin`;
+  the choice is fixed per instance and applies to every `ActorPose` after it.
+- **Zero quaternions.** proto3 has no unset scalar, so an all-zero `rotation`
+  means "keep the current one" rather than collapsing the object — fill it in
+  only when you mean to turn something.
+
+`SpawnActor` also takes an `asset_path` to a standalone `.spz` / `.ply` /
+`.glb`, for scenes whose bundle ships no bank; instances of one path share a
+single upload, as bank assets do. `RemoveActor` takes an object back out — it
+is gone from the next frame.
+
 ### View-dependent bands, camera and LiDAR
 
 Actors re-express **both** their view-dependent band sets when posed, unlike the
