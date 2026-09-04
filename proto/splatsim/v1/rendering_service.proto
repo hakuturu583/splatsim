@@ -70,6 +70,14 @@ message InitializeRequest {
   // so LoD can be toggled at runtime afterwards via SetLod regardless of
   // this initial value.
   optional bool enable_lod = 15;
+
+  // Optional anchor RGB frame for image-conditioned world-model backends
+  // (e.g. the OmniDreams / Cosmos-Dreams video world model), encoded as PNG or
+  // JPEG bytes. Such backends need one real frame to seed the scene appearance
+  // before autoregressive generation. This is the ONLY protocol extension over
+  // the shared RenderingService contract; the 3D Gaussian Splatting backend
+  // renders from geometry alone and ignores this field, so it stays optional.
+  optional bytes initial_image = 16;
 }
 
 message InitializeResponse {

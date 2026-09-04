@@ -166,6 +166,7 @@ dev = [
 [project.scripts]
 splatsim-viewer = "splatsim.viewer:main"
 splatsim-grpc-server = "splatsim.grpc_service.cli:main"
+splatsim-omnidreams-server = "splatsim.omnidreams_service.cli:main"
 
 [tool.ruff]
 exclude = [
