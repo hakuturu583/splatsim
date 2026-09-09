@@ -47,6 +47,9 @@ class Scene:
         self._lod_enabled = lod_manager is not None
         self.ppisp_tables = ppisp_tables
         self._actor_library = actor_library
+        # An optional equirect sky panorama (see _usdz.load_skybox); the Renderer
+        # samples it by ray direction behind the Gaussians.
+        self.skybox = None
 
     # --- rigid body access ---------------------------------------------------
 
@@ -347,6 +350,14 @@ class Scene:
             lod_manager=lod_manager,
             ppisp_tables=ppisp_tables,
         )
+        if config.background_usdz is not None:
+            from splatsim._usdz import load_skybox
+
+            scene.skybox = load_skybox(config.background_usdz, device)
+            if scene.skybox is not None:
+                h, w = int(scene.skybox.shape[0]), int(scene.skybox.shape[1])
+                if progress is not None:
+                    progress(step, total, f"skybox {w}x{h}")
 
         # Configured actors go through the same entry point a scenario uses, so
         # the bank is loaded once, on first spawn, and the name-collision rule

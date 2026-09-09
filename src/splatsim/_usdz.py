@@ -75,6 +75,26 @@ def read_scene_json(usdz_path: str | Path) -> dict[str, Any]:
     return meta
 
 
+def load_skybox(usdz_path: str | Path, device=None):
+    """Load an embedded ``skybox.png`` equirect panorama as an (H, W, 3) tensor.
+
+    Returns ``None`` when the bundle carries no skybox. A LiDAR-derived scene
+    has no sky Gaussians; a producer that bakes the sky into an equirectangular
+    texture embeds it here, and the Renderer samples it by ray direction behind
+    the Gaussians (no parallax, and no positions for SPZ to clip).
+    """
+    with zipfile.ZipFile(usdz_path) as zf:
+        names = [n for n in zf.namelist() if n.rsplit("/", 1)[-1] == "skybox.png"]
+        if not names:
+            return None
+        data = zf.read(names[0])
+    import cv2
+
+    arr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    rgb = np.ascontiguousarray(arr[:, :, ::-1]).astype(np.float32) / 255.0
+    return torch.from_numpy(rgb).to(device) if device is not None else torch.from_numpy(rgb)
+
+
 def load_spz_scene(
     usdz_path: str | Path,
     device: torch.device,
