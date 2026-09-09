@@ -41,6 +41,11 @@ class Renderer:
         self._bg_color = torch.tensor(
             [list(background_color)], device=device, dtype=torch.float32
         )  # [1, 3] — shape [C, D] where C=num_cameras
+        # Optional equirectangular skybox: an (H, W, 3) [0, 1] panorama sampled
+        # by world ray direction behind the Gaussians. A LiDAR-derived cloud has
+        # no sky in it; a finite Gaussian dome shows parallax and does not fit
+        # SPZ's position range, so the sky rides as a directional texture.
+        self.skybox: Tensor | None = None
 
     def render(
         self,
@@ -83,6 +88,12 @@ class Renderer:
         viewmats = viewmat.unsqueeze(0).to(self.device)  # [1, 4, 4]
         Ks = K.unsqueeze(0).to(self.device)  # [1, 3, 3]
 
+        # An explicit renderer skybox wins; otherwise the one the scene carried
+        # in from its bundle (see Scene.skybox / _usdz.load_skybox).
+        skybox = (
+            self.skybox if self.skybox is not None else getattr(scene, "skybox", None)
+        )
+
         render_colors, _render_alphas, _meta = rasterization(
             means=all_means,
             quats=all_quats,
@@ -99,10 +110,16 @@ class Renderer:
             radius_clip=self._radius_clip,
             render_mode="RGB",
             packed=False,
-            backgrounds=self._bg_color,
+            # With a skybox, the uncovered pixels are the skybox's, so render the
+            # Gaussians over black — otherwise render_colors already holds
+            # (1 - alpha) * bg_color and adding the skybox would double-count it.
+            backgrounds=None if skybox is not None else self._bg_color,
         )
 
         rgb = render_colors[0]
+        if skybox is not None:
+            alpha = _render_alphas[0]  # [H, W, 1]
+            rgb = rgb + (1.0 - alpha) * self._sample_skybox(viewmat, K, skybox)
         tables = scene.ppisp_tables if scene is not None else None
         if tables is not None and camera_name is not None and camera_pos is not None:
             from splatsim.ppisp import apply_ppisp
@@ -117,6 +134,40 @@ class Renderer:
         elif self.exposure != 1.0:
             rgb = rgb * self.exposure
         return rgb  # [H, W, 3]
+
+    def _sample_skybox(self, viewmat: Tensor, K: Tensor, skybox: Tensor) -> Tensor:
+        """Sample the equirect skybox along every pixel's world ray. [H, W, 3].
+
+        The panorama convention matches the baker's: longitude ``atan2(y, x)``
+        across the width, elevation ``asin(z)`` down the height with the zenith
+        on the top row. The sky is at infinity, so only the camera rotation
+        matters — pixel ``(u, v)`` maps to
+        ``R_cam→world · normalize(K^-1 [u, v, 1])``.
+        """
+        import math
+
+        import torch.nn.functional as functional
+
+        dev = skybox.device
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+        us = (torch.arange(self.width, device=dev, dtype=torch.float32) - cx) / fx
+        vs = (torch.arange(self.height, device=dev, dtype=torch.float32) - cy) / fy
+        vv, uu = torch.meshgrid(vs, us, indexing="ij")
+        d_opt = torch.stack([uu, vv, torch.ones_like(uu)], dim=-1)
+        d_opt = d_opt / d_opt.norm(dim=-1, keepdim=True)
+        dirs = d_opt @ viewmat[:3, :3].to(dev)  # R_cam→world = R^T, applied as d·R
+        d = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-12)
+        lon = torch.atan2(d[..., 1], d[..., 0])
+        lat = torch.asin(d[..., 2].clamp(-1.0, 1.0))
+        gx = ((lon / (2.0 * math.pi) + 0.5) % 1.0) * 2.0 - 1.0
+        gy = (0.5 - lat / math.pi).clamp(0.0, 1.0) * 2.0 - 1.0
+        grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)  # [1, H, W, 2]
+        img = skybox.permute(2, 0, 1).unsqueeze(0)  # [1, 3, Hs, Ws]
+        out = functional.grid_sample(
+            img, grid, mode="bilinear", padding_mode="border", align_corners=False
+        )
+        return out[0].permute(1, 2, 0)  # [H, W, 3]
 
 
 @dataclass
