@@ -88,11 +88,16 @@ def load_skybox(usdz_path: str | Path, device=None):
         if not names:
             return None
         data = zf.read(names[0])
-    import cv2
+    # Decode with torchvision (a core dependency) rather than opencv, which is
+    # only an optional extra — a default install must still render a bundle
+    # that carries a skybox.
+    from torchvision.io import decode_image
 
-    arr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    rgb = np.ascontiguousarray(arr[:, :, ::-1]).astype(np.float32) / 255.0
-    return torch.from_numpy(rgb).to(device) if device is not None else torch.from_numpy(rgb)
+    img = decode_image(
+        torch.frombuffer(bytearray(data), dtype=torch.uint8)
+    )  # [C, H, W]
+    rgb = img[:3].permute(1, 2, 0).to(torch.float32) / 255.0  # [H, W, 3]
+    return rgb.to(device) if device is not None else rgb
 
 
 def load_spz_scene(

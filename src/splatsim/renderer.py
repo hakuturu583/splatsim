@@ -88,6 +88,12 @@ class Renderer:
         viewmats = viewmat.unsqueeze(0).to(self.device)  # [1, 4, 4]
         Ks = K.unsqueeze(0).to(self.device)  # [1, 3, 3]
 
+        # An explicit renderer skybox wins; otherwise the one the scene carried
+        # in from its bundle (see Scene.skybox / _usdz.load_skybox).
+        skybox = (
+            self.skybox if self.skybox is not None else getattr(scene, "skybox", None)
+        )
+
         render_colors, _render_alphas, _meta = rasterization(
             means=all_means,
             quats=all_quats,
@@ -104,13 +110,13 @@ class Renderer:
             radius_clip=self._radius_clip,
             render_mode="RGB",
             packed=False,
-            backgrounds=self._bg_color,
+            # With a skybox, the uncovered pixels are the skybox's, so render the
+            # Gaussians over black — otherwise render_colors already holds
+            # (1 - alpha) * bg_color and adding the skybox would double-count it.
+            backgrounds=None if skybox is not None else self._bg_color,
         )
 
         rgb = render_colors[0]
-        # An explicit renderer skybox wins; otherwise the one the scene carried
-        # in from its bundle (see Scene.skybox / _usdz.load_skybox).
-        skybox = self.skybox if self.skybox is not None else getattr(scene, "skybox", None)
         if skybox is not None:
             alpha = _render_alphas[0]  # [H, W, 1]
             rgb = rgb + (1.0 - alpha) * self._sample_skybox(viewmat, K, skybox)

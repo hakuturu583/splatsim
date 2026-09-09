@@ -49,7 +49,7 @@ class Scene:
         self._actor_library = actor_library
         # An optional equirect sky panorama (see _usdz.load_skybox); the Renderer
         # samples it by ray direction behind the Gaussians.
-        self.skybox = None
+        self.skybox: Tensor | None = None
 
     # --- rigid body access ---------------------------------------------------
 
