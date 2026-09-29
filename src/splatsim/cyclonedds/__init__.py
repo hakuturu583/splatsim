@@ -8,6 +8,7 @@ except ImportError:
 
 from splatsim.cyclonedds import _fast_cdr
 from splatsim.cyclonedds.camera_info_publisher import CameraInfoPublisher
+from splatsim.cyclonedds.domain import make_participant, ros_domain_id
 from splatsim.cyclonedds.image_publisher import ImagePublisher
 from splatsim.cyclonedds.pointcloud2_publisher import PointCloud2Publisher
 
@@ -18,5 +19,7 @@ _fast_cdr.apply()
 __all__ = [
     "CameraInfoPublisher",
     "ImagePublisher",
+    "make_participant",
     "PointCloud2Publisher",
+    "ros_domain_id",
 ]
