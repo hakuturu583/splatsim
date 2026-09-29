@@ -19,6 +19,7 @@ from splatsim.actor_assets import world_to_tile_local
 from splatsim.background import Background
 from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
 from splatsim.cyclonedds.msg_types import Time
+from splatsim.cyclonedds.domain import make_participant
 from splatsim.cyclonedds.pointcloud2_publisher import PointCloud2Publisher
 from splatsim.dataclass.lidar_config import LidarConfig, sensor_defaults
 from splatsim.dataclass.lod_config import LodConfig
@@ -273,7 +274,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
 
                 self._K = build_intrinsics(intr.fx, intr.fy, intr.cx, intr.cy, device)
 
-                dp = DomainParticipant()
+                dp = make_participant()
                 self._dp = dp  # prevent GC from destroying DDS entities
                 frame_id = request.frame_id or "camera"
                 self._image_pub = ImagePublisher(

@@ -250,7 +250,9 @@ Each LiDAR sensor in a scene renders a point cloud that can be delivered two way
 selected per sensor with the `communication` field:
 
 - `dds` (default): publishes a `sensor_msgs/PointCloud2` over CycloneDDS on
-  `pointcloud_topic`.
+  `pointcloud_topic`, in the ROS 2 domain `ROS_DOMAIN_ID` names (default `0`).
+  Set it to the domain the subscriber runs in, as you would for any other ROS 2
+  process -- on a different domain the subscriber simply never sees a publisher.
 - `hils`: hardware-in-the-loop mode. Emits raw Hesai UDP data packets that mimic
   the physical sensor's wire format, so an unmodified LiDAR driver (e.g. Autoware
   `nebula`) can consume them. The `sensor_type` selects the packet format;

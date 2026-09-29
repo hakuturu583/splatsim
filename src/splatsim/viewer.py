@@ -562,14 +562,14 @@ def main() -> None:
     pointcloud_pub = None
     if args.dds:
         try:
-            from cyclonedds.domain import DomainParticipant
+            from splatsim.cyclonedds.domain import make_participant
         except ImportError:
             raise SystemExit(
                 "Error: --dds requires CycloneDDS.\n"
                 "Install with: pip install splatsim[dds]"
             ) from None
 
-        dp = DomainParticipant()
+        dp = make_participant()
         if lidar_cfg is None:
             from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
 
