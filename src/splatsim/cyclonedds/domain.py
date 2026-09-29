@@ -14,6 +14,7 @@ process honours.
 from __future__ import annotations
 
 import os
+import re
 from typing import Mapping
 
 from cyclonedds.domain import DomainParticipant
@@ -25,6 +26,11 @@ DEFAULT_DOMAIN_ID = 0
 MAX_DOMAIN_ID = 232
 
 ENV_VAR = "ROS_DOMAIN_ID"
+
+# An environment value is not a Python literal, so it is not read like one:
+# ``int`` would take "1_0" for 10 and the full-width "１０" for 10 as well. A
+# domain id is decimal digits and nothing else.
+_DECIMAL = re.compile(r"[0-9]+")
 
 
 def ros_domain_id(environ: Mapping[str, str] | None = None) -> int:
@@ -38,11 +44,13 @@ def ros_domain_id(environ: Mapping[str, str] | None = None) -> int:
     raw = (environ if environ is not None else os.environ).get(ENV_VAR, "").strip()
     if not raw:
         return DEFAULT_DOMAIN_ID
-    try:
-        domain_id = int(raw)
-    except ValueError:
-        raise ValueError(f"{ENV_VAR}={raw!r} is not an integer") from None
-    if not 0 <= domain_id <= MAX_DOMAIN_ID:
+    if not _DECIMAL.fullmatch(raw):
+        raise ValueError(
+            f"{ENV_VAR}={raw!r} is not a domain id: expected decimal digits "
+            f"0..{MAX_DOMAIN_ID}"
+        )
+    domain_id = int(raw)
+    if domain_id > MAX_DOMAIN_ID:
         raise ValueError(f"{ENV_VAR}={domain_id} is outside 0..{MAX_DOMAIN_ID}")
     return domain_id
 

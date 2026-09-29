@@ -32,16 +32,26 @@ def test_the_highest_domain_is_allowed() -> None:
     assert ros_domain_id({ENV_VAR: str(MAX_DOMAIN_ID)}) == MAX_DOMAIN_ID
 
 
-@pytest.mark.parametrize("value", ["twelve", "1.5", "0x2a"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "twelve",
+        "1.5",
+        "0x2a",
+        "-1",
+        "+1",
+        "1_0",  # int() would read the underscore as a Python literal: 10
+        "\uff11\uff10",  # full-width digits, which int() also reads as 10
+    ],
+)
 def test_a_value_that_is_not_a_domain_is_refused(value: str) -> None:
-    with pytest.raises(ValueError, match=ENV_VAR):
+    with pytest.raises(ValueError, match="not a domain id"):
         ros_domain_id({ENV_VAR: value})
 
 
-@pytest.mark.parametrize("value", ["-1", str(MAX_DOMAIN_ID + 1)])
-def test_a_domain_out_of_range_is_refused(value: str) -> None:
+def test_a_domain_above_the_range_is_refused() -> None:
     with pytest.raises(ValueError, match="outside"):
-        ros_domain_id({ENV_VAR: value})
+        ros_domain_id({ENV_VAR: str(MAX_DOMAIN_ID + 1)})
 
 
 def test_the_process_environment_is_the_default_source(monkeypatch) -> None:
