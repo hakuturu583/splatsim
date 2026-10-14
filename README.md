@@ -279,6 +279,61 @@ Packets are encoded with `torch` directly from the rendered range image, so when
 the renderer runs on CUDA the entire encode stays on the GPU and only the packed
 byte buffer crosses to the host (once per frame) for the UDP send.
 
+## gRPC service: sensor data over DDS or gRPC
+
+The rendering service (`splatsim-grpc-server`, the Docker image's default
+command) publishes every camera image, camera info and LiDAR point cloud over
+CycloneDDS by default. To get them back over the gRPC connection instead -- no
+DDS / ROS 2 setup on the client, or a network DDS discovery does not cross --
+start it with the gRPC sensor transport:
+
+```bash
+splatsim-grpc-server --sensor-transport grpc
+
+# Docker: the same switch as an environment variable
+docker run --rm -it --gpus all -p 50051:50051 \
+  -e SPLATSIM_SENSOR_TRANSPORT=grpc ghcr.io/tier4/splatsim:latest-sm89
+```
+
+`--sensor-transport` takes `dds` (default) or `grpc`; when the flag is absent
+`SPLATSIM_SENSOR_TRANSPORT` decides, and an unknown value refuses to start. With
+`grpc` the server creates no DDS entities at all, and `InitializeResponse`
+reports the active transport in `sensor_transport`.
+
+Clients then open `SubscribeSensorData` alongside their pose stream. Every
+message the DDS path would have written arrives as a `SensorData` carrying the
+same topic name and a payload mirroring the `sensor_msgs` type it replaces
+(`Image`, `CompressedImage`, `CameraInfo` or `PointCloud2`, with the same
+16-byte point layout):
+
+```python
+channel = grpc.insecure_channel(
+    "localhost:50051",
+    # A raw 1080p bgr8 image is ~6 MB, over gRPC's 4 MB default.
+    options=[("grpc.max_receive_message_length", 64 * 1024 * 1024)],
+)
+stub = pb2_grpc.RenderingServiceStub(channel)
+
+def receive():
+    request = pb2.SubscribeSensorDataRequest(topics=[])  # [] = every topic
+    for msg in stub.SubscribeSensorData(request):
+        if msg.HasField("point_cloud"):
+            points = np.frombuffer(msg.point_cloud.data, dtype=POINT_DTYPE)
+        elif msg.HasField("image"):
+            ...
+
+threading.Thread(target=receive, daemon=True).start()
+stub.StreamRigData(poses())
+```
+
+The subscription stays open until the client cancels it and may be opened
+before `Initialize`. Frames rendered while nobody is subscribed are dropped, as
+on a DDS topic without readers, and a client that falls behind loses its oldest
+queued messages (`queue_size`, default 16, at most 64) rather than slowing rendering down.
+Each open stream holds one server worker thread, so raise `--max-workers` if
+several subscribers and pose streams run at once. Under the default `dds`
+transport `SubscribeSensorData` fails with `FAILED_PRECONDITION`.
+
 ## LiDAR evaluation
 
 `src/eval` scores the LiDAR the simulator renders from a reconstructed `.usdz`

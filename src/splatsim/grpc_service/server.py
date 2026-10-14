@@ -29,6 +29,12 @@ from splatsim.grpc_service._generated import (
     rendering_service_pb2_grpc as pb2_grpc,
 )
 from splatsim.grpc_service.pose_buffer import PoseBuffer, TimestampedPose
+from splatsim.grpc_service.sensor_stream import (
+    SENSOR_TRANSPORT_DDS,
+    SENSOR_TRANSPORT_GRPC,
+    SensorDataHub,
+    parse_sensor_transport,
+)
 from splatsim.grpc_service.viewmat_builder import (
     build_base_to_world_from_pose,
     build_intrinsics,
@@ -149,11 +155,22 @@ class _RigCamera:
 
 
 class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
-    """gRPC servicer that manages scene loading, rendering, and DDS publishing."""
+    """gRPC servicer that manages scene loading, rendering, and publishing.
 
-    def __init__(self) -> None:
+    ``sensor_transport`` picks where rendered sensor data goes: ``"dds"`` (the
+    default) publishes it over CycloneDDS; ``"grpc"`` creates no DDS entities
+    at all and returns it to ``SubscribeSensorData`` clients instead, on the
+    same topic names.
+    """
+
+    def __init__(self, sensor_transport: str = SENSOR_TRANSPORT_DDS) -> None:
         self._lock = threading.Lock()
         self._initialized = False
+
+        self._sensor_transport = parse_sensor_transport(sensor_transport)
+        self._sensor_hub: SensorDataHub | None = (
+            SensorDataHub() if self._sensor_transport == SENSOR_TRANSPORT_GRPC else None
+        )
 
         self._scene: Scene | None = None
         self._renderer: Renderer | None = None
@@ -198,6 +215,44 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         # Instance ids seen in a pose stream but never spawned; kept so the
         # warning is logged once instead of every frame.
         self._unknown_actor_ids: set[str] = set()
+
+    # --- sensor publishers (DDS or gRPC) -------------------------------------
+
+    def _sink(self) -> DomainParticipant | SensorDataHub:
+        """Where the sensor publishers write: the DDS participant ``Initialize``
+        created, or the gRPC hub behind ``SubscribeSensorData``."""
+        if self._sensor_hub is not None:
+            return self._sensor_hub
+        assert self._dp is not None  # noqa: S101
+        return self._dp
+
+    def SubscribeSensorData(
+        self,
+        request: pb2.SubscribeSensorDataRequest,
+        context: grpc.ServicerContext,
+    ) -> Iterator[pb2.SensorData]:
+        """Stream rendered sensor data to this client (gRPC transport only).
+
+        The stream lives until the client cancels it and carries every frame
+        any pose stream renders from then on, filtered to ``request.topics``.
+        A client that falls behind loses its oldest queued messages rather
+        than slowing the render loop down.
+        """
+        hub = self._sensor_hub
+        if hub is None:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "Sensor data is published over DDS. Start the server with "
+                "--sensor-transport=grpc (or SPLATSIM_SENSOR_TRANSPORT=grpc) "
+                "to receive it over gRPC.",
+            )
+            return
+        sub = hub.subscribe(request.topics, request.queue_size)
+        # Ends the stream (wakes the blocked read) once the client goes away;
+        # add_callback returns False when the RPC has already terminated.
+        if not context.add_callback(sub.close):
+            sub.close()
+        yield from hub.iter_messages(sub)
 
     def _warmup(self, what: str, render_once: Callable[[], object]) -> None:
         """Render one throwaway frame so CUDA module loads / kernel JIT happen
@@ -274,11 +329,12 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
 
                 self._K = build_intrinsics(intr.fx, intr.fy, intr.cx, intr.cy, device)
 
-                dp = make_participant()
-                self._dp = dp  # prevent GC from destroying DDS entities
+                if self._sensor_hub is None:
+                    # Held so GC does not destroy the DDS entities.
+                    self._dp = make_participant()
                 frame_id = request.frame_id or "camera"
                 self._image_pub = ImagePublisher(
-                    dp,
+                    self._sink(),
                     topic_name=request.image_topic or "/splatsim/image_raw",
                     frame_id=frame_id,
                     compress_format=request.compress_format or "",
@@ -293,7 +349,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                     image_height=intr.height,
                 )
                 self._camera_info_pub = CameraInfoPublisher(
-                    dp,
+                    self._sink(),
                     cam_config,
                     topic_name=request.camera_info_topic or "/splatsim/camera_info",
                     frame_id=frame_id,
@@ -306,7 +362,11 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 )
 
                 self._initialized = True
-                logger.info("Initialization complete (%.1f fps)", self._frame_rate)
+                logger.info(
+                    "Initialization complete (%.1f fps, sensor data over %s)",
+                    self._frame_rate,
+                    self._sensor_transport,
+                )
 
                 renderer, K, scene = self._renderer, self._K, self._scene
                 self._warmup(
@@ -333,6 +393,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                         z=float(ecef_t[2]),
                     ),
                     ecef_rotation=ecef_r.flatten().tolist(),
+                    sensor_transport=self._sensor_transport,
                 )
 
             except Exception as exc:
@@ -967,7 +1028,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
         """Add a LiDAR sensor to the already-loaded scene.
 
         ``Initialize`` must have been called first — the LiDAR renderer shares
-        the scene and DomainParticipant created there.
+        the scene loaded there.
         """
         with self._lock:
             try:
@@ -977,7 +1038,6 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                         message="Scene not initialized. Call Initialize first.",
                     )
                 assert self._device is not None  # noqa: S101
-                assert self._dp is not None  # noqa: S101
 
                 # Rig form takes precedence; the single-sensor field stays
                 # supported for existing clients.
@@ -1024,7 +1084,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                 )
                 self._lidar_renderer = lidar_renderer
                 self._pointcloud_pub = PointCloud2Publisher(
-                    self._dp,
+                    self._sink(),
                     topic_name=cfg.pointcloud_topic,
                     frame_id=cfg.frame_id,
                 )
@@ -1213,7 +1273,6 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
     def _init_lidar_rig(self, sensor_msgs) -> pb2.InitializeResponse:
         """Register several LiDARs that render together off one gather."""
         assert self._device is not None  # noqa: S101
-        assert self._dp is not None  # noqa: S101
 
         cfgs = [self._lidar_config_from_msg(m) for m in sensor_msgs]
         names = [c.name for c in cfgs]
@@ -1235,7 +1294,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                         max_range_m=cfg.max_range_m,
                     ),
                     publisher=PointCloud2Publisher(
-                        self._dp,
+                        self._sink(),
                         topic_name=cfg.pointcloud_topic,
                         frame_id=cfg.frame_id,
                     ),
@@ -1293,7 +1352,6 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                         message="Scene not initialized. Call Initialize first.",
                     )
                 assert self._device is not None  # noqa: S101
-                assert self._dp is not None  # noqa: S101
 
                 names = [c.name for c in request.cameras]
                 if len(set(names)) != len(names):
@@ -1328,7 +1386,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                             ),
                             cam_to_base=cam_to_base,
                             image_pub=ImagePublisher(
-                                self._dp,
+                                self._sink(),
                                 topic_name=(
                                     c.image_topic
                                     or f"/splatsim/{c.name or 'camera'}/image"
@@ -1337,7 +1395,7 @@ class RenderingServiceServicer(pb2_grpc.RenderingServiceServicer):
                                 compress_format=c.compress_format or "",
                             ),
                             info_pub=CameraInfoPublisher(
-                                self._dp,
+                                self._sink(),
                                 topic_name=(
                                     c.camera_info_topic
                                     or f"/splatsim/{c.name or 'camera'}/camera_info"

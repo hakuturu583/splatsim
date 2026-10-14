@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
-from cyclonedds.pub import DataWriter
-from cyclonedds.topic import Topic
-
-from splatsim.cyclonedds._util import to_dds_topic
+from splatsim.cyclonedds._util import MessageSink, create_writer
 from splatsim.cyclonedds.msg_types import CameraInfo, Header, RegionOfInterest, Time
 
 if TYPE_CHECKING:
@@ -41,7 +38,8 @@ class CameraInfoPublisher:
     Parameters
     ----------
     participant:
-        CycloneDDS domain participant (caller manages its lifetime).
+        CycloneDDS domain participant (caller manages its lifetime), or a
+        :class:`~splatsim.cyclonedds._util.MessageSink` to write to instead.
     config:
         Camera configuration from which intrinsics are derived.
     topic_name:
@@ -52,15 +50,14 @@ class CameraInfoPublisher:
 
     def __init__(
         self,
-        participant: DomainParticipant,
+        participant: DomainParticipant | MessageSink,
         config: CameraConfig,
         topic_name: str = "/splatsim/camera_info",
         frame_id: str = "camera",
     ) -> None:
         self._frame_id = frame_id
 
-        topic = Topic(participant, to_dds_topic(topic_name), CameraInfo)
-        self._writer = DataWriter(participant, topic)
+        self._writer = create_writer(participant, topic_name, CameraInfo)
 
         # Precompute static intrinsic fields from config.
         fx, fy = config.fx, config.fy

@@ -219,6 +219,7 @@ include = [
     "test/test_grpc_lod.py",
     "test/test_grpc_pose_stream.py",
     "test/test_grpc_actors.py",
+    "test/test_grpc_sensor_stream.py",
 ]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
