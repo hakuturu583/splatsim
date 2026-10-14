@@ -27,6 +27,7 @@ from splatsim.grpc_service._generated import (
 )
 from splatsim.grpc_service.sensor_stream import (
     DEFAULT_QUEUE_SIZE,
+    MAX_QUEUE_SIZE,
     SensorDataHub,
     sensor_transport_from_env,
 )
@@ -106,6 +107,11 @@ def test_slow_subscriber_keeps_newest() -> None:
 
 def test_default_queue_size() -> None:
     assert SensorDataHub().subscribe(queue_size=0)._queue.maxlen == DEFAULT_QUEUE_SIZE
+
+
+def test_requested_queue_size_is_capped() -> None:
+    sub = SensorDataHub().subscribe(queue_size=2**32 - 1)
+    assert sub._queue.maxlen == MAX_QUEUE_SIZE
 
 
 def test_iter_messages_ends_on_close_and_unsubscribes() -> None:

@@ -329,7 +329,7 @@ stub.StreamRigData(poses())
 The subscription stays open until the client cancels it and may be opened
 before `Initialize`. Frames rendered while nobody is subscribed are dropped, as
 on a DDS topic without readers, and a client that falls behind loses its oldest
-queued messages (`queue_size`, default 16) rather than slowing rendering down.
+queued messages (`queue_size`, default 16, at most 64) rather than slowing rendering down.
 Each open stream holds one server worker thread, so raise `--max-workers` if
 several subscribers and pose streams run at once. Under the default `dds`
 transport `SubscribeSensorData` fails with `FAILED_PRECONDITION`.

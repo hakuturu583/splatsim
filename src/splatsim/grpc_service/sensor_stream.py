@@ -35,6 +35,10 @@ SENSOR_TRANSPORTS = (SENSOR_TRANSPORT_DDS, SENSOR_TRANSPORT_GRPC)
 
 #: Messages buffered per subscriber when the request leaves ``queue_size`` 0.
 DEFAULT_QUEUE_SIZE = 16
+#: Upper bound on a requested ``queue_size``: the value comes from the client,
+#: and a queue of raw camera frames (~6 MB each at 1080p) that a stalled client
+#: never drains would otherwise grow without limit.
+MAX_QUEUE_SIZE = 64
 
 
 def sensor_transport_from_env(environ: Mapping[str, str] | None = None) -> str:
@@ -112,7 +116,9 @@ class SensorDataHub:
     def subscribe(
         self, topics: Iterable[str] = (), queue_size: int = 0
     ) -> SensorSubscription:
-        sub = SensorSubscription(topics, queue_size or DEFAULT_QUEUE_SIZE)
+        sub = SensorSubscription(
+            topics, min(queue_size or DEFAULT_QUEUE_SIZE, MAX_QUEUE_SIZE)
+        )
         with self._lock:
             self._subscriptions = (*self._subscriptions, sub)
         logger.info(

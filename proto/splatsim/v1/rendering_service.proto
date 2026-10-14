@@ -369,7 +369,8 @@ message SubscribeSensorDataRequest {
   // in "/compressed" as on DDS). Empty delivers every topic.
   repeated string topics = 1;
   // Messages buffered for this subscriber before the oldest are dropped, so a
-  // slow client never stalls rendering. 0 selects the server default (16).
+  // slow client never stalls rendering. 0 selects the server default (16);
+  // values above the server maximum (64) are clamped to it.
   uint32 queue_size = 2;
 }
 
