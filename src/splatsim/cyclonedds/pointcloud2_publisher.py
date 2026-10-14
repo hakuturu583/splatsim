@@ -5,11 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from cyclonedds.pub import DataWriter
-from cyclonedds.topic import Topic
 from numpy.typing import NDArray
 
-from splatsim.cyclonedds._util import to_dds_topic
+from splatsim.cyclonedds._util import MessageSink, create_writer
 from splatsim.cyclonedds.msg_types import (
     Header,
     PointCloud2,
@@ -71,14 +69,13 @@ class PointCloud2Publisher:
 
     def __init__(
         self,
-        participant: DomainParticipant,
+        participant: DomainParticipant | MessageSink,
         *,
         topic_name: str = "/splatsim/lidar/pointcloud",
         frame_id: str = "splatsim_lidar",
     ) -> None:
         self._frame_id = frame_id
-        topic = Topic(participant, to_dds_topic(topic_name), PointCloud2)
-        self._writer = DataWriter(participant, topic)
+        self._writer = create_writer(participant, topic_name, PointCloud2)
 
     def publish(
         self,

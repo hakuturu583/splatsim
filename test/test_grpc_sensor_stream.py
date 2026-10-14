@@ -1,7 +1,8 @@
 """Sensor data over gRPC (``--sensor-transport=grpc``).
 
-The gRPC publishers must carry what the DDS publishers would have written --
-same topic names, same payloads -- and the hub between them and the
+With a :class:`SensorDataHub` in place of the DDS participant, the regular
+publishers must deliver what they would have written to DDS -- same topic
+names, same payloads -- and the hub between them and the
 ``SubscribeSensorData`` stream must never make the render loop wait on a
 client. The last tests drive the real servicer over an in-process channel.
 """
@@ -17,16 +18,15 @@ import grpc
 import numpy as np
 import pytest
 
+from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
 from splatsim.cyclonedds.msg_types import Time
+from splatsim.cyclonedds.pointcloud2_publisher import PointCloud2Publisher
 from splatsim.grpc_service._generated import (
     rendering_service_pb2 as pb2,
     rendering_service_pb2_grpc as pb2_grpc,
 )
 from splatsim.grpc_service.sensor_stream import (
     DEFAULT_QUEUE_SIZE,
-    GrpcCameraInfoPublisher,
-    GrpcImagePublisher,
-    GrpcPointCloud2Publisher,
     SensorDataHub,
     sensor_transport_from_env,
 )
@@ -115,16 +115,16 @@ def test_iter_messages_ends_on_close_and_unsubscribes() -> None:
     received: list[str] = []
 
     def consume() -> None:
-        for msg in hub.iter_messages(sub, lambda: True, poll_s=5.0):
+        for msg in hub.iter_messages(sub):
             received.append(msg.topic)
 
     t = threading.Thread(target=consume)
     t.start()
-    sub.close()  # must wake the blocked get without waiting for poll_s
+    sub.close()  # must end the stream once the queue is drained
     t.join(timeout=2.0)
     assert not t.is_alive()
     assert received == ["/a"]
-    assert not hub.wants("/a")
+    assert hub._subscriptions == ()
 
 
 # ── publishers ───────────────────────────────────────────────────────
@@ -134,7 +134,7 @@ def test_raw_image() -> None:
     hub = SensorDataHub()
     sub = hub.subscribe()
     img = _image()
-    GrpcImagePublisher(hub, topic_name="/cam/image", frame_id="cam").publish(
+    ImagePublisher(hub, topic_name="/cam/image", frame_id="cam").publish(
         img, stamp=_STAMP
     )
     msg = sub.get(0)
@@ -151,9 +151,8 @@ def test_raw_image() -> None:
 
 def test_compressed_image_topic_and_payload() -> None:
     hub = SensorDataHub()
-    pub = GrpcImagePublisher(hub, topic_name="/cam/image", compress_format="png")
-    assert pub.topic == "/cam/image/compressed"
-    sub = hub.subscribe([pub.topic])
+    pub = ImagePublisher(hub, topic_name="/cam/image", compress_format="png")
+    sub = hub.subscribe(["/cam/image/compressed"])
     img = _image()
     pub.publish(img, stamp=_STAMP)
     msg = sub.get(0)
@@ -165,15 +164,15 @@ def test_compressed_image_topic_and_payload() -> None:
     np.testing.assert_array_equal(decoded, img)
 
 
-def test_unsupported_compression_refused_up_front() -> None:
-    with pytest.raises(ValueError, match="compress_format"):
-        GrpcImagePublisher(SensorDataHub(), compress_format="webp")
+def test_unsupported_message_type_refused() -> None:
+    with pytest.raises(TypeError, match="no gRPC mirror"):
+        SensorDataHub().create_writer("/x", Time)
 
 
 def test_camera_info() -> None:
     hub = SensorDataHub()
     sub = hub.subscribe()
-    GrpcCameraInfoPublisher(hub, _Pinhole(), topic_name="/cam/info").publish(_STAMP)
+    CameraInfoPublisher(hub, _Pinhole(), topic_name="/cam/info").publish(_STAMP)
     msg = sub.get(0)
     assert msg is not None and msg.WhichOneof("payload") == "camera_info"
     info = msg.camera_info
@@ -186,7 +185,7 @@ def test_point_cloud_matches_dds_layout() -> None:
     hub = SensorDataHub()
     sub = hub.subscribe()
     records = np.arange(3 * 16, dtype=np.uint8)
-    GrpcPointCloud2Publisher(hub, topic_name="/lidar", frame_id="top").publish_packed(
+    PointCloud2Publisher(hub, topic_name="/lidar", frame_id="top").publish_packed(
         records, 3, stamp=_STAMP
     )
     msg = sub.get(0)
@@ -204,19 +203,12 @@ def test_point_cloud_matches_dds_layout() -> None:
     assert pc.data == records.tobytes()
 
 
-def test_point_cloud_size_checked() -> None:
-    pub = GrpcPointCloud2Publisher(SensorDataHub())
-    with pytest.raises(ValueError, match="records"):
-        pub.publish_packed(np.zeros(10, np.uint8), 1, stamp=_STAMP)
-
-
 # ── servicer ─────────────────────────────────────────────────────────
 
 
-def test_grpc_transport_builds_no_dds_participant() -> None:
+def test_grpc_transport_writes_to_the_hub() -> None:
     servicer = RenderingServiceServicer(sensor_transport="grpc")
-    pub = servicer._make_pointcloud_pub(topic_name="/lidar", frame_id="top")
-    assert isinstance(pub, GrpcPointCloud2Publisher)
+    assert servicer._sink() is servicer._sensor_hub is not None
     assert servicer._dp is None
 
 
@@ -265,15 +257,13 @@ def test_subscribe_receives_published_frames(serve) -> None:
     # Wait for the server side to register the subscription before publishing.
     pause = threading.Event()
     for _ in range(200):
-        if hub.wants("/lidar"):
+        if hub._subscriptions:
             break
         pause.wait(0.01)
-    assert hub.wants("/lidar")
+    assert hub._subscriptions
 
-    lidar = servicer._make_pointcloud_pub(topic_name="/lidar", frame_id="top")
-    camera = servicer._make_image_pub(
-        topic_name="/cam", frame_id="cam", compress_format=""
-    )
+    lidar = PointCloud2Publisher(servicer._sink(), topic_name="/lidar")
+    camera = ImagePublisher(servicer._sink(), topic_name="/cam")
     camera.publish(_image(), stamp=_STAMP)  # filtered out
     lidar.publish_packed(np.zeros(32, np.uint8), 2, stamp=_STAMP)
 
@@ -283,7 +273,7 @@ def test_subscribe_receives_published_frames(serve) -> None:
 
     call.cancel()
     for _ in range(200):
-        if not hub.wants("/lidar"):
+        if not hub._subscriptions:
             break
         pause.wait(0.01)
-    assert not hub.wants("/lidar"), "cancelled subscriber was not removed"
+    assert not hub._subscriptions, "cancelled subscriber was not removed"

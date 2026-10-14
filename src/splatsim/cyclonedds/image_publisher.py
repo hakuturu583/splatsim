@@ -5,11 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-from cyclonedds.pub import DataWriter
-from cyclonedds.topic import Topic
 from numpy.typing import NDArray
 
-from splatsim.cyclonedds._util import to_dds_topic
+from splatsim.cyclonedds._util import MessageSink, create_writer
 from splatsim.cyclonedds.msg_types import CompressedImage, Header, Image, Time
 
 if TYPE_CHECKING:
@@ -22,7 +20,8 @@ class ImagePublisher:
     Parameters
     ----------
     participant:
-        CycloneDDS domain participant (caller manages its lifetime).
+        CycloneDDS domain participant (caller manages its lifetime), or a
+        :class:`~splatsim.cyclonedds._util.MessageSink` to write to instead.
     topic_name:
         ROS 2 topic name (e.g. ``"/splatsim/image_raw"``).
         The ``rt/`` DDS prefix is added automatically.
@@ -40,7 +39,7 @@ class ImagePublisher:
 
     def __init__(
         self,
-        participant: DomainParticipant,
+        participant: DomainParticipant | MessageSink,
         topic_name: str = "/splatsim/image_raw",
         frame_id: str = "camera",
         compress_format: str = "",
@@ -56,10 +55,9 @@ class ImagePublisher:
             self._cv2 = cv2
             if not topic_name.endswith("/compressed"):
                 topic_name = topic_name.rstrip("/") + "/compressed"
-            topic = Topic(participant, to_dds_topic(topic_name), CompressedImage)
+            self._writer = create_writer(participant, topic_name, CompressedImage)
         else:
-            topic = Topic(participant, to_dds_topic(topic_name), Image)
-        self._writer = DataWriter(participant, topic)
+            self._writer = create_writer(participant, topic_name, Image)
 
     def publish(
         self,
