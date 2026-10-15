@@ -34,8 +34,8 @@ Configuration (carla_canvas's file, ``CARLA_CANVAS_CONFIG``)::
         exposure: 1.0
         lidar: {drop_threshold: 0.5, alpha_threshold: 0.1, min_range: 0.3, n_columns: auto}
 
-``alignment: geo`` needs splatsim's ``carla`` extra (lanelet2's MGRS
-projector, as :mod:`splatsim.carla_integration`). An actor's asset is placed
+``alignment: geo`` needs the ``carla_canvas`` extra (simple-lanelet2's
+MGRS projector and pyproj, :mod:`splatsim.geo_transform`). An actor's asset is placed
 at its bounding box's center (``anchor: bounding_box``, default) or at its
 CARLA origin (``anchor: origin``), x forward / y left / z up.
 """
@@ -48,12 +48,15 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import metadata
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+if TYPE_CHECKING:
+    from splatsim.scene import Scene
+
 try:
-    from carla_canvas import (  # ty: ignore[unresolved-import]
+    from carla_canvas import (
         CameraFrame,
         CameraView,
         LidarView,
@@ -61,12 +64,12 @@ try:
         Renderer,
         WorldInfo,
     )
-    from carla_canvas.geometry import Transform  # ty: ignore[unresolved-import]
-    from carla_canvas.scene import ActorInfo  # ty: ignore[unresolved-import]
-    from carla_canvas.scene import (  # ty: ignore[unresolved-import]
+    from carla_canvas.geometry import Transform
+    from carla_canvas.scene import ActorInfo
+    from carla_canvas.scene import (
         Scene as CanvasScene,
     )
-    from carla_canvas.sensors import LidarSpec  # ty: ignore[unresolved-import]
+    from carla_canvas.sensors import LidarSpec
 except ImportError:
     raise ImportError(
         "splatsim.carla_canvas requires carla_canvas.\n"
@@ -120,13 +123,25 @@ class SplatsimRenderer(Renderer):
 
     def __init__(self, options: dict[str, Any] | None = None) -> None:
         super().__init__(options)
-        self.scene = None  # splatsim.scene.Scene
-        self.frame: SceneFrame | None = None
+        self._scene: Scene | None = None
+        self._frame: SceneFrame | None = None
         self._actor_assets: list[_ActorAsset] = []
         self._asset_of: dict[int, _ActorAsset | None] = {}
         self._posed_frame = -1
         self._cameras: dict[tuple[int, int], Any] = {}
         self._lidars: dict[int, tuple[tuple, Any]] = {}
+
+    @property
+    def scene(self) -> Scene:
+        if self._scene is None:
+            raise RuntimeError("no world loaded (load_world has not run)")
+        return self._scene
+
+    @property
+    def frame(self) -> SceneFrame:
+        if self._frame is None:
+            raise RuntimeError("no world loaded (load_world has not run)")
+        return self._frame
 
     # --- world -------------------------------------------------------------------
 
@@ -150,10 +165,10 @@ class SplatsimRenderer(Renderer):
             )
         path = world.resolve(spec["scene"])
         self.device = torch.device(str(self.options.get("device", "cuda")))
-        self.scene = Scene.from_config(
+        self._scene = Scene.from_config(
             SceneConfig.from_source(path), device=self.device
         )
-        self.frame = self._scene_frame(spec, world)
+        self._frame = self._scene_frame(spec, world)
         self._actor_assets = _actor_assets(assets.get("actors") or {})
         self._asset_of.clear()
         self._posed_frame = -1
@@ -167,14 +182,14 @@ class SplatsimRenderer(Renderer):
         if str(spec.get("alignment", "geo")) != "geo":
             raise ValueError("alignment must be geo, or give a 4x4 matrix")
         try:
-            from splatsim.carla_integration.geo_transform import (
+            from splatsim.geo_transform import (
                 GeoTransform,
                 parse_geo_reference,
             )
         except ImportError as e:
             raise ImportError(
-                "alignment: geo needs lanelet2 and Autoware's MGRS projector "
-                "(lanelet2-python-api-for-autoware, see [tool.uv.sources]), "
+                "alignment: geo needs simple-lanelet2 and pyproj "
+                "(pip install 'splatsim[carla_canvas]'), "
                 f"or give the map an explicit matrix: {e}"
             ) from e
         if not world.opendrive:
@@ -230,7 +245,7 @@ class SplatsimRenderer(Renderer):
                 box = info.bounding_box
                 pose = pose @ Transform(box.location, box.rotation).matrix()
             m = self.frame.flu_pose(pose)
-            position = tuple(float(v) for v in m[:3, 3])
+            position = (float(m[0, 3]), float(m[1, 3]), float(m[2, 3]))
             rotation = quaternion_wxyz(m[:3, :3])
             name = self._body_name(actor_id)
             if name in self.scene.rigid_bodies:

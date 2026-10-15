@@ -21,11 +21,6 @@ outputs
 # 3D Tiles data (large binary files)
 test/data/*/iteration_*/
 
-# Generated protobuf/gRPC code
-src/splatsim/grpc_service/_generated/rendering_service_pb2.py
-src/splatsim/grpc_service/_generated/rendering_service_pb2_grpc.py
-src/splatsim/grpc_service/_generated/rendering_service_pb2.pyi
-
 # Serena MCP server cache
 .serena/
 

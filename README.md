@@ -1,6 +1,7 @@
 # splatsim
 
-3D Gaussian Splatting based simulator with DDS and CARLA integration.
+3D Gaussian Splatting based simulator. It renders CARLA cameras and LiDARs as a
+[carla_canvas](https://github.com/hakuturu583/carla_canvas) renderer backend.
 
 ## Prerequisites
 
@@ -15,8 +16,18 @@ splatsim can render the cameras and LiDARs of an unchanged
 [typesafe_carla](https://github.com/hakuturu583/typesafe_carla) program through
 [carla_canvas](https://github.com/hakuturu583/carla_canvas)
 (`renderer.backend: splatsim.carla_canvas:SplatsimRenderer`); carla_canvas
-provides the CARLA sensor models and the ROS 2 output. See
-[docs/carla_canvas.md](docs/carla_canvas.md).
+provides the CARLA sensor models and the ROS 2 output. The Docker image runs
+it as a carla_canvas renderer service:
+
+```bash
+# canvas.yaml (renderer.backend: splatsim.carla_canvas:SplatsimRenderer) and
+# its scene USDZs in the current directory
+docker run --rm --gpus all -p 50051:50051 -v $PWD:/config ghcr.io/tier4/splatsim:latest-sm89
+# on the CARLA client: renderer.endpoint: "<gpu-host>:50051" in its canvas.yaml
+CARLA_CANVAS_CONFIG=canvas.yaml typesafe-codon run main.py
+```
+
+See [docs/carla_canvas.md](docs/carla_canvas.md).
 
 ## Installation
 
@@ -29,24 +40,15 @@ uv sync
 # With GUI viewer
 uv sync --extra gui
 
-# With DDS support
-uv sync --extra dds
+# As a carla_canvas renderer (`carla-canvas serve`)
+uv sync --extra carla_canvas
 
-# With CARLA support (includes DDS)
-uv sync --extra carla
+# `splatsim-viewer --mp4` (the viewer module needs the GUI extra too)
+uv sync --extra gui --extra mp4
 
 # All optional dependencies
 uv sync --extra all
 ```
-
-> CARLA extra requires system libraries for lanelet2. On Ubuntu 22.04:
->
-> ```bash
-> sudo apt-get install -y \
->   libboost-dev libboost-serialization-dev libboost-filesystem-dev \
->   libboost-program-options-dev libboost-python-dev libboost-system-dev \
->   libeigen3-dev libpugixml-dev libgeographic-dev librange-v3-dev python3-dev
-> ```
 
 ### Docker
 
@@ -78,13 +80,20 @@ docker pull ghcr.io/tier4/splatsim:1.0.0-cuda12.8.1-sm89
 # Rolling latest for an RTX 50xx (Blackwell, sm_120)
 docker pull ghcr.io/tier4/splatsim:latest-sm120
 
-# Run (requires NVIDIA Container Toolkit)
-docker run --rm -it --gpus all ghcr.io/tier4/splatsim:latest-sm89
+# Run the carla_canvas renderer service (requires NVIDIA Container Toolkit):
+# mount the directory holding canvas.yaml and its scenes at /config
+docker run --rm --gpus all -p 50051:50051 -v $PWD:/config ghcr.io/tier4/splatsim:latest-sm89
 ```
+
+The image's command is `carla-canvas serve --endpoint 0.0.0.0:50051` with
+`CARLA_CANVAS_CONFIG=/config/canvas.yaml`; set `-e CARLA_CANVAS_CONFIG=...` for
+another file. Maps align through their OpenDRIVE geo-reference
+(`alignment: geo`, with [simple_lanelet2](https://github.com/hakuturu583/simple_lanelet2)'s
+MGRS projector) or an explicit `matrix` (docs/carla_canvas.md).
 
 #### Build locally
 
-The Dockerfile uses a multi-stage build with the `dds` extra to keep the image minimal.
+The Dockerfile uses a multi-stage build with the `carla_canvas` extra to keep the image minimal.
 
 ```bash
 # Build
@@ -93,7 +102,7 @@ docker buildx build \
   -t splatsim .
 
 # Run (requires NVIDIA Container Toolkit)
-docker run --rm -it --gpus all splatsim
+docker run --rm --gpus all -p 50051:50051 -v $PWD:/config splatsim
 ```
 
 To customize CUDA or Ubuntu versions:
@@ -112,11 +121,11 @@ docker buildx build \
 # Launch the viewer
 splatsim-viewer
 
-# Render a configured LiDAR and publish sensor_msgs/PointCloud2 via DDS
-splatsim-viewer scene.usdz --lidar top --dds
+# Show a configured LiDAR's panorama
+splatsim-viewer scene.usdz --lidar top
 
-# Run a scenario
-spawn-scenario
+# Render the rig camera's trajectory to an MP4 (the `gui` and `mp4` extras)
+splatsim-viewer scene.usdz --mp4 out.mp4
 ```
 
 ## Dynamic objects (actor assets)
@@ -130,7 +139,7 @@ background chunks use, so an actor's Gaussians and its per-Gaussian LiDAR
 attributes go through the readers splatsim already has.
 
 **Poses come from outside.** splatsim hands you a `RigidBody` per instance and
-the scenario drives it — a CARLA bridge, a scenario runner, the gRPC service.
+the scenario drives it — e.g. the carla_canvas backend, which poses CARLA's actors.
 The bundle's own `sequence_tracks.json` is metadata here, exposed for callers
 that want to replay it, not a playback engine.
 
@@ -163,60 +172,6 @@ helpers:
 - **Quaternion order.** Everything inside a scene bundle is `xyzw`; every
   splatsim pose is `wxyz`. Route bundle poses through
   `splatsim.actor_assets.pose_from_track_frame`.
-
-### Over gRPC
-
-The rendering service places and drives the same objects, so a client that
-already streams sensor poses does not need a second channel for the traffic
-around them:
-
-```python
-stub.Initialize(pb2.InitializeRequest(scene_path="scene.usdz", ...))
-
-# What the bundle ships
-for asset in stub.ListActorAssets(pb2.ListActorAssetsRequest()).assets:
-    print(asset.asset_id, asset.class_name, asset.size)
-
-stub.SpawnActor(pb2.SpawnActorRequest(
-    instance_id="car_01",
-    asset_id="sedan_0007",          # or asset_path="/data/sedan.spz"
-    pose=pb2.Pose(position=..., rotation=...),
-))
-
-def poses():
-    for stamp, ego, actors in scenario:
-        yield pb2.RigData(
-            stamp=stamp,
-            pose=ego,
-            actors=[pb2.ActorPose(instance_id="car_01", pose=actors["car_01"])],
-        )
-
-stub.StreamRigData(poses())
-```
-
-`actors` rides on the pose messages of all three streams (`StreamCameraData`,
-`StreamLidarData`, `StreamRigData`). The newest poses the stream has delivered
-are applied to the scene right before the frame is rendered — so a frame's
-objects are as fresh as its ego pose, and on a rig every sensor sees them at one
-instant. Leaving `actors` out of a message keeps the previous poses, so a client
-may move objects at a lower rate than it streams poses (the server then skips
-the update entirely rather than re-uploading unchanged poses).
-
-Two differences from the Python API, both because the wire is not the scenario:
-
-- **Frame.** Camera / LiDAR / rig poses are streamed tile-local, so actors
-  default to the same frame rather than to the world frame `spawn_actor` uses.
-  Set `world_frame` on `SpawnActor` to send ENU world coordinates and have the
-  server subtract the origin it reported in `InitializeResponse.scene_origin`;
-  the choice is fixed per instance and applies to every `ActorPose` after it.
-- **Zero quaternions.** proto3 has no unset scalar, so an all-zero `rotation`
-  means "keep the current one" rather than collapsing the object — fill it in
-  only when you mean to turn something.
-
-`SpawnActor` also takes an `asset_path` to a standalone `.spz` / `.ply` /
-`.glb`, for scenes whose bundle ships no bank; instances of one path share a
-single upload, as bank assets do. `RemoveActor` takes an object back out — it
-is gone from the next frame.
 
 ### View-dependent bands, camera and LiDAR
 
@@ -253,95 +208,13 @@ actors:
     rotation: [0.966, 0.0, 0.0, 0.259] # wxyz
 ```
 
-## LiDAR transport (DDS vs. HILS)
+## Hesai HILS packets
 
-Each LiDAR sensor in a scene renders a point cloud that can be delivered two ways,
-selected per sensor with the `communication` field:
-
-- `dds` (default): publishes a `sensor_msgs/PointCloud2` over CycloneDDS on
-  `pointcloud_topic`, in the ROS 2 domain `ROS_DOMAIN_ID` names (default `0`).
-  Set it to the domain the subscriber runs in, as you would for any other ROS 2
-  process -- on a different domain the subscriber simply never sees a publisher.
-- `hils`: hardware-in-the-loop mode. Emits raw Hesai UDP data packets that mimic
-  the physical sensor's wire format, so an unmodified LiDAR driver (e.g. Autoware
-  `nebula`) can consume them. The `sensor_type` selects the packet format;
-  currently supported models are **OT128** (Pandar OT128) and **XT32**
-  (PandarXT-32).
-
-```yaml
-lidar_sensors:
-  - name: top
-    sensor_type: XT32        # OT128 | XT32
-    communication: hils      # dds (default) | hils
-    hils_host: 192.168.1.201 # UDP destination (unicast or broadcast)
-    hils_port: 2368          # Hesai point-cloud port
-    # hils_start_epoch: 1700000000  # optional: Unix time that sim-time 0
-    #                               # maps to; omit to start "now".
-```
-
-Packet timestamps use the **simulation clock**: the date-time/timestamp written
-into each packet is `hils_start_epoch + <simulation elapsed time>`. When
-`hils_start_epoch` is omitted it defaults to the wall-clock time at which the
-sensor is created (simulation starts "now").
-
-Packets are encoded with `torch` directly from the rendered range image, so when
-the renderer runs on CUDA the entire encode stays on the GPU and only the packed
-byte buffer crosses to the host (once per frame) for the UDP send.
-
-## gRPC service: sensor data over DDS or gRPC
-
-The rendering service (`splatsim-grpc-server`, the Docker image's default
-command) publishes every camera image, camera info and LiDAR point cloud over
-CycloneDDS by default. To get them back over the gRPC connection instead -- no
-DDS / ROS 2 setup on the client, or a network DDS discovery does not cross --
-start it with the gRPC sensor transport:
-
-```bash
-splatsim-grpc-server --sensor-transport grpc
-
-# Docker: the same switch as an environment variable
-docker run --rm -it --gpus all -p 50051:50051 \
-  -e SPLATSIM_SENSOR_TRANSPORT=grpc ghcr.io/tier4/splatsim:latest-sm89
-```
-
-`--sensor-transport` takes `dds` (default) or `grpc`; when the flag is absent
-`SPLATSIM_SENSOR_TRANSPORT` decides, and an unknown value refuses to start. With
-`grpc` the server creates no DDS entities at all, and `InitializeResponse`
-reports the active transport in `sensor_transport`.
-
-Clients then open `SubscribeSensorData` alongside their pose stream. Every
-message the DDS path would have written arrives as a `SensorData` carrying the
-same topic name and a payload mirroring the `sensor_msgs` type it replaces
-(`Image`, `CompressedImage`, `CameraInfo` or `PointCloud2`, with the same
-16-byte point layout):
-
-```python
-channel = grpc.insecure_channel(
-    "localhost:50051",
-    # A raw 1080p bgr8 image is ~6 MB, over gRPC's 4 MB default.
-    options=[("grpc.max_receive_message_length", 64 * 1024 * 1024)],
-)
-stub = pb2_grpc.RenderingServiceStub(channel)
-
-def receive():
-    request = pb2.SubscribeSensorDataRequest(topics=[])  # [] = every topic
-    for msg in stub.SubscribeSensorData(request):
-        if msg.HasField("point_cloud"):
-            points = np.frombuffer(msg.point_cloud.data, dtype=POINT_DTYPE)
-        elif msg.HasField("image"):
-            ...
-
-threading.Thread(target=receive, daemon=True).start()
-stub.StreamRigData(poses())
-```
-
-The subscription stays open until the client cancels it and may be opened
-before `Initialize`. Frames rendered while nobody is subscribed are dropped, as
-on a DDS topic without readers, and a client that falls behind loses its oldest
-queued messages (`queue_size`, default 16, at most 64) rather than slowing rendering down.
-Each open stream holds one server worker thread, so raise `--max-workers` if
-several subscribers and pose streams run at once. Under the default `dds`
-transport `SubscribeSensorData` fails with `FAILED_PRECONDITION`.
+`splatsim.hils` encodes a rendered LiDAR range image as raw Hesai UDP data
+packets (**OT128**, **XT32**) that an unmodified LiDAR driver (e.g. Autoware
+`nebula`) can consume, on the GPU when the renderer runs on CUDA
+(`HesaiHilsPublisher`, `build_packets`). Packet timestamps are
+`start_epoch_s + <simulation elapsed time>`.
 
 ## LiDAR evaluation
 

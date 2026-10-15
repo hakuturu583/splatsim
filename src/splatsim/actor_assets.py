@@ -22,7 +22,7 @@ Poses come from outside
 
 The library hands out :class:`~splatsim.rigid_body.RigidBody` instances and
 nothing more: where an actor goes each frame is the caller's business — a CARLA
-bridge, a scenario runner, the gRPC service. The bundle's own tracks are
+bridge such as the carla_canvas backend, a scenario runner. The bundle's own tracks are
 metadata here, exposed through :meth:`ActorAssetLibrary.bound_track_ids` for
 callers that want to replay them, not a playback engine.
 

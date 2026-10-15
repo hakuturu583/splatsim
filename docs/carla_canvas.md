@@ -35,9 +35,7 @@ vehicle's splats.
 ## Use
 
 ```sh
-pip install carla-canvas                    # the renderer SDK (no CARLA client needed here)
-# alignment: geo also needs lanelet2 and Autoware's MGRS projector
-# (lanelet2-python-api-for-autoware, see [tool.uv.sources])
+uv sync --extra carla_canvas                # carla-canvas, simple-lanelet2 and pyproj (alignment: geo)
 carla-canvas serve --config canvas.yaml     # on the GPU machine
 # on the client: CARLA_CANVAS_CONFIG=canvas.yaml typesafe-codon run main.py
 ```
@@ -70,10 +68,25 @@ ros:
   backend: auto
 ```
 
+### Docker
+
+The splatsim image runs this backend: its command is `carla-canvas serve
+--endpoint 0.0.0.0:50051` with `CARLA_CANVAS_CONFIG=/config/canvas.yaml`.
+
+```sh
+# canvas.yaml (as above) and its scene USDZs in the current directory
+docker run --rm --gpus all -p 50051:50051 -v $PWD:/config ghcr.io/tier4/splatsim:latest-sm89
+```
+
+The client uses its own copy of the configuration with `endpoint:
+"<gpu-host>:50051"` (and no `command`, so it does not try to start a renderer
+itself). Asset paths are relative to the configuration file. `alignment: geo`
+works in the image (simple-lanelet2).
+
 ## Frames
 
-`alignment: geo` maps CARLA positions through the same pipeline as
-`splatsim.carla_integration` (`GeoTransform`: CARLA → OpenDRIVE → MGRS → LLA →
+`alignment: geo` maps CARLA positions through `splatsim.geo_transform`
+(`GeoTransform`: CARLA → OpenDRIVE → MGRS → LLA →
 ECEF → tile-local, re-centered), using the OpenDRIVE that carla_canvas sends
 with the map (protocol 2) and the scene's ECEF anchor. CARLA rotations come
 from carla_canvas as Unreal rotation matrices. `splatsim.carla_canvas.frames`

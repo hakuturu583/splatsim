@@ -946,7 +946,7 @@ def _panorama_geometry(
         k, s_count = sector
         c0, c1 = _sector_col_range(w_full, k, s_count)
         # The sector's pose pair is interpolated at sweep fractions k/S and
-        # (k+1)/S (see the gRPC sector loop); roll times below are relative to
+        # (k+1)/S; roll times below are relative to
         # the midpoint of that pose window. The COLUMN window may lean a few
         # columns past the pose window (tile-rounded boundaries) — that only
         # stretches the roll times, the motion model is anchored to the poses.
@@ -2226,8 +2226,7 @@ class LidarRenderer:
     ) -> tuple[np.ndarray, int]:
         """Pack the valid returns straight into PointCloud2 point records.
 
-        Produces the exact 16-byte little-endian record layout used by
-        :mod:`splatsim.cyclonedds.pointcloud2_publisher` (x, y, z float32 |
+        Produces a 16-byte little-endian PointCloud2 record layout (x, y, z float32 |
         intensity uint8 | return_type uint8 = 0 | channel uint16) — but packs
         it on the GPU and moves ONE contiguous buffer to the host, instead of
         transferring xyz / intensity / channel separately and re-packing them

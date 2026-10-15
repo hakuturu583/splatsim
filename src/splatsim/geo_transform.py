@@ -21,8 +21,8 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 
-import lanelet2.core  # ty: ignore[unresolved-import]
-import lanelet2.io  # ty: ignore[unresolved-import]
+import lanelet2.core
+import lanelet2.io
 import numpy as np
 from autoware_lanelet2_extension_python.projection import (
     MGRSProjector,
