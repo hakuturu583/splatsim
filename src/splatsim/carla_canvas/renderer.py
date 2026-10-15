@@ -66,6 +66,7 @@ try:
     from carla_canvas.scene import (  # ty: ignore[unresolved-import]
         Scene as CanvasScene,
     )
+    from carla_canvas.sensors import LidarSpec  # ty: ignore[unresolved-import]
 except ImportError:
     raise ImportError(
         "splatsim.carla_canvas requires carla_canvas.\n"
@@ -304,14 +305,15 @@ class SplatsimRenderer(Renderer):
         from splatsim.lidar_renderer import LidarRenderer, LidarSensorSpec
 
         o = dict(self.options.get("lidar") or {})
-        a = view.attributes
+        # the blueprint's attributes with CARLA's defaults, as carla_canvas fires them
+        carla = LidarSpec.from_actor(view.scene.actors[view.sensor_id])
         columns = o.get("n_columns", "auto")
         if columns in (None, "auto"):
             columns = default_n_columns(
-                float(a.get("points_per_second", 56000)),
+                carla.points_per_second,
                 len(view.elevations),
-                float(a.get("rotation_frequency", 10.0)),
-                float(a.get("horizontal_fov", 360.0)),
+                carla.rotation_frequency,
+                carla.horizontal_fov,
             )
         key = (
             tuple(float(e) for e in view.elevations),
@@ -330,7 +332,7 @@ class SplatsimRenderer(Renderer):
             sensor_type="",
             s2b=np.eye(4),
             n_columns=n_columns,
-            spinning_frequency_hz=float(a.get("rotation_frequency", 10.0)),
+            spinning_frequency_hz=carla.rotation_frequency,
             row_elevations_rad=tuple(float(np.radians(e)) for e in elevations),
         )
         renderer = LidarRenderer(
