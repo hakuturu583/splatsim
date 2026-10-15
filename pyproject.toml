@@ -16,9 +16,6 @@ dependencies = [
     "scipy>=1.10",
     "pyyaml>=6.0",
     "setuptools",
-    "grpcio>=1.60.0",
-    "protobuf>=4.25.0",
-    "grpcio-tools>=1.60.0",
     "packaging",
     # SplatAD spherical LiDAR rasterizer, now its own package rather than a copy
     # in-tree (see [tool.uv.sources]). It JIT-builds its CUDA extension on first
@@ -32,9 +29,15 @@ dependencies = [
 gui = [
     "PyQt5>=5.15.0",
 ]
-dds = [
-    "cyclonedds>=11.0.1",
+# `splatsim-viewer --mp4` (src/splatsim/_mp4.py).
+mp4 = [
     "opencv-python-headless>=4.0.0",
+]
+# The carla_canvas renderer backend (src/splatsim/carla_canvas, docs/carla_canvas.md):
+# `carla-canvas serve` with `backend: splatsim.carla_canvas:SplatsimRenderer`.
+# What the Docker image runs.
+carla_canvas = [
+    "carla-canvas>=0.1.1",
 ]
 # Ground-truth LiDAR evaluation (src/eval, run as `python -m eval.eval_lidar`).
 # Pulls a local WebAuto / T4 dataset via t4-devkit for the GT trajectory + GT
@@ -173,19 +176,13 @@ dev = [
 
 [project.scripts]
 splatsim-viewer = "splatsim.viewer:main"
-splatsim-grpc-server = "splatsim.grpc_service.cli:main"
-
-[tool.ruff]
-exclude = [
-    "src/splatsim/grpc_service/_generated",
-]
 
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-module-name = ["splatsim", "scenarios"]
+module-name = ["splatsim"]
 
 # `.claude/` is Claude Code's local scratch space (worktrees, memory, cached
 # artefacts). It contains full copies of the repo from other branches whose
@@ -200,42 +197,13 @@ include = ["launch/**"]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
 
-# scenarios also imports ament_index_python (ROS 2 only, not pip-installable)
-# and autoware_carla_scenario, whose sensor-config dataclasses it constructs by
-# keyword — invisible base classes, so the same unknown-argument cascade as the
-# carla_integration block below.
+# geo_transform (the carla_canvas backend's `alignment: geo`) imports lanelet2,
+# Autoware's MGRS projector and pyproj, which are installed separately
+# (lanelet2-python-api-for-autoware, see [tool.uv.sources]).
 [[tool.ty.overrides]]
-include = ["src/scenarios/**"]
+include = ["src/splatsim/geo_transform.py"]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
-unknown-argument = "ignore"
-
-# Generated protobuf/gRPC stubs are produced at build time and gitignored,
-# so they are absent during CI type-checking. This also covers tests that
-# import those stubs (e.g. test_grpc_lod.py's rendering_service_pb2 import).
-[[tool.ty.overrides]]
-include = [
-    "src/splatsim/grpc_service/**",
-    "test/test_grpc_lod.py",
-    "test/test_grpc_pose_stream.py",
-    "test/test_grpc_actors.py",
-    "test/test_grpc_sensor_stream.py",
-]
-[tool.ty.overrides.rules]
-unresolved-import = "ignore"
-
-# The CARLA integration imports `carla` and `autoware_carla_scenario`, neither of
-# which is pip-installable, so the whole subtree is unresolvable in CI. Beyond the
-# imports themselves this hides base classes: SplatSimLidarSensorConfig is a
-# dataclass deriving from autoware_carla_scenario's LidarSensorConfig, so ty
-# synthesises __init__ from the visible fields only and reports every inherited
-# field as an unknown argument. The same blindness makes the module's existing
-# suppressions look unused.
-[[tool.ty.overrides]]
-include = ["src/splatsim/carla_integration/**"]
-[tool.ty.overrides.rules]
-unresolved-import = "ignore"
-unknown-argument = "ignore"
 unused-ignore-comment = "ignore"
 
 # The LiDAR eval script depends on the optional `eval` extra (t4-devkit,
@@ -252,7 +220,5 @@ name = "splatsim"
 "share/ament_index/resource_index/packages" = ["resource/splatsim"]
 "share/splatsim" = ["package.xml", ".env"]
 "share/splatsim/launch" = [
-    "launch/splatsim_scenario.launch.xml",
-    "launch/splatsim_scenario.launch.py",
     "launch/splatsim_viewer.launch.xml",
 ]

@@ -34,8 +34,8 @@ Configuration (carla_canvas's file, ``CARLA_CANVAS_CONFIG``)::
         exposure: 1.0
         lidar: {drop_threshold: 0.5, alpha_threshold: 0.1, min_range: 0.3, n_columns: auto}
 
-``alignment: geo`` needs splatsim's ``carla`` extra (lanelet2's MGRS
-projector, as :mod:`splatsim.carla_integration`). An actor's asset is placed
+``alignment: geo`` needs lanelet2 and Autoware's MGRS projector
+(:mod:`splatsim.geo_transform`). An actor's asset is placed
 at its bounding box's center (``anchor: bounding_box``, default) or at its
 CARLA origin (``anchor: origin``), x forward / y left / z up.
 """
@@ -167,7 +167,7 @@ class SplatsimRenderer(Renderer):
         if str(spec.get("alignment", "geo")) != "geo":
             raise ValueError("alignment must be geo, or give a 4x4 matrix")
         try:
-            from splatsim.carla_integration.geo_transform import (
+            from splatsim.geo_transform import (
                 GeoTransform,
                 parse_geo_reference,
             )

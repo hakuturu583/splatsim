@@ -39,14 +39,12 @@ ENV TORCH_EXTENSIONS_DIR=/workspace/splatsim/.torch_extensions
 COPY pyproject.toml uv.lock .python-version README.md ./
 COPY resource/ resource/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --extra dds --no-dev --no-install-project
+    uv sync --extra carla_canvas --no-dev --no-install-project
 
-# Copy source, generate proto code, and install project
+# Copy source and install project
 COPY src/ src/
-COPY proto/ proto/
-RUN uv run python src/splatsim/grpc_service/generate_proto.py
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --extra dds --no-dev
+    uv sync --extra carla_canvas --no-dev
 
 # Pre-compile gsplat CUDA kernels (JIT) so the runtime image does not need nvcc.
 # `mkdir -p` guarantees the extensions dir exists even when gsplat's wheel
@@ -133,5 +131,11 @@ ENV VIRTUAL_ENV=/workspace/splatsim/.venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 ENV TORCH_EXTENSIONS_DIR=/workspace/splatsim/.torch_extensions
 
+# A carla_canvas renderer service (docs/carla_canvas.md): mount the directory
+# holding canvas.yaml (renderer.backend: splatsim.carla_canvas:SplatsimRenderer)
+# and its scene USDZs at /config, e.g.
+#   docker run --gpus all -p 50051:50051 -v $PWD:/config <image>
+# Asset paths in the config are relative to the config file.
+ENV CARLA_CANVAS_CONFIG=/config/canvas.yaml
 EXPOSE 50051
-CMD ["splatsim-grpc-server"]
+CMD ["carla-canvas", "serve", "--endpoint", "0.0.0.0:50051"]

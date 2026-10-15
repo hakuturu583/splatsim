@@ -4,7 +4,6 @@ import argparse
 import math
 import sys
 import time
-import types
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,26 +14,12 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QImage, QKeyEvent, QPainter, QPixmap
 from PyQt5.QtWidgets import QApplication, QLabel, QMainWindow
 
-from splatsim.cyclonedds.msg_types import Time
 from splatsim.renderer import Renderer
 
 if TYPE_CHECKING:
-    from splatsim.cyclonedds.camera_info_publisher import CameraInfoPublisher
-    from splatsim.cyclonedds.image_publisher import ImagePublisher
-    from splatsim.cyclonedds.pointcloud2_publisher import PointCloud2Publisher
     from splatsim.dataclass import LidarConfig
     from splatsim.lidar_renderer import LidarRenderer
     from splatsim.scene import Scene
-
-
-def _wall_clock_stamp() -> Time:
-    """Wall-clock timestamp for the standalone viewer.
-
-    Callers running under a sim clock (e.g. CARLA co-sim) must build their
-    own ``Time`` from the sim time source instead of calling this.
-    """
-    sec, nanosec = divmod(time.time_ns(), 10**9)
-    return Time(sec=sec, nanosec=nanosec)
 
 
 # When a LiDAR panorama is shown instead of a camera image, the window is
@@ -100,11 +85,7 @@ class Viewer(QMainWindow):
         rotate_speed: float = 1.5,
         initial_position: tuple[float, float, float] | None = None,
         initial_yaw_deg: float | None = None,
-        image_publisher: ImagePublisher | None = None,
-        camera_info_publisher: CameraInfoPublisher | None = None,
         lidar_renderer: LidarRenderer | None = None,
-        pointcloud_publisher: PointCloud2Publisher | None = None,
-        lidar_drop_threshold: float = 0.5,
         lidar_alpha_threshold: float = 0.1,
         camera_name: str | None = None,
     ) -> None:
@@ -169,11 +150,6 @@ class Viewer(QMainWindow):
         # HUD font
         self._hud_font = QFont("monospace", 12)
 
-        # DDS publishers (optional)
-        self._image_pub = image_publisher
-        self._camera_info_pub = camera_info_publisher
-        self._pointcloud_pub = pointcloud_publisher
-        self._lidar_drop_threshold = lidar_drop_threshold
         self._lidar_alpha_threshold = lidar_alpha_threshold
 
         # Render timer (~30 FPS)
@@ -321,13 +297,6 @@ class Viewer(QMainWindow):
         image_np = (image.clamp(0.0, 1.0) * 255).byte().cpu().numpy()
         image_np = np.ascontiguousarray(image_np)
 
-        if self._image_pub is not None:
-            stamp = _wall_clock_stamp()
-            bgr_np = np.ascontiguousarray(image_np[:, :, ::-1])
-            self._image_pub.publish(bgr_np, stamp=stamp)
-            if self._camera_info_pub is not None:
-                self._camera_info_pub.publish(stamp=stamp)
-
         return image_np
 
     def _render_lidar_np(self) -> np.ndarray:
@@ -336,18 +305,6 @@ class Viewer(QMainWindow):
         base_to_world = self._build_base_to_world()
         with torch.no_grad():
             panorama = self.lidar_renderer.render(base_to_world, scene=self.scene)
-            if self._pointcloud_pub is not None:
-                point_cloud = self.lidar_renderer.panorama_to_point_cloud(
-                    panorama,
-                    drop_threshold=self._lidar_drop_threshold,
-                    alpha_threshold=self._lidar_alpha_threshold,
-                )
-                self._pointcloud_pub.publish(
-                    point_cloud["xyz"],
-                    point_cloud["intensity"],
-                    channel=point_cloud["channel"],
-                    stamp=_wall_clock_stamp(),
-                )
         return _lidar_panorama_to_rgb(
             panorama,
             min_range_m=self.lidar_renderer.min_range_m,
@@ -406,8 +363,6 @@ class Viewer(QMainWindow):
                 f"LiDAR: {spec.name} ({spec.sensor_type or 'uniform'}, "
                 f"{self.lidar_renderer.n_rows}x{self.lidar_renderer.n_columns})"
             )
-        if self._image_pub is not None or self._pointcloud_pub is not None:
-            lines.append("DDS: publishing")
         for i, line in enumerate(lines):
             painter.drawText(10, 20 + i * 18, line)
         painter.end()
@@ -459,20 +414,6 @@ def main() -> None:
             "initial pose (e.g. CAM_FRONT). Defaults to the first camera in "
             "the first rig."
         ),
-    )
-    parser.add_argument(
-        "--dds",
-        action="store_true",
-        help="Publish images and camera info via CycloneDDS",
-    )
-    parser.add_argument("--topic-image", default="/splatsim/image_raw")
-    parser.add_argument("--topic-camera-info", default="/splatsim/camera_info")
-    parser.add_argument("--frame-id", default="camera")
-    parser.add_argument(
-        "--compress-format",
-        default="",
-        help="Compress format for published images (e.g. 'jpeg', 'png'). "
-        "Empty string (default) publishes raw sensor_msgs/Image.",
     )
     parser.add_argument(
         "--pos",
@@ -547,8 +488,6 @@ def main() -> None:
         args.scene_source, camera_name=args.camera, lod_enabled=args.lod
     )
 
-    if args.mp4 and args.dds:
-        raise SystemExit("Error: --mp4 and --dds cannot be combined")
     if args.lidar is not None and not args.lidar:
         raise SystemExit("Error: --lidar requires a sensor name; got an empty string")
     if args.lidar is not None and args.mp4:
@@ -556,56 +495,6 @@ def main() -> None:
     lidar_cfg = (
         _find_lidar_config(config, args.lidar) if args.lidar is not None else None
     )
-
-    image_pub = None
-    camera_info_pub = None
-    pointcloud_pub = None
-    if args.dds:
-        try:
-            from splatsim.cyclonedds.domain import make_participant
-        except ImportError:
-            raise SystemExit(
-                "Error: --dds requires CycloneDDS.\n"
-                "Install with: pip install splatsim[dds]"
-            ) from None
-
-        dp = make_participant()
-        if lidar_cfg is None:
-            from splatsim.cyclonedds import CameraInfoPublisher, ImagePublisher
-
-            image_pub = ImagePublisher(
-                dp,
-                topic_name=args.topic_image,
-                frame_id=args.frame_id,
-                compress_format=args.compress_format,
-            )
-
-            # Build a config-like object with the same intrinsics the Viewer uses.
-            rc, vc = config.renderer, config.viewer
-            fov_y = math.radians(vc.fov_y_deg)
-            fy = rc.height / (2.0 * math.tan(fov_y / 2.0))
-            cam_cfg = types.SimpleNamespace(
-                fx=fy,
-                fy=fy,
-                cx=rc.width / 2.0,
-                cy=rc.height / 2.0,
-                image_width=rc.width,
-                image_height=rc.height,
-            )
-            camera_info_pub = CameraInfoPublisher(
-                dp,
-                cam_cfg,
-                topic_name=args.topic_camera_info,
-                frame_id=args.frame_id,
-            )
-        else:
-            from splatsim.cyclonedds import PointCloud2Publisher
-
-            pointcloud_pub = PointCloud2Publisher(
-                dp,
-                topic_name=lidar_cfg.pointcloud_topic,
-                frame_id=lidar_cfg.frame_id,
-            )
 
     from splatsim.scene import Scene, print_progress
 
@@ -661,11 +550,7 @@ def main() -> None:
         rotate_speed=vc.rotate_speed,
         initial_position=initial_position,
         initial_yaw_deg=initial_yaw_deg,
-        image_publisher=image_pub,
-        camera_info_publisher=camera_info_pub,
         lidar_renderer=lidar_renderer,
-        pointcloud_publisher=pointcloud_pub,
-        lidar_drop_threshold=lidar_cfg.drop_threshold if lidar_cfg is not None else 0.5,
         lidar_alpha_threshold=(
             lidar_cfg.alpha_threshold if lidar_cfg is not None else 0.1
         ),

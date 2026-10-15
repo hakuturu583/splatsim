@@ -4,7 +4,7 @@ carla_canvas hands the renderer CARLA poses (Unreal's left-handed frame: x
 forward, y right, z up; columns of a pose's rotation are the body's forward,
 right and up axes). splatsim renders in a right-handed tile-local frame. A
 :class:`SceneFrame` maps one onto the other, either through the map's
-geo-reference (the same pipeline as :mod:`splatsim.carla_integration`) or
+geo-reference (:mod:`splatsim.geo_transform`) or
 through an explicit matrix, and derives what splatsim's renderers take:
 
 * cameras: a world-to-camera view matrix in gsplat's RDF convention;
@@ -56,7 +56,7 @@ class SceneFrame:
 
     @staticmethod
     def from_geo(geo_transform) -> SceneFrame:
-        """Through a :class:`splatsim.carla_integration.GeoTransform` (the map's
+        """Through a :class:`splatsim.geo_transform.GeoTransform` (the map's
         OpenDRIVE geo-reference and the scene's ECEF anchor)."""
         # carla_rotation_to_tile_local(R) = R_enu_to_tile @ S @ R: linear in R
         rotation = geo_transform.carla_rotation_to_tile_local(np.eye(3))

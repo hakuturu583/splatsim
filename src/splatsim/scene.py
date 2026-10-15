@@ -18,8 +18,6 @@ from splatsim.renderer import Renderer
 from splatsim.rigid_body import RigidBody
 
 if TYPE_CHECKING:
-    from splatsim.cyclonedds.camera_info_publisher import CameraInfoPublisher
-    from splatsim.cyclonedds.image_publisher import ImagePublisher
     from splatsim.ppisp import PpispTables
     from splatsim.viewer import Viewer
 
@@ -121,9 +119,9 @@ class Scene:
         """Return the bundle's actor asset bank, loading it on first use.
 
         :meth:`spawn_actor` goes through here; so does anything that only wants
-        to *look* at what the bundle ships (the gRPC ``ListActorAssets``
-        handler) without spawning anything. Raises when there is no background
-        USDZ to read a bank from, or when that bundle carries none.
+        to *look* at what the bundle ships without spawning anything. Raises
+        when there is no background USDZ to read a bank from, or when that
+        bundle carries none.
         """
         if self._actor_library is None:
             if self.background is None:
@@ -463,8 +461,6 @@ def resolve_initial_pose(
 def load_scene(
     config: SceneConfig | str | Path,
     *,
-    image_publisher: ImagePublisher | None = None,
-    camera_info_publisher: CameraInfoPublisher | None = None,
     camera_name: str | None = None,
 ) -> Viewer:
     """Build a Viewer from a SceneConfig or a scene USDZ path.
@@ -506,7 +502,5 @@ def load_scene(
         rotate_speed=vc.rotate_speed,
         initial_position=initial_position,
         initial_yaw_deg=initial_yaw_deg,
-        image_publisher=image_publisher,
-        camera_info_publisher=camera_info_publisher,
         camera_name=camera_name,
     )

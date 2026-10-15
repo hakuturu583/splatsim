@@ -1,8 +1,8 @@
 """Shared geometry primitives: quaternion / rotation / pose-interpolation math.
 
 Before this module the same handful of transforms was re-implemented across
-``_usdz``, ``lidar_renderer``, ``grpc_service.pose_buffer``,
-``carla_integration`` and ``eval/eval_lidar`` — each with its own quaternion
+``_usdz``, ``lidar_renderer``, the former gRPC service, the CARLA
+integration and ``eval/eval_lidar`` — each with its own quaternion
 order and its own SLERP/LERP copy. They now all delegate here.
 
 The rotation math itself is delegated to :mod:`scipy.spatial.transform`

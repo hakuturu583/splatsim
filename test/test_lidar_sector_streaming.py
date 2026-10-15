@@ -1,6 +1,6 @@
 """Sector streaming: render a LiDAR revolution as azimuth wedges.
 
-Three contracts are pinned here:
+Two contracts are pinned here:
 
 * **Azimuth-wedge cull parity** — the fused CUDA cull's wedge test matches the
   PyTorch fallback bit-for-bit, including wedges touching the ±180° seam.
@@ -10,17 +10,11 @@ Three contracts are pinned here:
   translation (rolling shutter per sector vs one whole-sweep pose pair are
   different — per-sector is the better — approximations, so only near-equality
   can be asserted).
-* **The gRPC sector loop** — sectors are scheduled off the pose timeline
-  (rendered as soon as their sweep slice is covered), revolutions publish with
-  the sweep-end stamp, and the loop resyncs to fresh poses after a gap.
 """
 
 from __future__ import annotations
 
 import math
-import threading
-import time
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -322,165 +316,3 @@ def test_depth_lanes_match_serial_rasterization(monkeypatch) -> None:
         assert torch.equal(a["distance"], b["distance"]), mode
         for key in ("intensity", "raydrop_logit"):
             assert torch.allclose(a[key], b[key], atol=1e-5), (mode, key)
-
-
-# ── the gRPC sector loop ─────────────────────────────────────────────────
-
-
-def _pose_msg(t_ns: int, x: float):
-    return SimpleNamespace(
-        stamp=SimpleNamespace(sec=t_ns // 1_000_000_000, nanosec=t_ns % 1_000_000_000),
-        pose=SimpleNamespace(
-            position=SimpleNamespace(x=x, y=0.0, z=0.0),
-            rotation=SimpleNamespace(w=1.0, x=0.0, y=0.0, z=0.0),
-        ),
-        actors=(),
-    )
-
-
-def test_sector_loop_schedules_windows_and_publishes_revolutions() -> None:
-    from splatsim.grpc_service.server import RenderingServiceServicer, _SectorHooks
-
-    servicer = RenderingServiceServicer()
-    period = 100_000_000  # 100 ms sweep
-    n_sectors = 4
-    rendered: list[tuple[int, int, int]] = []  # (k, start_ns, end_ns)
-    published: list[tuple[int, int]] = []  # (n_outputs, stamp_ns)
-    states: list[dict] = []
-    done = threading.Event()
-
-    def render_sector(start, end, k, state):
-        if not states or states[-1] is not state:
-            states.append(state)
-        state["gathers"] = state.get("gathers", 0) + 1
-        rendered.append((k, start.time_ns, end.time_ns))
-        return k
-
-    def publish_revolution(outputs, end_pose, stamp_ns):
-        published.append((len(outputs), stamp_ns))
-        if len(published) >= 2:
-            done.set()
-
-    hooks = _SectorHooks(
-        n_sectors=n_sectors,
-        spin_period_ns=period,
-        render_sector=render_sector,
-        publish_revolution=publish_revolution,
-    )
-
-    t0 = 1_000_000_000
-
-    def poses():
-        # First pose alone, then give the render thread time to anchor the
-        # revolution at it (it anchors at the NEWEST pose on its first wake).
-        yield _pose_msg(t0, x=0.0)
-        time.sleep(0.1)
-        # 10 ms pose cadence over two sweeps + one extra pose so the second
-        # revolution's last window closes.
-        for i in range(1, 2 * 10 + 1):
-            yield _pose_msg(t0 + i * 10_000_000, x=float(i))
-        # Keep the stream open until the render thread has drained everything;
-        # closing it immediately would tear the loop down mid-revolution.
-        done.wait(timeout=5.0)
-
-    summary = servicer._run_pose_stream(
-        poses(),
-        frame_rate=10.0,
-        render_and_publish=lambda *a: pytest.fail("plain loop must not run"),
-        sweep_time_ns=period,
-        sector_hooks=hooks,
-    )
-
-    assert done.is_set(), "expected two published revolutions"
-    assert summary.frames_rendered == len(published) >= 2
-    # First revolution: anchored at the first pose, 4 windows of 25 ms.
-    first = rendered[:n_sectors]
-    assert [k for k, _, _ in first] == list(range(n_sectors))
-    for k, start_ns, end_ns in first:
-        assert start_ns == t0 + k * period // n_sectors
-        assert end_ns == t0 + (k + 1) * period // n_sectors
-    # Revolution stamp = its sweep-end time; revolutions are back-to-back.
-    assert published[0][0] == n_sectors
-    assert published[0][1] == t0 + period
-    assert published[1][1] == t0 + 2 * period
-    # One shared-state dict per revolution (the per-revolution gather cache).
-    assert all(s["gathers"] == n_sectors for s in states[:2])
-    assert states[0] is not states[1]
-
-
-def test_sector_loop_resyncs_after_a_pose_gap() -> None:
-    from splatsim.grpc_service.server import RenderingServiceServicer, _SectorHooks
-
-    servicer = RenderingServiceServicer()
-    period = 100_000_000
-    n_sectors = 4
-    rendered: list[tuple[int, int, int]] = []
-    published: list[int] = []
-    done = threading.Event()
-
-    def render_sector(start, end, k, state) -> None:
-        rendered.append((k, start.time_ns, end.time_ns))
-
-    def publish_revolution(outputs, end_pose, stamp_ns) -> None:
-        published.append(stamp_ns)
-        if len(published) >= 2:
-            done.set()
-
-    hooks = _SectorHooks(
-        n_sectors=n_sectors,
-        spin_period_ns=period,
-        render_sector=render_sector,
-        publish_revolution=publish_revolution,
-    )
-
-    t0 = 1_000_000_000
-    gap_t0 = t0 + period + 5 * period  # 5 sweeps of silence after one sweep
-
-    def poses():
-        # Let the loop anchor the first revolution at t0 (it anchors at the
-        # newest buffered pose on its first wake).
-        yield _pose_msg(t0, x=0.0)
-        time.sleep(0.1)
-        for i in range(1, 11):  # one full sweep
-            yield _pose_msg(t0 + i * 10_000_000, x=float(i))
-        # The first revolution must be out the door before the gap pose lands,
-        # otherwise the loop legitimately resyncs straight past it.
-        deadline = time.monotonic() + 2.0
-        while not published and time.monotonic() < deadline:
-            time.sleep(0.005)
-        # ...long gap, then a fresh burst. Anchor again before streaming it.
-        yield _pose_msg(gap_t0, x=100.0)
-        time.sleep(0.1)
-        for i in range(1, 11):
-            yield _pose_msg(gap_t0 + i * 10_000_000, x=100.0 + i)
-        done.wait(timeout=5.0)
-
-    servicer._run_pose_stream(
-        poses(),
-        frame_rate=10.0,
-        render_and_publish=lambda *a: pytest.fail("plain loop must not run"),
-        sweep_time_ns=period,
-        sector_hooks=hooks,
-    )
-
-    assert done.is_set(), "expected a revolution on each side of the gap"
-    assert published[0] == t0 + period
-    # After the gap the loop must anchor at the fresh poses, not grind through
-    # the 5 silent sweeps: the second revolution starts at the first post-gap
-    # pose.
-    second = rendered[n_sectors : 2 * n_sectors]
-    assert second[0][1] == gap_t0
-    assert published[1] == gap_t0 + period
-
-
-def test_sector_count_env_parsing(monkeypatch) -> None:
-    from splatsim.grpc_service import server
-
-    monkeypatch.delenv("SPLATSIM_LIDAR_SECTORS", raising=False)
-    assert server._lidar_sector_count() == 1
-    monkeypatch.setenv("SPLATSIM_LIDAR_SECTORS", "8")
-    assert server._lidar_sector_count() == 8
-    monkeypatch.setenv("SPLATSIM_LIDAR_SECTORS", "0")
-    assert server._lidar_sector_count() == 1
-    monkeypatch.setenv("SPLATSIM_LIDAR_SECTORS", "banana")
-    assert server._lidar_sector_count() == 1
