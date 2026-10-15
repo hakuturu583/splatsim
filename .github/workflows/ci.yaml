@@ -18,22 +18,6 @@ jobs:
       - name: Set up Python
         run: uv python install
 
-      - name: Install system dependencies for lanelet2
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libboost-dev \
-            libboost-serialization-dev \
-            libboost-filesystem-dev \
-            libboost-program-options-dev \
-            libboost-python-dev \
-            libboost-system-dev \
-            libeigen3-dev \
-            libpugixml-dev \
-            libgeographic-dev \
-            librange-v3-dev \
-            python3-dev
-
       - name: Install dependencies
         # ppisp ships a CUDA extension (ppisp_cuda) whose setup.py unconditionally
         # constructs a torch CUDAExtension, which requires CUDA_HOME/nvcc even to

@@ -35,9 +35,7 @@ vehicle's splats.
 ## Use
 
 ```sh
-uv sync --extra carla_canvas                # or: pip install carla-canvas (the renderer SDK)
-# alignment: geo also needs lanelet2 and Autoware's MGRS projector
-# (lanelet2-python-api-for-autoware, see [tool.uv.sources])
+uv sync --extra carla_canvas                # carla-canvas, simple-lanelet2 and pyproj (alignment: geo)
 carla-canvas serve --config canvas.yaml     # on the GPU machine
 # on the client: CARLA_CANVAS_CONFIG=canvas.yaml typesafe-codon run main.py
 ```
@@ -82,8 +80,8 @@ docker run --rm --gpus all -p 50051:50051 -v $PWD:/config ghcr.io/tier4/splatsim
 
 The client uses its own copy of the configuration with `endpoint:
 "<gpu-host>:50051"` (and no `command`, so it does not try to start a renderer
-itself). Asset paths are relative to the configuration file. The image has no
-lanelet2: give each map a `matrix` rather than `alignment: geo`.
+itself). Asset paths are relative to the configuration file. `alignment: geo`
+works in the image (simple-lanelet2).
 
 ## Frames
 

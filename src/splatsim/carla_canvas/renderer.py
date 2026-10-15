@@ -34,8 +34,8 @@ Configuration (carla_canvas's file, ``CARLA_CANVAS_CONFIG``)::
         exposure: 1.0
         lidar: {drop_threshold: 0.5, alpha_threshold: 0.1, min_range: 0.3, n_columns: auto}
 
-``alignment: geo`` needs lanelet2 and Autoware's MGRS projector
-(:mod:`splatsim.geo_transform`). An actor's asset is placed
+``alignment: geo`` needs the ``carla_canvas`` extra (simple-lanelet2's
+MGRS projector and pyproj, :mod:`splatsim.geo_transform`). An actor's asset is placed
 at its bounding box's center (``anchor: bounding_box``, default) or at its
 CARLA origin (``anchor: origin``), x forward / y left / z up.
 """
@@ -173,8 +173,8 @@ class SplatsimRenderer(Renderer):
             )
         except ImportError as e:
             raise ImportError(
-                "alignment: geo needs lanelet2 and Autoware's MGRS projector "
-                "(lanelet2-python-api-for-autoware, see [tool.uv.sources]), "
+                "alignment: geo needs simple-lanelet2 and pyproj "
+                "(pip install 'splatsim[carla_canvas]'), "
                 f"or give the map an explicit matrix: {e}"
             ) from e
         if not world.opendrive:

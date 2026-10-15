@@ -50,17 +50,6 @@ uv sync --extra mp4
 uv sync --extra all
 ```
 
-> The carla_canvas backend's `alignment: geo` needs lanelet2 and Autoware's
-> MGRS projector (`lanelet2-python-api-for-autoware`, see `[tool.uv.sources]`),
-> which need system libraries. On Ubuntu 22.04:
->
-> ```bash
-> sudo apt-get install -y \
->   libboost-dev libboost-serialization-dev libboost-filesystem-dev \
->   libboost-program-options-dev libboost-python-dev libboost-system-dev \
->   libeigen3-dev libpugixml-dev libgeographic-dev librange-v3-dev python3-dev
-> ```
-
 ### Docker
 
 #### Pull a published image
@@ -98,8 +87,9 @@ docker run --rm --gpus all -p 50051:50051 -v $PWD:/config ghcr.io/tier4/splatsim
 
 The image's command is `carla-canvas serve --endpoint 0.0.0.0:50051` with
 `CARLA_CANVAS_CONFIG=/config/canvas.yaml`; set `-e CARLA_CANVAS_CONFIG=...` for
-another file. The image has no lanelet2, so give each map an explicit `matrix`
-instead of `alignment: geo` (docs/carla_canvas.md).
+another file. Maps align through their OpenDRIVE geo-reference
+(`alignment: geo`, with [simple_lanelet2](https://github.com/hakuturu583/simple_lanelet2)'s
+MGRS projector) or an explicit `matrix` (docs/carla_canvas.md).
 
 #### Build locally
 
