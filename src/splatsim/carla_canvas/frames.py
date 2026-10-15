@@ -38,13 +38,21 @@ class SceneFrame:
 
     @staticmethod
     def from_matrix(matrix: Array) -> SceneFrame:
-        """An explicit 4x4 CARLA-world → tile-local matrix (rotation, scale and
-        the y flip a right-handed scene needs)."""
+        """An explicit 4x4 CARLA-world → tile-local matrix (rotation, a uniform
+        scale and the y flip a right-handed scene needs). Points get the scale;
+        orientations only the rotation."""
         m = np.asarray(matrix, dtype=np.float64)
         if m.shape != (4, 4):
             raise ValueError("the CARLA → scene matrix must be 4x4")
         linear, offset = m[:3, :3], m[:3, 3]
-        return SceneFrame(lambda p: linear @ p + offset, linear)
+        scale = abs(float(np.linalg.det(linear))) ** (1.0 / 3.0)
+        rotation = linear / scale if scale > 0.0 else linear
+        if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6):
+            raise ValueError(
+                "the CARLA → scene matrix must be a rotation (and flip) times a "
+                "uniform scale"
+            )
+        return SceneFrame(lambda p: linear @ p + offset, rotation)
 
     @staticmethod
     def from_geo(geo_transform) -> SceneFrame:

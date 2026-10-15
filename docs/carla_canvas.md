@@ -36,7 +36,8 @@ vehicle's splats.
 
 ```sh
 pip install carla-canvas                    # the renderer SDK (no CARLA client needed here)
-pip install 'splatsim[carla]'               # alignment: geo (lanelet2 MGRS projector)
+# alignment: geo also needs lanelet2 and Autoware's MGRS projector
+# (lanelet2-python-api-for-autoware, see [tool.uv.sources])
 carla-canvas serve --config canvas.yaml     # on the GPU machine
 # on the client: CARLA_CANVAS_CONFIG=canvas.yaml typesafe-codon run main.py
 ```
@@ -60,6 +61,7 @@ renderer:
     near_plane: 0.01
     far_plane: 1000.0
     exposure: 1.0
+    ppisp_camera: front               # the scene's PPISP camera profile, or {role_name glob: profile}
     lidar: {drop_threshold: 0.5, alpha_threshold: 0.1, min_range: 0.3, n_columns: auto}
 sensors:
   - sensor.camera.rgb

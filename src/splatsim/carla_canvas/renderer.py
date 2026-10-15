@@ -173,8 +173,9 @@ class SplatsimRenderer(Renderer):
             )
         except ImportError as e:
             raise ImportError(
-                "alignment: geo needs splatsim's carla extra "
-                f"(pip install 'splatsim[carla]'): {e}"
+                "alignment: geo needs lanelet2 and Autoware's MGRS projector "
+                "(lanelet2-python-api-for-autoware, see [tool.uv.sources]), "
+                f"or give the map an explicit matrix: {e}"
             ) from e
         if not world.opendrive:
             raise ValueError(
@@ -282,6 +283,18 @@ class SplatsimRenderer(Renderer):
             )
         return renderer
 
+    def _ppisp_camera(self, view: CameraView) -> str | None:
+        """The scene's PPISP camera profile for this sensor (options.ppisp_camera:
+        a name, or role_name glob -> name); None renders without PPISP."""
+        profiles = self.options.get("ppisp_camera")
+        if profiles is None or isinstance(profiles, str):
+            return profiles
+        role = view.attributes.get("role_name", "")
+        for pattern, name in dict(profiles).items():
+            if fnmatch.fnmatchcase(role, str(pattern)):
+                return str(name)
+        return None
+
     def render_camera(self, view: CameraView) -> CameraFrame:
         import torch
 
@@ -295,7 +308,9 @@ class SplatsimRenderer(Renderer):
         )
         k = torch.tensor(cam.intrinsics(), device=self.device, dtype=torch.float32)
         with torch.no_grad(), self._hidden(view.ignore_actors):
-            rgb = renderer.render(viewmat, k, scene=self.scene)
+            rgb = renderer.render(
+                viewmat, k, scene=self.scene, camera_name=self._ppisp_camera(view)
+            )
         return CameraFrame(rgb=(rgb.clamp(0.0, 1.0) * 255.0 + 0.5).byte().cpu().numpy())
 
     # --- LiDARs --------------------------------------------------------------------

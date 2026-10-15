@@ -53,9 +53,9 @@ class FakeCameraRenderer:
     def __init__(self, width, height, **kwargs):
         self.width, self.height = width, height
 
-    def render(self, viewmat, k, *, scene):
+    def render(self, viewmat, k, *, scene, camera_name=None):
         FakeCameraRenderer.calls.append(
-            (viewmat.clone(), k.clone(), set(scene.rigid_bodies))
+            (viewmat.clone(), k.clone(), set(scene.rigid_bodies), camera_name)
         )
         img = torch.zeros(self.height, self.width, 3)
         img[..., 0] = 1.0  # red
@@ -177,7 +177,8 @@ def test_camera_and_actors(service) -> None:
     )
     image = np.frombuffer(r.measurements[0].image.raw_data, np.uint8).reshape(4, 8, 4)
     assert (image[..., 2] == 255).all() and (image[..., 0] == 0).all()  # BGRA of red
-    viewmat, k, bodies = FakeCameraRenderer.calls[0]
+    viewmat, k, bodies, ppisp = FakeCameraRenderer.calls[0]
+    assert ppisp is None  # no ppisp_camera option
     assert bodies == {"carla_10", "carla_20"}  # cameras see the ego vehicle
     ahead = viewmat.double().numpy() @ np.array([6.5, 0.0, 2.0, 1.0])  # 5 m ahead
     np.testing.assert_allclose(ahead[:3], [0, 0, 5], atol=1e-5)
@@ -247,3 +248,14 @@ def test_lidar_samples_the_panorama(service) -> None:
     # first tick: the ray at -90 (the dropped column) is missing on each laser
     assert counts == [99, 99, 99, 99]
     np.testing.assert_allclose(sensor_to_world[:3, 3].numpy(), [0, 0, 2.5])
+
+
+def test_ppisp_camera_profiles(service) -> None:
+    _svc, renderer, _ctx = service
+    view = types.SimpleNamespace(attributes={"role_name": "front_left"})
+    renderer.options["ppisp_camera"] = "cam0"
+    assert renderer._ppisp_camera(view) == "cam0"
+    renderer.options["ppisp_camera"] = {"front*": "cam_front", "*": "cam_other"}
+    assert renderer._ppisp_camera(view) == "cam_front"
+    view.attributes["role_name"] = "rear"
+    assert renderer._ppisp_camera(view) == "cam_other"

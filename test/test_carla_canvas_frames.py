@@ -116,3 +116,18 @@ def test_default_columns() -> None:
     # 90° sweeps: a quarter turn's rays, so 4x the columns over 360°
     assert default_n_columns(1_310_720, 64, 10, 90.0) == 8192
     assert default_n_columns(327_680, 64, 10, 90.0) == 2048
+
+
+def test_a_scaled_matrix_scales_points_not_orientations() -> None:
+    scaled = SceneFrame.from_matrix(
+        2.0 * np.asarray(FLIP, dtype=np.float64) + np.diag([0, 0, 0, -1.0])
+    )
+    plain = SceneFrame.from_matrix(FLIP)
+    pose = carla_pose(yaw_deg=30.0)
+    np.testing.assert_allclose(
+        scaled.flu_pose(pose)[:3, :3], plain.flu_pose(pose)[:3, :3]
+    )
+    position, _ = scaled.pose(carla_pose(location=(1.0, 2.0, 3.0)))
+    np.testing.assert_allclose(position, [2.0, -4.0, 6.0])
+    with pytest.raises(ValueError):
+        SceneFrame.from_matrix(np.diag([1.0, 2.0, 1.0, 1.0]))
