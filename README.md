@@ -9,6 +9,15 @@
 - [uv](https://docs.astral.sh/uv/)
 - (Docker builds) Docker with [BuildKit](https://docs.docker.com/build/buildkit/) and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 
+## carla_canvas backend
+
+splatsim can render the cameras and LiDARs of an unchanged
+[typesafe_carla](https://github.com/hakuturu583/typesafe_carla) program through
+[carla_canvas](https://github.com/hakuturu583/carla_canvas)
+(`renderer.backend: splatsim.carla_canvas:SplatsimRenderer`); carla_canvas
+provides the CARLA sensor models and the ROS 2 output. See
+[docs/carla_canvas.md](docs/carla_canvas.md).
+
 ## Installation
 
 ### Local
