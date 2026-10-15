@@ -345,11 +345,12 @@ class SplatsimRenderer(Renderer):
                 carla.rotation_frequency,
                 carla.horizontal_fov,
             )
+        scale = self.frame.scale  # ranges in scene units
         key = (
             tuple(float(e) for e in view.elevations),
             int(columns),
-            float(view.max_distance),
-            float(o.get("min_range", 0.3)),
+            float(view.max_distance) * scale,
+            float(o.get("min_range", 0.3)) * scale,
         )
         cached = self._lidars.get(view.sensor_id)
         if cached is not None and cached[0] == key:
@@ -396,5 +397,6 @@ class SplatsimRenderer(Renderer):
         cols_t = torch.as_tensor(cols, device=self.device)
         valid = image["valid"][rows_t, cols_t].cpu().numpy()
         distance = image["distance"][rows_t, cols_t].cpu().numpy().astype(np.float64)
+        distance /= self.frame.scale  # scene units -> CARLA metres
         intensity = image["intensity"][rows_t, cols_t].clamp(0.0, 1.0).cpu().numpy()
         return RayHits(np.where(valid, distance, np.inf), intensity=intensity)

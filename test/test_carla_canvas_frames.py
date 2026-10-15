@@ -55,23 +55,35 @@ def test_flu_pose_is_a_proper_rotation() -> None:
     np.testing.assert_allclose(r[:, 1], [1.0, 0.0, 0.0], atol=1e-12)
 
 
-def test_geo_frame_uses_the_rotation_linearly() -> None:
+def test_geo_frame_turns_poses_with_the_positions() -> None:
+    """CARLA x is the MGRS grid's east, off true east by the grid convergence:
+    orientations follow the position map, not an ENU rotation."""
+    convergence, k = math.radians(0.72), 1.00017  # Tokyo; the projection's scale
+
     class FakeGeo:
         r_enu_to_tile = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
-
-        def carla_rotation_to_tile_local(self, r):
-            return self.r_enu_to_tile @ np.diag([1.0, -1.0, 1.0]) @ r
+        c, s = math.cos(convergence), math.sin(convergence)
+        grid_to_enu = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
         def carla_position_to_tile_local(self, x, y, z):
-            return np.array([x + 100.0, y, z])
+            grid = np.array([x, -y, z])
+            offset = np.array([100.0, 0.0, 0.0])
+            return self.r_enu_to_tile @ (k * self.grid_to_enu @ grid) + offset
 
-    frame = SceneFrame.from_geo(FakeGeo())
+    geo = FakeGeo()
+    frame = SceneFrame.from_geo(geo)
     pose = carla_pose((1.0, 2.0, 3.0), yaw_deg=30.0)
     position, axes = frame.pose(pose)
-    np.testing.assert_allclose(position, [101.0, 2.0, 3.0])
     np.testing.assert_allclose(
-        axes, FakeGeo().carla_rotation_to_tile_local(pose[:3, :3])
+        position, geo.carla_position_to_tile_local(1.0, 2.0, 3.0)
     )
+    # a point 10 m ahead of the pose lies along its forward axis
+    ahead = geo.carla_position_to_tile_local(*(pose[:3, 3] + 10.0 * pose[:3, 0]))
+    direction = (ahead - position) / np.linalg.norm(ahead - position)
+    np.testing.assert_allclose(axes[:, 0], direction, atol=1e-9)
+    expected = geo.r_enu_to_tile @ geo.grid_to_enu @ np.diag([1.0, -1.0, 1.0])
+    np.testing.assert_allclose(frame.rotation, expected, atol=1e-9)
+    assert np.isclose(np.linalg.det(frame.rotation), -1.0)
 
 
 @pytest.mark.parametrize("yaw", [0.0, 45.0, 135.0, -100.0, 179.0])
@@ -129,5 +141,6 @@ def test_a_scaled_matrix_scales_points_not_orientations() -> None:
     )
     position, _ = scaled.pose(carla_pose(location=(1.0, 2.0, 3.0)))
     np.testing.assert_allclose(position, [2.0, -4.0, 6.0])
+    assert scaled.scale == pytest.approx(2.0) and plain.scale == 1.0
     with pytest.raises(ValueError):
         SceneFrame.from_matrix(np.diag([1.0, 2.0, 1.0, 1.0]))

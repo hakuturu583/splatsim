@@ -91,6 +91,11 @@ class FakeLidarRenderer:
 
 @pytest.fixture
 def service(monkeypatch):
+    # The real package first: its __init__ imports splatsim.dataclass & co.,
+    # which the stand-ins below would otherwise shadow.
+    import splatsim
+    import splatsim.carla_canvas.renderer  # noqa: F401
+
     modules = {
         "splatsim.renderer": types.SimpleNamespace(Renderer=FakeCameraRenderer),
         "splatsim.lidar_renderer": types.SimpleNamespace(

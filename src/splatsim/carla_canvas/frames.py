@@ -32,9 +32,13 @@ class SceneFrame:
     directions (it carries the handedness flip, so its determinant is -1).
     """
 
-    def __init__(self, position: Callable[[Array], Array], rotation: Array) -> None:
+    def __init__(
+        self, position: Callable[[Array], Array], rotation: Array, scale: float = 1.0
+    ) -> None:
         self._position = position
         self.rotation = np.asarray(rotation, dtype=np.float64)
+        #: scene units per CARLA metre (a ``matrix`` with a uniform scale)
+        self.scale = float(scale)
 
     @staticmethod
     def from_matrix(matrix: Array) -> SceneFrame:
@@ -52,17 +56,25 @@ class SceneFrame:
                 "the CARLA → scene matrix must be a rotation (and flip) times a "
                 "uniform scale"
             )
-        return SceneFrame(lambda p: linear @ p + offset, rotation)
+        return SceneFrame(lambda p: linear @ p + offset, rotation, scale)
 
     @staticmethod
-    def from_geo(geo_transform) -> SceneFrame:
+    def from_geo(geo_transform, at: Array | None = None) -> SceneFrame:
         """Through a :class:`splatsim.geo_transform.GeoTransform` (the map's
-        OpenDRIVE geo-reference and the scene's ECEF anchor)."""
-        # carla_rotation_to_tile_local(R) = R_enu_to_tile @ S @ R: linear in R
-        rotation = geo_transform.carla_rotation_to_tile_local(np.eye(3))
-        return SceneFrame(
-            lambda p: geo_transform.carla_position_to_tile_local(*p), rotation
-        )
+        OpenDRIVE geo-reference and the scene's ECEF anchor).
+
+        Orientations follow the position map: its Jacobian at ``at`` (a CARLA
+        point, default the map origin), orthonormalized. CARLA's x is the
+        MGRS grid's east, which is not true east (the grid convergence, up to
+        ~1.7 degrees at a UTM zone's edge), so ENU-based
+        ``carla_rotation_to_tile_local`` would turn poses against positions."""
+
+        def position(p: Array) -> Array:
+            return np.asarray(
+                geo_transform.carla_position_to_tile_local(*p), dtype=np.float64
+            )
+
+        return SceneFrame(position, local_rotation(position, at))
 
     # --- poses -------------------------------------------------------------------
 
@@ -92,6 +104,23 @@ class SceneFrame:
         out[:3, :3] = np.column_stack([axes[:, 0], -axes[:, 1], axes[:, 2]])
         out[:3, 3] = position
         return out
+
+
+def local_rotation(
+    position: Callable[[Array], Array], at: Array | None = None, step: float = 1.0
+) -> Array:
+    """The rotation (with its reflection: CARLA is left-handed) closest to the
+    Jacobian of a position map at ``at``: central differences of ``step``
+    metres, orthonormalized by the polar decomposition."""
+    p0 = np.zeros(3) if at is None else np.asarray(at, dtype=np.float64)
+    jacobian = np.column_stack(
+        [
+            (position(p0 + step * e) - position(p0 - step * e)) / (2.0 * step)
+            for e in np.eye(3)
+        ]
+    )
+    u, _, vt = np.linalg.svd(jacobian)
+    return u @ vt
 
 
 def quaternion_wxyz(rotation: Array) -> tuple[float, float, float, float]:

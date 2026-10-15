@@ -75,8 +75,12 @@ The splatsim image runs this backend: its command is `carla-canvas serve
 
 ```sh
 # canvas.yaml (as above) and its scene USDZs in the current directory
-docker run --rm --gpus all -p 50051:50051 -v $PWD:/config ghcr.io/tier4/splatsim:latest-sm89
+docker run --rm --gpus all -p 50051:50051 -v $PWD:/config ghcr.io/hakuturu583/splatsim:latest-sm89
 ```
+
+`enable_for_ros()` sensors are published over CycloneDDS from the container
+(the `carla_canvas` extra includes `carla-canvas[ros]`); use `--network host`
+instead of `-p` so DDS discovery reaches other hosts' ROS 2 nodes.
 
 The client uses its own copy of the configuration with `endpoint:
 "<gpu-host>:50051"` (and no `command`, so it does not try to start a renderer
@@ -89,7 +93,13 @@ works in the image (simple-lanelet2).
 (`GeoTransform`: CARLA → OpenDRIVE → MGRS → LLA →
 ECEF → tile-local, re-centered), using the OpenDRIVE that carla_canvas sends
 with the map (protocol 2) and the scene's ECEF anchor. CARLA rotations come
-from carla_canvas as Unreal rotation matrices. `splatsim.carla_canvas.frames`
+from carla_canvas as Unreal rotation matrices and are turned with the
+position map's own (orthonormalized) Jacobian at the map origin: CARLA's x is
+the MGRS grid's east, which differs from true east by the grid convergence
+(0.7° in Tokyo, up to ~1.7° at a zone edge), so an ENU-based rotation would
+turn every pose against its position. A `matrix` maps CARLA world to the
+re-centered tile-local frame; with a uniform scale, LiDAR ranges are
+converted back to metres (actor assets are not scaled). `splatsim.carla_canvas.frames`
 derives the gsplat RDF view matrix for cameras and FLU poses for LiDARs and
 actors (numpy only, tested in `test/test_carla_canvas_frames.py`).
 

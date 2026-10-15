@@ -82,14 +82,16 @@ old = """\
             "[yellow]gsplat: No CUDA toolkit found. gsplat will be disabled.[/yellow]"
         )"""
 
+# _backend.py imports torch.utils.cpp_extension as `jit` (gsplat 4e52698).
+assert "import torch.utils.cpp_extension as jit" in src, "gsplat _backend.py no longer imports jit"
 new = """\
     else:
         # Try loading pre-compiled CUDA extension without toolkit
         name = "gsplat_cuda"
-        build_dir = _get_build_directory(name, verbose=False)
+        build_dir = jit._get_build_directory(name, verbose=False)
         _so = os.path.join(build_dir, f"{name}.so")
         if os.path.exists(_so):
-            _C = _import_module_from_library(name, build_dir, True)
+            _C = jit._import_module_from_library(name, build_dir, True)
         else:
             Console().print(
                 "[yellow]gsplat: No CUDA toolkit found. gsplat will be disabled.[/yellow]"
