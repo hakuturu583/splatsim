@@ -66,9 +66,6 @@ try:
     )
     from carla_canvas.geometry import Transform
     from carla_canvas.scene import ActorInfo
-    from carla_canvas.scene import (
-        Scene as CanvasScene,
-    )
     from carla_canvas.sensors import LidarSpec
 except ImportError:
     raise ImportError(
@@ -78,9 +75,9 @@ except ImportError:
 
 from splatsim.carla_canvas.frames import (
     SceneFrame,
-    carla_rays_to_panorama,
     default_n_columns,
     quaternion_wxyz,
+    rays_to_panorama,
 )
 
 log = logging.getLogger("splatsim.carla_canvas")
@@ -120,6 +117,9 @@ class SplatsimRenderer(Renderer):
     version = _version()
     camera_outputs = frozenset({"rgb"})
     semantic_lidar = False
+    # Views hand poses, ray azimuths and actor poses over right-handed (CARLA's
+    # with y negated, bodies FLU): SceneFrame only maps them into the tile.
+    coordinate_frame = "right_handed"
 
     def __init__(self, options: dict[str, Any] | None = None) -> None:
         super().__init__(options)
@@ -225,9 +225,10 @@ class SplatsimRenderer(Renderer):
     def _body_name(actor_id: int) -> str:
         return f"carla_{actor_id}"
 
-    def _pose_actors(self, scene: CanvasScene) -> None:
+    def _pose_actors(self, view: CameraView | LidarView) -> None:
         """Spawn, pose and remove the splat actors of this frame's CARLA actors
         (once per frame: every view of the frame shares the poses)."""
+        scene = view.scene
         if scene.frame == self._posed_frame or not self._actor_assets:
             return
         self._posed_frame = scene.frame
@@ -240,10 +241,10 @@ class SplatsimRenderer(Renderer):
                 or not info.is_visible_body
             ):
                 continue
-            pose = scene.transform(actor_id).matrix()
+            pose = view.actor_matrix(actor_id)
             if asset.anchor == "bounding_box":
                 box = info.bounding_box
-                pose = pose @ Transform(box.location, box.rotation).matrix()
+                pose = pose @ Transform(box.location, box.rotation).matrix(view.frame)
             m = self.frame.flu_pose(pose)
             position = (float(m[0, 3]), float(m[1, 3]), float(m[2, 3]))
             rotation = quaternion_wxyz(m[:3, :3])
@@ -314,10 +315,10 @@ class SplatsimRenderer(Renderer):
         import torch
 
         cam = view.camera
-        self._pose_actors(view.scene)
+        self._pose_actors(view)
         renderer = self._camera_renderer(cam.width, cam.height)
         viewmat = torch.tensor(
-            self.frame.viewmat(cam.pose.matrix()),
+            self.frame.viewmat(view.pose_matrix()),
             device=self.device,
             dtype=torch.float32,
         )
@@ -375,11 +376,11 @@ class SplatsimRenderer(Renderer):
     def cast_lidar_rays(self, view: LidarView) -> RayHits:
         import torch
 
-        self._pose_actors(view.scene)
+        self._pose_actors(view)
         renderer = self._lidar_renderer(view)
         o = dict(self.options.get("lidar") or {})
         sensor_to_world = torch.tensor(
-            self.frame.flu_pose(view.pose.matrix()),
+            self.frame.flu_pose(view.pose_matrix()),
             device=self.device,
             dtype=torch.float32,
         )
@@ -390,8 +391,8 @@ class SplatsimRenderer(Renderer):
                 drop_threshold=float(o.get("drop_threshold", 0.5)),
                 alpha_threshold=float(o.get("alpha_threshold", 0.1)),
             )
-        rows, cols = carla_rays_to_panorama(
-            view.elevations, view.channel, view.azimuths, renderer.n_columns
+        rows, cols = rays_to_panorama(
+            view.elevations, view.channel, view.body_azimuths(), renderer.n_columns
         )
         rows_t = torch.as_tensor(rows, device=self.device)
         cols_t = torch.as_tensor(cols, device=self.device)

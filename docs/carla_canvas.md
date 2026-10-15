@@ -92,16 +92,18 @@ works in the image (simple-lanelet2).
 `alignment: geo` maps CARLA positions through `splatsim.geo_transform`
 (`GeoTransform`: CARLA → OpenDRIVE → MGRS → LLA →
 ECEF → tile-local, re-centered), using the OpenDRIVE that carla_canvas sends
-with the map (protocol 2) and the scene's ECEF anchor. CARLA rotations come
-from carla_canvas as Unreal rotation matrices and are turned with the
+with the map (protocol 2) and the scene's ECEF anchor. The renderer declares
+carla_canvas's `coordinate_frame = "right_handed"`, so poses arrive already
+right-handed (CARLA with y negated, bodies x forward / y left / z up) and
+LiDAR azimuths as FLU angles; they are turned into the tile with the
 position map's own (orthonormalized) Jacobian at the map origin: CARLA's x is
 the MGRS grid's east, which differs from true east by the grid convergence
 (0.7° in Tokyo, up to ~1.7° at a zone edge), so an ENU-based rotation would
 turn every pose against its position. A `matrix` maps CARLA world to the
 re-centered tile-local frame; with a uniform scale, LiDAR ranges are
 converted back to metres (actor assets are not scaled). `splatsim.carla_canvas.frames`
-derives the gsplat RDF view matrix for cameras and FLU poses for LiDARs and
-actors (numpy only, tested in `test/test_carla_canvas_frames.py`).
+(`SceneFrame`) only maps that frame into tile-local; the gsplat RDF view matrix
+comes from carla_canvas's `view_matrix_cv` (numpy only, tested in `test/test_carla_canvas_frames.py`).
 
 ## Limits
 

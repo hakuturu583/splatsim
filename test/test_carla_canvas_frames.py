@@ -9,13 +9,15 @@ import pytest
 
 pytest.importorskip("carla_canvas")
 
+from carla_canvas.geometry import to_frame  # noqa: E402
+
 from splatsim.carla_canvas.frames import (
     SceneFrame,
-    carla_rays_to_panorama,
     column_of,
     default_n_columns,
     panorama_columns,
     quaternion_wxyz,
+    rays_to_panorama,
 )
 
 # CARLA (x east, y south, z up) -> a right-handed scene sharing its origin (y north)
@@ -23,7 +25,12 @@ FLIP = np.diag([1.0, -1.0, 1.0, 1.0])
 
 
 def carla_pose(location=(0.0, 0.0, 0.0), yaw_deg=0.0) -> np.ndarray:
-    """A 4x4 CARLA pose with only a yaw (CARLA: right positive)."""
+    """A CARLA pose with only a yaw (CARLA: right positive), as carla_canvas
+    hands it to a right_handed renderer."""
+    return to_frame(_carla_pose(location, yaw_deg), "right_handed")
+
+
+def _carla_pose(location=(0.0, 0.0, 0.0), yaw_deg=0.0) -> np.ndarray:
     y = math.radians(yaw_deg)
     m = np.eye(4)
     m[:3, 0] = (math.cos(y), math.sin(y), 0.0)  # forward
@@ -74,18 +81,20 @@ def test_geo_frame_turns_poses_with_the_positions() -> None:
 
     geo = FakeGeo()
     frame = SceneFrame.from_geo(geo)
-    pose = carla_pose((1.0, 2.0, 3.0), yaw_deg=30.0)
-    position, axes = frame.pose(pose)
+    carla = _carla_pose((1.0, 2.0, 3.0), yaw_deg=30.0)
+    m = frame.flu_pose(to_frame(carla, "right_handed"))
+    position, forward = m[:3, 3], m[:3, 0]
     np.testing.assert_allclose(
         position, geo.carla_position_to_tile_local(1.0, 2.0, 3.0)
     )
-    # a point 10 m ahead of the pose lies along its forward axis
-    ahead = geo.carla_position_to_tile_local(*(pose[:3, 3] + 10.0 * pose[:3, 0]))
+    # a point 10 m ahead of the pose (in CARLA) lies along its forward axis
+    ahead = geo.carla_position_to_tile_local(*(carla[:3, 3] + 10.0 * carla[:3, 0]))
     direction = (ahead - position) / np.linalg.norm(ahead - position)
-    np.testing.assert_allclose(axes[:, 0], direction, atol=1e-9)
-    expected = geo.r_enu_to_tile @ geo.grid_to_enu @ np.diag([1.0, -1.0, 1.0])
-    np.testing.assert_allclose(frame.rotation, expected, atol=1e-9)
-    assert np.isclose(np.linalg.det(frame.rotation), -1.0)
+    np.testing.assert_allclose(forward, direction, atol=1e-9)
+    np.testing.assert_allclose(
+        frame.rotation, geo.r_enu_to_tile @ geo.grid_to_enu, atol=1e-9
+    )
+    assert np.isclose(np.linalg.det(m[:3, :3]), 1.0)
 
 
 @pytest.mark.parametrize("yaw", [0.0, 45.0, 135.0, -100.0, 179.0])
@@ -108,11 +117,11 @@ def test_panorama_columns_and_carla_azimuths() -> None:
     cols = panorama_columns(n)
     assert cols[0] > 3.14 and cols[-1] < -3.14  # +π -> -π, as splatsim
     np.testing.assert_array_equal(column_of(cols, n), np.arange(n))
-    # CARLA yaw +90 (right) is FLU azimuth -90: three quarters along the sweep
-    rows, c = carla_rays_to_panorama(
+    # FLU azimuth -90 (CARLA yaw +90, right): three quarters along the sweep
+    rows, c = rays_to_panorama(
         np.array([10.0, 0.0, -10.0]),
         np.array([0, 2, 1]),
-        np.array([90.0, 0.0, -180.0]),
+        np.array([-90.0, 0.0, 180.0]),
         n,
     )
     assert rows.tolist() == [0, 2, 1]
@@ -120,7 +129,7 @@ def test_panorama_columns_and_carla_azimuths() -> None:
     assert abs(cols[c[1]]) < 2 * math.pi / n
     assert c[2] in (0, n - 1)  # ±180 wraps
     with pytest.raises(ValueError):
-        carla_rays_to_panorama(np.array([0.0, 5.0]), np.array([0]), np.array([0.0]), n)
+        rays_to_panorama(np.array([0.0, 5.0]), np.array([0]), np.array([0.0]), n)
 
 
 def test_default_columns() -> None:
@@ -141,7 +150,7 @@ def test_a_scaled_matrix_scales_points_not_orientations() -> None:
     np.testing.assert_allclose(
         scaled.flu_pose(pose)[:3, :3], plain.flu_pose(pose)[:3, :3]
     )
-    position, _ = scaled.pose(carla_pose(location=(1.0, 2.0, 3.0)))
+    position = scaled.flu_pose(carla_pose(location=(1.0, 2.0, 3.0)))[:3, 3]
     np.testing.assert_allclose(position, [2.0, -4.0, 6.0])
     assert scaled.scale == pytest.approx(2.0) and plain.scale == 1.0
     with pytest.raises(ValueError):

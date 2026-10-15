@@ -1,9 +1,9 @@
 """CARLA world → splatsim scene (tile-local) frames for the carla_canvas backend.
 
-carla_canvas hands the renderer CARLA poses (Unreal's left-handed frame: x
-forward, y right, z up; columns of a pose's rotation are the body's forward,
-right and up axes). splatsim renders in a right-handed tile-local frame. A
-:class:`SceneFrame` maps one onto the other, either through the map's
+The renderer works in carla_canvas's ``right_handed`` coordinate frame
+(CARLA's with y negated, bodies x forward / y left / z up): carla_canvas
+converts CARLA's poses before handing them over. splatsim renders in a
+right-handed tile-local frame. A :class:`SceneFrame` maps one onto the other, either through the map's
 geo-reference (:mod:`splatsim.geo_transform`) or
 through an explicit matrix, and derives what splatsim's renderers take:
 
@@ -22,17 +22,19 @@ import math
 from collections.abc import Callable
 
 import numpy as np
-from carla_canvas.geometry import flu_axes, quaternion_xyzw, view_matrix_cv
+from carla_canvas.geometry import FLIP_Y, quaternion_xyzw, view_matrix_cv
 from numpy.typing import NDArray
 
 Array = NDArray[np.float64]
 
 
 class SceneFrame:
-    """CARLA world → tile-local.
+    """carla_canvas's ``right_handed`` frame (CARLA's with y negated: the
+    OpenDRIVE frame; bodies x forward, y left, z up) → tile-local.
 
-    ``position`` maps a CARLA world point; ``rotation`` maps CARLA world
-    directions (it carries the handedness flip, so its determinant is -1).
+    The renderer declares ``coordinate_frame = "right_handed"``, so poses come
+    from carla_canvas already right-handed and this map is a proper one:
+    ``position`` maps a point, ``rotation`` (determinant +1) directions.
     """
 
     def __init__(
@@ -45,19 +47,25 @@ class SceneFrame:
 
     @staticmethod
     def from_matrix(matrix: Array) -> SceneFrame:
-        """An explicit 4x4 CARLA-world → tile-local matrix (rotation, a uniform
-        scale and the y flip a right-handed scene needs). Points get the scale;
-        orientations only the rotation."""
+        """An explicit 4x4 **CARLA-world** → tile-local matrix, as in the
+        configuration (rotation, a uniform scale and the y flip a right-handed
+        scene needs). Points get the scale; orientations only the rotation."""
         m = np.asarray(matrix, dtype=np.float64)
         if m.shape != (4, 4):
             raise ValueError("the CARLA → scene matrix must be 4x4")
-        linear, offset = m[:3, :3], m[:3, 3]
+        # right_handed → CARLA (y negated) → tile-local
+        linear, offset = m[:3, :3] @ FLIP_Y, m[:3, 3]
         scale = abs(float(np.linalg.det(linear))) ** (1.0 / 3.0)
         rotation = linear / scale if scale > 0.0 else linear
         if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6):
             raise ValueError(
                 "the CARLA → scene matrix must be a rotation (and flip) times a "
                 "uniform scale"
+            )
+        if np.linalg.det(rotation) < 0:
+            raise ValueError(
+                "the CARLA → scene matrix must flip handedness (CARLA is "
+                "left-handed, the scene right-handed)"
             )
         return SceneFrame(lambda p: linear @ p + offset, rotation, scale)
 
@@ -66,49 +74,41 @@ class SceneFrame:
         """Through a :class:`splatsim.geo_transform.GeoTransform` (the map's
         OpenDRIVE geo-reference and the scene's ECEF anchor).
 
-        Orientations follow the position map: its Jacobian at ``at`` (a CARLA
-        point, default the map origin), orthonormalized. CARLA's x is the
-        MGRS grid's east, which is not true east (the grid convergence, up to
-        ~1.7 degrees at a UTM zone's edge), so ENU-based
-        ``carla_rotation_to_tile_local`` would turn poses against positions."""
+        Orientations follow the position map: its Jacobian at ``at`` (an
+        OpenDRIVE point, default the map origin), orthonormalized. The
+        OpenDRIVE x is the MGRS grid's east, which is not true east (the grid
+        convergence, up to ~1.7 degrees at a UTM zone's edge), so an ENU-based
+        rotation would turn poses against positions."""
 
         def position(p: Array) -> Array:
+            x, y, z = p
             return np.asarray(
-                geo_transform.carla_position_to_tile_local(*p), dtype=np.float64
+                geo_transform.carla_position_to_tile_local(x, -y, z), dtype=np.float64
             )
 
         return SceneFrame(position, local_rotation(position, at))
 
     # --- poses -------------------------------------------------------------------
 
-    def pose(self, carla_pose: Array) -> tuple[Array, Array]:
-        """(position, axes) of a 4x4 CARLA pose in tile-local: axes' columns are
-        the body's forward, right and up directions."""
-        m = np.asarray(carla_pose, dtype=np.float64)
-        return np.asarray(
-            self._position(m[:3, 3]), dtype=np.float64
-        ), self.rotation @ m[:3, :3]
-
-    def viewmat(self, carla_pose: Array) -> Array:
-        """4x4 world-to-camera (gsplat RDF: x right, y down, z forward) of a
-        CARLA camera pose (looking along its x)."""
-        return view_matrix_cv(*self.pose(carla_pose))
-
-    def flu_pose(self, carla_pose: Array) -> Array:
-        """4x4 body-to-world in FLU (x forward, y left, z up): a LiDAR's
-        sensor-to-world, an actor's pose. A proper rotation."""
-        position, axes = self.pose(carla_pose)
+    def flu_pose(self, pose: Array) -> Array:
+        """4x4 body-to-world in tile-local of a ``right_handed`` (FLU) pose:
+        a LiDAR's sensor-to-world, an actor's pose. A proper rotation."""
+        m = np.asarray(pose, dtype=np.float64)
         out = np.eye(4)
-        out[:3, :3] = flu_axes(axes)
-        out[:3, 3] = position
+        out[:3, :3] = self.rotation @ m[:3, :3]
+        out[:3, 3] = self._position(m[:3, 3])
         return out
+
+    def viewmat(self, pose: Array) -> Array:
+        """4x4 world-to-camera (gsplat RDF: x right, y down, z forward) of a
+        ``right_handed`` camera pose (looking along its x)."""
+        return view_matrix_cv(self.flu_pose(pose), "right_handed")
 
 
 def local_rotation(
     position: Callable[[Array], Array], at: Array | None = None, step: float = 1.0
 ) -> Array:
-    """The rotation (with its reflection: CARLA is left-handed) closest to the
-    Jacobian of a position map at ``at``: central differences of ``step``
+    """The rotation closest to the Jacobian of a position map at ``at``: central differences of ``step``
     metres, orthonormalized by the polar decomposition."""
     p0 = np.zeros(3) if at is None else np.asarray(at, dtype=np.float64)
     jacobian = np.column_stack(
@@ -147,16 +147,17 @@ def column_of(azimuth_flu: Array, n_columns: int) -> NDArray[np.int64]:
     return np.mod(col, int(n_columns))
 
 
-def carla_rays_to_panorama(
+def rays_to_panorama(
     elevations_deg: Array, channel: Array, azimuths_deg: Array, n_columns: int
 ) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-    """(row, column) of each CARLA LiDAR ray in a panorama whose rows are the
-    lasers' elevations in CARLA's order (``elevations_deg``, descending: row i is
-    laser i). CARLA's azimuth is a yaw (right positive); FLU's is to the left."""
+    """(row, column) of each LiDAR ray in a panorama whose rows are the lasers'
+    elevations in CARLA's order (``elevations_deg``, descending: row i is laser
+    i), from the rays' FLU azimuths (degrees, left positive:
+    ``LidarView.body_azimuths()`` in the ``right_handed`` frame)."""
     rows = np.asarray(channel, dtype=np.int64)
     if len(elevations_deg) and np.any(np.diff(np.asarray(elevations_deg)) >= 0):
         raise ValueError("the lasers' elevations must be strictly descending")
-    return rows, column_of(-np.radians(azimuths_deg), n_columns)
+    return rows, column_of(np.radians(azimuths_deg), n_columns)
 
 
 def default_n_columns(
