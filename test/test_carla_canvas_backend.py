@@ -16,9 +16,9 @@ import pytest
 carla_canvas = pytest.importorskip("carla_canvas")
 torch = pytest.importorskip("torch")
 
-from carla_canvas.geometry import Transform  # ty: ignore[unresolved-import]
-from carla_canvas.server.service import RendererService  # ty: ignore[unresolved-import]
-from carla_canvas.v1 import renderer_pb2 as pb  # ty: ignore[unresolved-import]
+from carla_canvas.geometry import Transform  # noqa: E402  # ty: ignore[unresolved-import]
+from carla_canvas.server.service import RendererService  # noqa: E402  # ty: ignore[unresolved-import]
+from carla_canvas.v1 import renderer_pb2 as pb  # noqa: E402  # ty: ignore[unresolved-import]
 
 FLIP = [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
 VEHICLE, CAMERA, LIDAR, OTHER = 10, 11, 12, 20

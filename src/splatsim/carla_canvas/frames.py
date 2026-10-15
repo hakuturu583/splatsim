@@ -134,7 +134,9 @@ def quaternion_wxyz(rotation: Array) -> tuple[float, float, float, float]:
 def panorama_columns(n_columns: int) -> Array:
     """The azimuths (radians, FLU: atan2(y, x)) of splatsim's panorama columns:
     +π → -π, as :func:`splatsim.lidar_renderer._sensor_column_azimuths`."""
-    return np.linspace(math.pi - 1e-4, -math.pi + 1e-4, int(n_columns))
+    return np.linspace(
+        math.pi - 1e-4, -math.pi + 1e-4, int(n_columns), dtype=np.float64
+    )
 
 
 def column_of(azimuth_flu: Array, n_columns: int) -> NDArray[np.int64]:
