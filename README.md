@@ -43,8 +43,8 @@ uv sync --extra gui
 # As a carla_canvas renderer (`carla-canvas serve`)
 uv sync --extra carla_canvas
 
-# `splatsim-viewer --mp4`
-uv sync --extra mp4
+# `splatsim-viewer --mp4` (the viewer module needs the GUI extra too)
+uv sync --extra gui --extra mp4
 
 # All optional dependencies
 uv sync --extra all
@@ -124,7 +124,7 @@ splatsim-viewer
 # Show a configured LiDAR's panorama
 splatsim-viewer scene.usdz --lidar top
 
-# Render the rig camera's trajectory to an MP4 (the `mp4` extra)
+# Render the rig camera's trajectory to an MP4 (the `gui` and `mp4` extras)
 splatsim-viewer scene.usdz --mp4 out.mp4
 ```
 

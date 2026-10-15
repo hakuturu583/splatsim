@@ -29,7 +29,7 @@ dependencies = [
 gui = [
     "PyQt5>=5.15.0",
 ]
-# `splatsim-viewer --mp4` (src/splatsim/_mp4.py).
+# `splatsim-viewer --mp4` (src/splatsim/_mp4.py), with `gui`: splatsim.viewer imports PyQt5.
 mp4 = [
     "opencv-python-headless>=4.0.0",
 ]
