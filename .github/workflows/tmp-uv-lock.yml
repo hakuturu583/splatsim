@@ -1,0 +1,21 @@
+# Temporary: regenerates uv.lock where download.pytorch.org is reachable.
+# Removed in the next commit.
+name: tmp uv lock
+on:
+  push:
+    branches: [claude/busy-ramanujan-36jofa]
+    paths: [.github/workflows/tmp-uv-lock.yml]
+jobs:
+  lock:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: uv lock
+        run: |
+          # ppisp's setup.py builds a CUDAExtension even for its metadata.
+          mkdir -p "$RUNNER_TEMP/cuda/lib64" "$RUNNER_TEMP/cuda/bin"
+          CUDA_HOME="$RUNNER_TEMP/cuda" BUILD_NO_CUDA=1 uv lock
+          git diff --stat uv.lock
+      - uses: actions/upload-artifact@v4
+        with: { name: uv-lock, path: uv.lock }
