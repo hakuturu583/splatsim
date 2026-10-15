@@ -113,3 +113,6 @@ def test_default_columns() -> None:
     assert default_n_columns(56000, 32, 10) == 360  # 175 per turn: at least 360
     assert default_n_columns(1_310_720, 64, 10) == 2048
     assert default_n_columns(1e9, 1, 1) == 8192
+    # 90° sweeps: a quarter turn's rays, so 4x the columns over 360°
+    assert default_n_columns(1_310_720, 64, 10, 90.0) == 8192
+    assert default_n_columns(327_680, 64, 10, 90.0) == 2048

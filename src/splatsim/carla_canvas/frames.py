@@ -161,9 +161,14 @@ def carla_rays_to_panorama(
 
 
 def default_n_columns(
-    points_per_second: float, channels: int, rotation_frequency: float
+    points_per_second: float,
+    channels: int,
+    rotation_frequency: float,
+    horizontal_fov: float = 360.0,
 ) -> int:
-    """Panorama columns: CARLA's points per laser per revolution (at least 360,
-    at most 8192), so each ray has its own column."""
+    """Panorama columns over 360°: CARLA's ray spacing per laser (a revolution's
+    points over horizontal_fov; at least 360, at most 8192), so each ray has
+    its own column."""
     per_turn = points_per_second / max(channels, 1) / max(rotation_frequency, 1e-6)
+    per_turn *= 360.0 / min(max(horizontal_fov, 1e-6), 360.0)
     return int(min(max(round(per_turn), 360), 8192))

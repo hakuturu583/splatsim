@@ -311,6 +311,7 @@ class SplatsimRenderer(Renderer):
                 float(a.get("points_per_second", 56000)),
                 len(view.elevations),
                 float(a.get("rotation_frequency", 10.0)),
+                float(a.get("horizontal_fov", 360.0)),
             )
         key = (
             tuple(float(e) for e in view.elevations),
