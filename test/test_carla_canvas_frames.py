@@ -7,6 +7,8 @@ import math
 import numpy as np
 import pytest
 
+pytest.importorskip("carla_canvas")
+
 from splatsim.carla_canvas.frames import (
     SceneFrame,
     carla_rays_to_panorama,

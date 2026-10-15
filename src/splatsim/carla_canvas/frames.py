@@ -11,7 +11,9 @@ through an explicit matrix, and derives what splatsim's renderers take:
 * LiDARs: a sensor-to-world pose in FLU (gsplat's LiDAR frame);
 * actors: a position and a ``wxyz`` quaternion of the body in FLU.
 
-numpy only: no torch, no CUDA.
+numpy only: no torch, no CUDA. The CARLA-side conventions (sensor axes,
+OpenCV camera axes, quaternions) are carla_canvas's
+(:mod:`carla_canvas.geometry`); only the CARLA → tile-local map is splatsim's.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import math
 from collections.abc import Callable
 
 import numpy as np
+from carla_canvas.geometry import flu_axes, quaternion_xyzw, view_matrix_cv
 from numpy.typing import NDArray
 
 Array = NDArray[np.float64]
@@ -89,19 +92,14 @@ class SceneFrame:
     def viewmat(self, carla_pose: Array) -> Array:
         """4x4 world-to-camera (gsplat RDF: x right, y down, z forward) of a
         CARLA camera pose (looking along its x)."""
-        position, axes = self.pose(carla_pose)
-        rdf = np.column_stack([axes[:, 1], -axes[:, 2], axes[:, 0]])
-        view = np.eye(4)
-        view[:3, :3] = rdf.T
-        view[:3, 3] = -(rdf.T @ position)
-        return view
+        return view_matrix_cv(*self.pose(carla_pose))
 
     def flu_pose(self, carla_pose: Array) -> Array:
         """4x4 body-to-world in FLU (x forward, y left, z up): a LiDAR's
         sensor-to-world, an actor's pose. A proper rotation."""
         position, axes = self.pose(carla_pose)
         out = np.eye(4)
-        out[:3, :3] = np.column_stack([axes[:, 0], -axes[:, 1], axes[:, 2]])
+        out[:3, :3] = flu_axes(axes)
         out[:3, 3] = position
         return out
 
@@ -124,44 +122,8 @@ def local_rotation(
 
 
 def quaternion_wxyz(rotation: Array) -> tuple[float, float, float, float]:
-    """``(w, x, y, z)`` of a proper rotation matrix."""
-    r = np.asarray(rotation, dtype=np.float64)
-    trace = r[0, 0] + r[1, 1] + r[2, 2]
-    if trace > 0:
-        s = 2.0 * math.sqrt(trace + 1.0)
-        q = (
-            0.25 * s,
-            (r[2, 1] - r[1, 2]) / s,
-            (r[0, 2] - r[2, 0]) / s,
-            (r[1, 0] - r[0, 1]) / s,
-        )
-    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
-        s = 2.0 * math.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2])
-        q = (
-            (r[2, 1] - r[1, 2]) / s,
-            0.25 * s,
-            (r[0, 1] + r[1, 0]) / s,
-            (r[0, 2] + r[2, 0]) / s,
-        )
-    elif r[1, 1] > r[2, 2]:
-        s = 2.0 * math.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2])
-        q = (
-            (r[0, 2] - r[2, 0]) / s,
-            (r[0, 1] + r[1, 0]) / s,
-            0.25 * s,
-            (r[1, 2] + r[2, 1]) / s,
-        )
-    else:
-        s = 2.0 * math.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1])
-        q = (
-            (r[1, 0] - r[0, 1]) / s,
-            (r[0, 2] + r[2, 0]) / s,
-            (r[1, 2] + r[2, 1]) / s,
-            0.25 * s,
-        )
-    w, x, y, z = q
-    if w < 0:
-        w, x, y, z = -w, -x, -y, -z
+    """``(w, x, y, z)`` of a proper rotation matrix (splatsim's order)."""
+    x, y, z, w = quaternion_xyzw(rotation)
     return w, x, y, z
 
 
