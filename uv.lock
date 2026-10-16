@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'linux'",
@@ -45,7 +45,7 @@ wheels = [
 
 [[package]]
 name = "carla-canvas"
-version = "0.1.1"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
@@ -53,10 +53,15 @@ dependencies = [
     { name = "protobuf" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/da/5b/842e69a7e7073049197f585b3994f4b0fc5a890dfc7825f88e60c20a2729/carla_canvas-0.1.1.tar.gz", hash = "sha256:3234dbc69df3d2283a1ab034b91e931cde538d6e98b08b2397b457c247b029e8", size = 98167, upload-time = "2026-10-15T13:48:56.844Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ed/f3/ecebb8bd0805cb1f630dcfb2be05139365afb0b4f8aa158dd656b76b3f4e/carla_canvas-0.2.0.tar.gz", hash = "sha256:8b566a10f4d516f7c404dd4e1ad6b6c6bfaf379425ee603f70cf00cb2a193072", size = 102313, upload-time = "2026-10-15T23:32:55.053Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bb/d1/5dd575e45ee9ea9387a3339cf1d95a543c018d167587df43c1285b8d8da5/carla_canvas-0.1.1-py3-none-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f5b06cb6d91c65f4142b297e4cd83d3df1bd2ad577136c42f540a8ac93efee11", size = 7140297, upload-time = "2026-10-15T13:48:52.768Z" },
-    { url = "https://files.pythonhosted.org/packages/1c/b9/fd16df1954cbee88c311d5341513da4aabb1233404fb38253b869cd9ca91/carla_canvas-0.1.1-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:10a94211e6068323500e2be624795bc21edb98c525e178321249b21c9ea4a546", size = 7955694, upload-time = "2026-10-15T13:48:55.001Z" },
+    { url = "https://files.pythonhosted.org/packages/74/61/c70bee6db21b80b148b3bc7de9c2af593a70e8b548d92fdaf24c3b4ddd80/carla_canvas-0.2.0-py3-none-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:baa5ebfe296bdd2391f7a76b5d5bc8846e396d67aaa7b5804f23a1be85b5fd2f", size = 7142315, upload-time = "2026-10-15T23:32:51.136Z" },
+    { url = "https://files.pythonhosted.org/packages/75/41/1e0b1516634af03e5d17114e74a335bff40317d4d5bddfef57e2f4705158/carla_canvas-0.2.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d904a5a6fc30427bcaae90538140b59f5366cca926b7166eff58b3ed83fe2494", size = 7957709, upload-time = "2026-10-15T23:32:53.101Z" },
+]
+
+[package.optional-dependencies]
+ros = [
+    { name = "cyclonedds" },
 ]
 
 [[package]]
@@ -152,6 +157,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/78/ad/98aae8630ac71f16711968e38a5acfecce41b778bf2f0312851020f565a8/charset_normalizer-3.4.9-cp314-cp314t-musllinux_1_2_armv7l.whl", hash = "sha256:cd6c3d4b783c556fa00bf540854e42f135e2f256abd29669fcd0da0f2dec79c2", size = 215222, upload-time = "2026-07-07T14:34:28.774Z" },
     { url = "https://files.pythonhosted.org/packages/f7/40/9593d54209765207a7f11073c06494c1721e4ca4a0a426c597679bf7f91e/charset_normalizer-3.4.9-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:ee2f2a527e3c1a6e6411eb4209642e138b544a2d72fe5d0d76daf77b24063534", size = 231958, upload-time = "2026-07-07T14:34:30.345Z" },
     { url = "https://files.pythonhosted.org/packages/98/2b/f97f1c193fb855c345d678f5077d6926034db0722df74c8f057020e05a25/charset_normalizer-3.4.9-py3-none-any.whl", hash = "sha256:68e5f26a1ad57ded6d1cfb85331d1c1a195314756471d97758c48498bb4dcdf5", size = 64538, upload-time = "2026-07-07T14:34:56.993Z" },
+]
+
+[[package]]
+name = "click"
+version = "8.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c7/0e/7fa0ef50764b67090eca4114772a2abf8b6148198475e54c660b97caeee6/click-8.5.0.tar.gz", hash = "sha256:ba0d2089de75ea0310e2dde03160e6ca10009947fb95a182f9b54021bb272e34", size = 382235, upload-time = "2026-08-26T13:33:14.56Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/58/50/6c0d534c5f134586a8e1ba4e330569e32f057e33372ae556463212fb4cd3/click-8.5.0-py3-none-any.whl", hash = "sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360", size = 125251, upload-time = "2026-08-26T13:33:12.928Z" },
 ]
 
 [[package]]
@@ -363,6 +377,21 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a9/95/a3dbbb5028f35eafb79008e7522a75244477d2838f38cbb722248dabc2a8/cycler-0.12.1.tar.gz", hash = "sha256:88bb128f02ba341da8ef447245a9e138fae777f6a23943da4540077d3601eb1c", size = 7615, upload-time = "2023-10-07T05:32:18.335Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e7/05/c19819d5e3d95294a6f5947fb9b9629efb316b96de511b418c53d245aae6/cycler-0.12.1-py3-none-any.whl", hash = "sha256:85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30", size = 8321, upload-time = "2023-10-07T05:32:16.783Z" },
+]
+
+[[package]]
+name = "cyclonedds"
+version = "11.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "rich-click" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/83/52/f501db026eff5aed63598c51b58a09ee45cf90306791cbf7c05f1a30ebf9/cyclonedds-11.0.1.tar.gz", hash = "sha256:487cdd9e3dbe3bc6f66c3318c45979f4015bb9d32d5dfcb9bb4a67376176a526", size = 191643, upload-time = "2026-03-20T12:47:30.097Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/40/e8/4f05e7c13fdd7f7c552dab21f8e99fe12153cc3e6ff35238968b24f2019f/cyclonedds-11.0.1-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9eaa0e08ea41206b495f36fa4c008ff89113f78a39e54f4a17793d9a68e7b978", size = 7702433, upload-time = "2026-03-20T12:47:36.472Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/01/0295bc331924c147a5f13deb30dff21b1d006059eac6828cf74377c716bd/cyclonedds-11.0.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:dce635041d42e954a5fec187dabf99d4b36c9daa54cc97d6d2238985e3ef6101", size = 7703243, upload-time = "2026-03-20T12:47:44.138Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/27/26dafd6cde19a440497c26d3fd39560db2e5ec2261fa628801000a0cd8b6/cyclonedds-11.0.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:3e96507088c57165f7c189c3a85be866f74c7449fb0cbc6316ad306e5f599be1", size = 7704807, upload-time = "2026-03-20T12:47:51.365Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/a5/a6c8052dafd16c8c0e02eb6ef0cb2bb086d726d654c56e94ec4cdb1640ab/cyclonedds-11.0.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:fef1f6ce115a579e322f3156842e8b660883e4e8b0aa2f5e2a3df9d7959d1736", size = 7704791, upload-time = "2026-03-20T12:47:58.037Z" },
 ]
 
 [[package]]
@@ -1775,6 +1804,20 @@ wheels = [
 ]
 
 [[package]]
+name = "rich-click"
+version = "1.9.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "rich" },
+    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/96/3e/5688fdd83aea416de336582a274f2bc8236b5c261b04c11e17bc262786ad/rich_click-1.9.9.tar.gz", hash = "sha256:324cba7513cd4187ee92b2eef21f071714e45be062458c8b157bd7e0c81103e3", size = 75866, upload-time = "2026-09-05T19:20:14.799Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b5/51/b2b91aec091e86bc961e5164f00207d89f133cc82b5ddad541d2132ea819/rich_click-1.9.9-py3-none-any.whl", hash = "sha256:365e7a9d0adb42e41ea832a0a12e02c44c079a26536dee688125eb9814f97274", size = 71910, upload-time = "2026-09-05T19:20:13.587Z" },
+]
+
+[[package]]
 name = "ruff"
 version = "0.15.10"
 source = { registry = "https://pypi.org/simple" }
@@ -2026,7 +2069,7 @@ bev = [
     { name = "spconv-cu126" },
 ]
 carla-canvas = [
-    { name = "carla-canvas" },
+    { name = "carla-canvas", extra = ["ros"] },
     { name = "pyproj", version = "3.7.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pyproj", version = "3.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "pyproj", version = "3.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -2056,7 +2099,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "3dgs-io", git = "https://github.com/autowarefoundation/3dgs_io.git?tag=v2.1.0" },
-    { name = "carla-canvas", marker = "extra == 'carla-canvas'", specifier = ">=0.1.1" },
+    { name = "carla-canvas", extras = ["ros"], marker = "extra == 'carla-canvas'", specifier = ">=0.2.0" },
     { name = "gsplat", extras = ["lidar"], git = "https://github.com/nerfstudio-project/gsplat.git?rev=4e52698e45eaaed929ed3a5065e96a688d085df6" },
     { name = "onnx", marker = "extra == 'bev'", specifier = ">=1.16" },
     { name = "onnx2torch", marker = "extra == 'bev'", specifier = ">=1.5" },

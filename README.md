@@ -22,7 +22,7 @@ it as a carla_canvas renderer service:
 ```bash
 # canvas.yaml (renderer.backend: splatsim.carla_canvas:SplatsimRenderer) and
 # its scene USDZs in the current directory
-docker run --rm --gpus all -p 50051:50051 -v $PWD:/config ghcr.io/tier4/splatsim:latest-sm89
+docker run --rm --gpus all -p 50051:50051 -v $PWD:/config ghcr.io/hakuturu583/splatsim:latest-sm89
 # on the CARLA client: renderer.endpoint: "<gpu-host>:50051" in its canvas.yaml
 CARLA_CANVAS_CONFIG=canvas.yaml typesafe-codon run main.py
 ```
@@ -75,14 +75,14 @@ tag dimension.
 
 ```bash
 # A specific version for an RTX 40xx (Ada, sm_89), CUDA 12.8.1
-docker pull ghcr.io/tier4/splatsim:1.0.0-cuda12.8.1-sm89
+docker pull ghcr.io/hakuturu583/splatsim:2.0.0-cuda12.8.1-sm89
 
 # Rolling latest for an RTX 50xx (Blackwell, sm_120)
-docker pull ghcr.io/tier4/splatsim:latest-sm120
+docker pull ghcr.io/hakuturu583/splatsim:latest-sm120
 
 # Run the carla_canvas renderer service (requires NVIDIA Container Toolkit):
 # mount the directory holding canvas.yaml and its scenes at /config
-docker run --rm --gpus all -p 50051:50051 -v $PWD:/config ghcr.io/tier4/splatsim:latest-sm89
+docker run --rm --gpus all -p 50051:50051 -v $PWD:/config ghcr.io/hakuturu583/splatsim:latest-sm89
 ```
 
 The image's command is `carla-canvas serve --endpoint 0.0.0.0:50051` with

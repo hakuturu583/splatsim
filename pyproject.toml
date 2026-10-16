@@ -39,7 +39,7 @@ mp4 = [
 # Autoware's MGRS projector, in Rust; prebuilt wheels) and pyproj serve
 # `alignment: geo` (splatsim.geo_transform).
 carla_canvas = [
-    "carla-canvas>=0.1.1",
+    "carla-canvas[ros]>=0.2.0",  # ROS 2 output (CycloneDDS) for enable_for_ros()
     "simple-lanelet2>=1.2.2",
     "pyproj>=3.6",
 ]
